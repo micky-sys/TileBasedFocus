@@ -1,0 +1,16 @@
+{
+  "port": "COM3",
+  "baud": 115200,
+  "duration_requested_s": 30.0,
+  "started_iso_utc": "2026-05-26T10:27:36Z",
+  "total_bytes": 12480,
+  "parser_stats": {
+    "good_blocks": 130,
+    "bad_crc": 0,
+    "bad_length": 0,
+    "skipped_bytes": 0,
+    "events_decoded": 130,
+    "events_skipped_unknown": 0,
+    "buffered": 0
+  }
+}

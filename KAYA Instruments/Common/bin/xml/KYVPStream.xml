@@ -1,0 +1,3072 @@
+<RegisterDescription
+    ModelName="KAYA_Stream_XML"
+    VendorName="KAYA_Instruments_Ltd"
+    ToolTip="KAYA_Stream_XML"
+    StandardNameSpace="None"
+    SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="0"
+    MajorVersion="4" MinorVersion="0" SubMinorVersion="0"
+    ProductGuid="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+    VersionGuid="11111111-2222-3333-4444-555555555555"
+    xmlns="http://www.genicam.org/GenApi/Version_1_1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_1
+    http://www.genicam.org/GenApi/GenApiSchema_Version_1_1.xsd">
+    
+    <Group Comment="RootCategory">
+        <Category Name="Root" NameSpace="Standard">
+            <ToolTip>Extended features and stream statistics related to connected camera.</ToolTip>
+            <Description>Extended features and stream statistics related to connected camera.</Description>
+            <DisplayName>Extended Stream Features</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pFeature>PolledParametersInvalidator</pFeature>
+            <pFeature>ImageFormatControl</pFeature>
+            <pFeature>TriggerControl</pFeature>
+            <pFeature>StatisticsAndTests</pFeature>
+            <pFeature>TransportLayerControl</pFeature>
+            <pFeature>ColorTransformationControl</pFeature>
+            <pFeature>MetaDataControl</pFeature>
+            <pFeature>HWStreamMaxCount</pFeature>
+        </Category>
+    </Group>
+    
+    <!-- ******************************************************************* -->
+    <!-- Port                                                                -->
+    <!-- ******************************************************************* -->
+    
+    <Port Name="Device">
+        <ToolTip> Port node giving access to the camera</ToolTip>
+    </Port> 
+    
+    <!-- ******************************************************************* -->
+    <!-- Integers                                                            -->
+    <!-- ******************************************************************* -->
+
+    <Integer Name="VirtPerStreamRegsBase">
+        <Value>0x00000000</Value>
+    </Integer>
+    
+    <!-- PolledParametersInvalidator -->
+    <Command Name="PolledParametersInvalidator">
+        <ToolTip>Inalidates the value of appointed parameters.</ToolTip>
+        <Description>Inalidates the value of appointed parameters. Triggered by background monitoring procedure</Description>
+        <Visibility>Invisible</Visibility>
+        <Value>0</Value>
+        <CommandValue>1</CommandValue>
+    </Command>
+    
+    <!-- ******************************************************************* -->
+    <!-- Categories                                                          -->
+    <!-- ******************************************************************* -->
+
+    <Category Name="TriggerControl" NameSpace="Standard">
+        <ToolTip>The Trigger Control section describes all features related to image acquisition using trigger(s).</ToolTip>
+        <Description>The Trigger Control section describes all features related to image acquisition using trigger(s).</Description>
+        <DisplayName>Trigger Control</DisplayName>
+        <Visibility>Expert</Visibility>
+        <pIsImplemented>StreamTriggerControl_Imp</pIsImplemented>
+        <pFeature>TriggerMode</pFeature>
+        <pFeature>TriggerActivation</pFeature>
+        <pFeature>TriggerSource</pFeature>                     
+        <pFeature>TriggerDelay</pFeature>                      
+        <pFeature>TriggerFilter</pFeature>                     
+        <pFeature>TriggerSoftware</pFeature>                   
+        <pFeature>TriggerEventMode</pFeature>
+        <pFeature>StreamTriggerControl_Imp</pFeature>
+        <pFeature>MetaDataControl_Imp</pFeature>
+    </Category>
+    
+    <Category Name="ImageFormatControl" NameSpace="Standard">
+        <ToolTip>Control over additional camera video stream features.</ToolTip>
+        <Description>Control over additional camera video stream features.</Description>
+        <DisplayName>Image Format Control</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>SegmentsPerBuffer</pFeature>       
+        <pFeature>PixelFormat</pFeature>
+        <pFeature>DebayerMode</pFeature>         
+        <pFeature>Width</pFeature>                    
+        <pFeature>Height</pFeature>           
+        <pFeature>PackedDataMode</pFeature>          
+        <pFeature>DecimationVerticalMode</pFeature>   
+        <pFeature>DecimationVertical</pFeature>       
+        <pFeature>DecimationHorizontalMode</pFeature> 
+        <pFeature>DecimationHorizontal</pFeature>     
+        <pFeature>ImageCompressionMode</pFeature>     
+        <pFeature>XRGB8888</pFeature>                 
+        <pFeature>Deinterlacing</pFeature>              
+        <pFeature>TransformationPixelFormat_Mono8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_Mono10_Available</pFeature>
+        <pFeature>TransformationPixelFormat_Mono12_Available</pFeature>
+        <pFeature>TransformationPixelFormat_Mono14_Available</pFeature>
+        <pFeature>TransformationPixelFormat_Mono16_Available</pFeature>   
+        <pFeature>TransformationPixelFormat_RGB8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_RGB10_Available</pFeature>
+        <pFeature>TransformationPixelFormat_RGB12_Available</pFeature>
+        <pFeature>TransformationPixelFormat_RGB14_Available</pFeature>
+        <pFeature>TransformationPixelFormat_RGB16_Available</pFeature> 
+        <pFeature>TransformationPixelFormat_RGBA8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_BayerGR8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_BayerRG8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_BayerGB8_Available</pFeature>
+        <pFeature>TransformationPixelFormat_BayerBG8_Available</pFeature>
+        
+    </Category>
+    
+    <Category Name="TransportLayerControl" NameSpace="Standard">
+    
+        <!-- Recommended element -->
+        <ToolTip>Category that contains the Transport layer control features.</ToolTip>
+        <Description>Category that contains the Transport layer control features.</Description>
+        <DisplayName>Transport Layer Control</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>StreamPacketDataSize</pFeature>  
+        
+        <pFeature>Image1StreamID</pFeature>                              
+        <pFeature>Image2StreamID</pFeature>                             
+        
+        <pFeature>ImageAcquisitionFilter_Imp</pFeature>
+        <pFeature>ImageAcquisitionFilterEnable</pFeature>                
+        <pFeature>ImageAcquisitionFilterSelector</pFeature>              
+        <pFeature>ImageAcquisitionFilterValue</pFeature>                 
+        
+        <pFeature>TransportChannelsMaxCount</pFeature>
+        <pFeature>TransportChannelSelector</pFeature>
+        <pFeature>RevisionPackets</pFeature>                             
+        <pFeature>CommandPackets</pFeature>                              
+        <pFeature>PRBS_Errors</pFeature>                                 
+        <pFeature>FEC_RXPackets</pFeature>                              
+        <pFeature>FEC_CorrectedPackets</pFeature>                        
+        <pFeature>FEC_CorruptedPackets</pFeature>
+        <pFeature>TransportCountersReset</pFeature>         
+
+        <pFeature>TransportChannelSelector_Imp</pFeature>
+        <pFeature>RevisionPackets_Imp</pFeature>                             
+        <pFeature>CommandPackets_Imp</pFeature>                                                             
+        <pFeature>FEC_RxPackets_Imp</pFeature>                              
+        <pFeature>FEC_CorrectedPackets_Imp</pFeature>                        
+        <pFeature>FEC_CorruptedPackets_Imp</pFeature>
+        <pFeature>TransportCountersReset_Imp</pFeature>    
+        
+    </Category>
+    
+    <Category Name="StatisticsAndTests" NameSpace="Standard">
+        <ToolTip>Category for device statistics and tests.</ToolTip>
+        <Description>Category for device statistics and tests.</Description>
+        <DisplayName>Statistics and Tests</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <pIsImplemented>StreamStatistics_Imp</pIsImplemented>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>HWStreamSelector</pFeature> 
+        <pFeature>CRCErrorCounter_Imp</pFeature>    
+        <pFeature>CRCErrorCounter</pFeature>      
+        <pFeature>RXPacketCounter_Imp</pFeature> 
+        <pFeature>RXPacketCounter</pFeature>      
+        <pFeature>DropPacketCounter_Imp</pFeature> 
+        <pFeature>DropPacketCounter</pFeature>    
+        <pFeature>RXFrameCounter_Imp</pFeature>  
+        <pFeature>RXFrameCounter</pFeature>       
+        <pFeature>DropFrameCounter_Imp</pFeature> 
+        <pFeature>DropFrameCounter</pFeature>     
+        <pFeature>DropStreamIdCounter_Imp</pFeature>
+        <pFeature>DropStreamIdCounter</pFeature>
+        <pFeature>RXLineCounter_Imp</pFeature>
+        <pFeature>RXLineCounter</pFeature>
+        <pFeature>RXIHCounter_Imp</pFeature>
+        <pFeature>RXIHCounter</pFeature>
+        <pFeature>DropIHCounter_Imp</pFeature>
+        <pFeature>DropIHCounter</pFeature>
+        <pFeature>StatisticsCountersReset</pFeature>      
+        <pFeature>LatencyFrameStart</pFeature>              
+        <pFeature>LatencyFrameEnd</pFeature> 
+        <pFeature>LatencyCountersReset</pFeature>
+        <pFeature>FifoThreshold_Imp</pFeature>  
+        <pFeature>FifoThreshold</pFeature>                  
+        <pFeature>AcquisitionFps</pFeature>   
+        <pFeature>StreamStatistics_Imp</pFeature>        
+    </Category>
+
+    <Category Name="ColorTransformationControl" NameSpace="Standard">
+      <ToolTip>Color Transformation control features.</ToolTip>
+      <Description>Category that contains the Color Transformation control features.</Description>
+      <DisplayName>Color Transformation Control</DisplayName>
+      <Visibility>Expert</Visibility>
+      <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>-->
+      <pFeature>ColorTransformationRR</pFeature>
+      <pFeature>ColorTransformationRG</pFeature>
+      <pFeature>ColorTransformationRB</pFeature>
+      <pFeature>ColorTransformationR0</pFeature>
+      <pFeature>ColorTransformationGR</pFeature>
+      <pFeature>ColorTransformationGG</pFeature>
+      <pFeature>ColorTransformationGB</pFeature>
+      <pFeature>ColorTransformationG0</pFeature>
+      <pFeature>ColorTransformationBR</pFeature>
+      <pFeature>ColorTransformationBG</pFeature>
+      <pFeature>ColorTransformationBB</pFeature>
+      <pFeature>ColorTransformationB0</pFeature>
+    </Category>
+
+    <Category Name="MetaDataControl" NameSpace="Standard">
+      <ToolTip>Category that contains the control over Metadata insertion features.</ToolTip>
+      <Description>Category that contains the control over Metadata insertion features.</Description>
+      <DisplayName>Meta Data Control</DisplayName>
+      <Visibility>Beginner</Visibility>
+      <pIsImplemented>MetaDataControl_Imp</pIsImplemented>
+      <ImposedAccessMode>RO</ImposedAccessMode>
+      <pFeature>MetaDataMode</pFeature>
+    </Category>
+
+    <!-- ******************************************************************* -->
+    <!-- ImageFormatControl                                                  -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="ImageFormatControl">
+        <!-- SegmentsPerBuffer -->
+        <Integer Name="SegmentsPerBuffer" NameSpace="Standard">
+            <ToolTip>Number of Lines/Frames to accumulate in a single buffer frame.</ToolTip>
+            <Description>Number of Lines/Frames to accumulate in a single buffer frame.</Description>
+            <DisplayName>Segments Per Buffer</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pValue>SegmentsPerBufferReg</pValue>
+            <Min>1</Min>
+        </Integer>
+        <IntReg Name="SegmentsPerBufferReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x0</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- PackedDataMode -->
+        <Enumeration Name="PackedDataMode" NameSpace="Standard">
+            <ToolTip>Select maintain data packing mode for stream output.</ToolTip>
+            <Description>Select maintain data packing mode for stream output.</Description>
+            <DisplayName>Packed Data Enable</DisplayName>
+            <Visibility>Expert</Visibility>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <EnumEntry Name="Unpacked" NameSpace="Standard">
+                <DisplayName>Unpacked</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="Packed_RowAligned32" NameSpace="Standard">
+                <DisplayName>Packed Row 32bit Aligned</DisplayName>
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <EnumEntry Name="Packed_RowAligned32_Reverse" NameSpace="Standard">
+                <DisplayName>Packed Row 32bit Aligned Reverse</DisplayName>
+                <Value>0x00000002</Value>
+            </EnumEntry>
+            <pValue>PackedDataModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="PackedDataModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x14</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransformationPixelFormat_Mono8_Available -->
+        <Boolean Name="TransformationPixelFormat_Mono8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_Mono8_Available</ToolTip>
+            <Description>TransformationPixelFormat_Mono8_Available</Description>
+            <DisplayName>TransformationPixelFormat_Mono8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_Mono8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_Mono8_AvailableReg">
+            <Address>0x34</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_Mono10_Available -->
+        <Boolean Name="TransformationPixelFormat_Mono10_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_Mono10_Available</ToolTip>
+            <Description>TransformationPixelFormat_Mono10_Available</Description>
+            <DisplayName>TransformationPixelFormat_Mono10_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_Mono10_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_Mono10_AvailableReg">
+            <Address>0x38</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_Mono12_Available -->
+        <Boolean Name="TransformationPixelFormat_Mono12_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_Mono12_Available</ToolTip>
+            <Description>TransformationPixelFormat_Mono12_Available</Description>
+            <DisplayName>TransformationPixelFormat_Mono12_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_Mono12_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_Mono12_AvailableReg">
+            <Address>0x3c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_Mono14_Available -->
+        <Boolean Name="TransformationPixelFormat_Mono14_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_Mono14_Available</ToolTip>
+            <Description>TransformationPixelFormat_Mono14_Available</Description>
+            <DisplayName>TransformationPixelFormat_Mono14_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_Mono14_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_Mono14_AvailableReg">
+            <Address>0x40</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_Mono16_Available -->
+        <Boolean Name="TransformationPixelFormat_Mono16_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_Mono16_Available</ToolTip>
+            <Description>TransformationPixelFormat_Mono16_Available</Description>
+            <DisplayName>TransformationPixelFormat_Mono16_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_Mono16_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_Mono16_AvailableReg">
+            <Address>0x44</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransformationPixelFormat_RGB8_Available -->
+        <Boolean Name="TransformationPixelFormat_RGB8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGB8_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGB8_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGB8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGB8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGB8_AvailableReg">
+            <Address>0x48</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_RGB10_Available -->
+        <Boolean Name="TransformationPixelFormat_RGB10_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGB10_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGB10_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGB10_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGB10_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGB10_AvailableReg">
+            <Address>0x4c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_RGB12_Available -->
+        <Boolean Name="TransformationPixelFormat_RGB12_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGB12_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGB12_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGB12_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGB12_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGB12_AvailableReg">
+            <Address>0x50</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_RGB14_Available -->
+        <Boolean Name="TransformationPixelFormat_RGB14_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGB14_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGB14_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGB14_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGB14_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGB14_AvailableReg">
+            <Address>0x54</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_RGB16_Available -->
+        <Boolean Name="TransformationPixelFormat_RGB16_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGB16_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGB16_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGB16_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGB16_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGB16_AvailableReg">
+            <Address>0x58</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransformationPixelFormat_RGBA8_Available -->
+        <Boolean Name="TransformationPixelFormat_RGBA8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_RGBA8_Available</ToolTip>
+            <Description>TransformationPixelFormat_RGBA8_Available</Description>
+            <DisplayName>TransformationPixelFormat_RGBA8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_RGBA8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_RGBA8_AvailableReg">
+            <Address>0x5c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransformationPixelFormat_BayerGR8_Available -->
+        <Boolean Name="TransformationPixelFormat_BayerGR8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_BayerGR8_Available</ToolTip>
+            <Description>TransformationPixelFormat_BayerGR8_Available</Description>
+            <DisplayName>TransformationPixelFormat_BayerGR8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_BayerGR8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_BayerGR8_AvailableReg">
+            <Address>0x60</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_BayerRG8_Available -->
+        <Boolean Name="TransformationPixelFormat_BayerRG8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_BayerRG8_Available</ToolTip>
+            <Description>TransformationPixelFormat_BayerRG8_Available</Description>
+            <DisplayName>TransformationPixelFormat_BayerRG8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_BayerRG8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_BayerRG8_AvailableReg">
+            <Address>0x64</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_BayerGB8_Available -->
+        <Boolean Name="TransformationPixelFormat_BayerGB8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_BayerGB8_Available</ToolTip>
+            <Description>TransformationPixelFormat_BayerGB8_Available</Description>
+            <DisplayName>TransformationPixelFormat_BayerGB8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_BayerGB8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_BayerGB8_AvailableReg">
+            <Address>0x68</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- TransformationPixelFormat_BayerBG8_Available -->
+        <Boolean Name="TransformationPixelFormat_BayerBG8_Available" NameSpace="Standard">
+            <ToolTip>TransformationPixelFormat_BayerBG8_Available</ToolTip>
+            <Description>TransformationPixelFormat_BayerBG8_Available</Description>
+            <DisplayName>TransformationPixelFormat_BayerBG8_Available</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransformationPixelFormat_BayerBG8_AvailableReg</pValue>
+        </Boolean>
+        <IntReg Name="TransformationPixelFormat_BayerBG8_AvailableReg">
+            <Address>0x6c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- PixelFormat -->
+        <Enumeration Name="PixelFormat" NameSpace="Standard">
+            <ToolTip>Pixel Format for Image Format transformation.</ToolTip>
+            <Description>Pixel Format for Image Format transformation.
+            Availability is subject to current camera's pixel format.</Description>
+            <DisplayName>Transformation Pixel Format</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <EnumEntry Name="Normal" NameSpace="Standard">
+                <DisplayName>Normal</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="Mono8" NameSpace="Standard">
+                <DisplayName>Mono8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_Mono8_Available</pIsAvailable>
+                <Value>0x00000101</Value>
+            </EnumEntry>
+            <EnumEntry Name="Mono10" NameSpace="Standard">
+                <DisplayName>Mono10</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_Mono10_Available</pIsAvailable>
+                <Value>0x00000102</Value>
+            </EnumEntry>
+            <EnumEntry Name="Mono12" NameSpace="Standard">
+                <DisplayName>Mono12</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_Mono12_Available</pIsAvailable>
+                <Value>0x00000103</Value>
+            </EnumEntry>
+            <EnumEntry Name="Mono14" NameSpace="Standard">
+                <DisplayName>Mono14</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_Mono14_Available</pIsAvailable>
+                <Value>0x00000104</Value>
+            </EnumEntry>
+            <EnumEntry Name="Mono16" NameSpace="Standard">
+                <DisplayName>Mono16</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_Mono16_Available</pIsAvailable>
+                <Value>0x00000105</Value>
+            </EnumEntry>
+            
+            <EnumEntry Name="RGB8" NameSpace="Standard">
+                <DisplayName>RGB8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGB8_Available</pIsAvailable>
+                <Value>0x00000401</Value>
+            </EnumEntry>
+            <EnumEntry Name="RGB10" NameSpace="Standard">
+                <DisplayName>RGB10</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGB10_Available</pIsAvailable>
+                <Value>0x00000402</Value>
+            </EnumEntry>
+            <EnumEntry Name="RGB12" NameSpace="Standard">
+                <DisplayName>RGB12</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGB12_Available</pIsAvailable>
+                <Value>0x00000403</Value>
+            </EnumEntry>
+            <EnumEntry Name="RGB14" NameSpace="Standard">
+                <DisplayName>RGB14</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGB14_Available</pIsAvailable>
+                <Value>0x00000404</Value>
+            </EnumEntry>
+            <EnumEntry Name="RGB16" NameSpace="Standard">
+                <DisplayName>RGB16</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGB16_Available</pIsAvailable>
+                <Value>0x00000405</Value>
+            </EnumEntry>
+            
+            <EnumEntry Name="RGBA8" NameSpace="Standard">
+                <DisplayName>RGBA8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_RGBA8_Available</pIsAvailable>
+                <Value>0x00000501</Value>
+            </EnumEntry>
+            
+            <EnumEntry Name="BayerGR8" NameSpace="Standard">
+                <DisplayName>BayerGR8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_BayerGR8_Available</pIsAvailable>
+                <Value>0x00000311</Value>
+            </EnumEntry>
+            <EnumEntry Name="BayerRG8" NameSpace="Standard">
+                <DisplayName>BayerRG8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_BayerRG8_Available</pIsAvailable>
+                <Value>0x00000321</Value>
+            </EnumEntry>
+            <EnumEntry Name="BayerGB8" NameSpace="Standard">
+                <DisplayName>BayerGB8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_BayerGB8_Available</pIsAvailable>
+                <Value>0x00000331</Value>
+            </EnumEntry>
+            <EnumEntry Name="BayerBG8" NameSpace="Standard">
+                <DisplayName>BayerBG8</DisplayName>
+                <pIsAvailable>TransformationPixelFormat_BayerBG8_Available</pIsAvailable>
+                <Value>0x00000341</Value>
+            </EnumEntry>
+            
+            <pValue>PixelFormatReg</pValue>
+        </Enumeration>
+        <IntReg Name="PixelFormatReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x4</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- Deinterlacing -->
+        <Enumeration Name="Deinterlacing" NameSpace="Standard">
+            <ToolTip>Indicates whether received picture should be deinterlaced.</ToolTip>
+            <Description>Indicates whether received picture should be deinterlaced.</Description>
+            <DisplayName>Deinterlacing</DisplayName>
+            <!-- <Visibility>Beginner</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <EnumEntry Name="Off" NameSpace="Standard">
+                <DisplayName>Off</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="Weave" NameSpace="Standard">
+                <DisplayName>Weave</DisplayName>
+                <Value>0x00000002</Value>
+            </EnumEntry>
+            <pValue>DeinterlacingReg</pValue>
+        </Enumeration>
+        <IntReg Name="DeinterlacingReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x30</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DebayerMode -->
+        <Enumeration Name="DebayerMode" NameSpace="Standard">
+            <ToolTip>Bayer demosaic algorithm.</ToolTip>
+            <Description>Bayer demosaic algorithm.</Description>
+            <DisplayName>Debayer Mode</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <EnumEntry Name="Demosaic3x3" NameSpace="Standard">
+                <DisplayName>Demosaic 3x3</DisplayName>
+                <!--<pIsImplemented>FWCapable_Bayer_Imp</pIsImplemented>-->
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="Demosaic3x2" NameSpace="Standard">
+                <DisplayName>Demosaic 3x2</DisplayName>
+                <!--<pIsImplemented>FWCapable_HardwareDebayerMode3x2_Imp</pIsImplemented>-->
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <!--<EnumEntry Name="DemosaicSoftware" NameSpace="Standard">
+                <DisplayName>Demosaic Software</DisplayName>
+                <Value>0x000000ff</Value>
+            </EnumEntry>-->
+            <pValue>DebayerModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="DebayerModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x8</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- PixelIFTransformEnable -->
+        <Enumeration Name="PixelIFTransformEnable" NameSpace="Standard">
+            <ToolTip>Pixel Format Transform Enable Mask.</ToolTip>
+            <Description>Pixel Format Transform Enable Mask.</Description>
+            <DisplayName>PixelIF Transform Enable Mask</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <EnumEntry Name="raw" NameSpace="Standard">
+                <DisplayName>raw</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="mono8" NameSpace="Standard">
+                <DisplayName>Mono8</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="mono10" NameSpace="Standard">
+                <DisplayName>Mono10</DisplayName>
+                <Value>0x00000001</Value><!--Mono8(0x00000001)-->
+            </EnumEntry>
+            <EnumEntry Name="mono12" NameSpace="Standard">
+                <DisplayName>Mono12</DisplayName>
+                <Value>0x00000001</Value><!--Mono8(0x00000001)-->
+            </EnumEntry>
+            <EnumEntry Name="mono14" NameSpace="Standard">
+                <DisplayName>Mono14</DisplayName>
+                <Value>0x00000001</Value><!--Mono8(0x00000001)-->
+            </EnumEntry>
+            <EnumEntry Name="mono16" NameSpace="Standard">
+                <DisplayName>Mono16</DisplayName>
+                <Value>0x00000001</Value><!--Mono8(0x00000001)-->
+            </EnumEntry>
+
+            <EnumEntry Name="rgb8" NameSpace="Standard">
+                <DisplayName>RGB8</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="rgb10" NameSpace="Standard">
+                <DisplayName>RGB10</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="rgb12" NameSpace="Standard">
+                <DisplayName>RGB12</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="rgb14" NameSpace="Standard">
+                <DisplayName>RGB14</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="rgb16" NameSpace="Standard">
+                <DisplayName>RGB16</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+
+            <EnumEntry Name="rgba8" NameSpace="Standard">
+                <DisplayName>RGBA8</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="rgba10" NameSpace="Standard">
+                <DisplayName>RGBA10</DisplayName>
+                <Value>0x00000400</Value><!--RGBA8(0x00000400)-->
+            </EnumEntry>
+            <EnumEntry Name="rgba12" NameSpace="Standard">
+                <DisplayName>RGBA12</DisplayName>
+                <Value>0x00000400</Value><!--RGBA8(0x00000400)-->
+            </EnumEntry>
+            <EnumEntry Name="rgba14" NameSpace="Standard">
+                <DisplayName>RGBA14</DisplayName>
+                <Value>0x00000400</Value><!--RGBA8(0x00000400)-->
+            </EnumEntry>
+            <EnumEntry Name="rgba16" NameSpace="Standard">
+                <DisplayName>RGBA16</DisplayName>
+                <Value>0x00000400</Value><!--RGBA8(0x00000400)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergr8" NameSpace="Standard">
+                <DisplayName>BayerGR8</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergr10" NameSpace="Standard">
+                <DisplayName>BayerGR10</DisplayName>
+                <Value>0x00010060</Value><!--RGB8(0x00000020), RGB10(0x00000040), BayerGR8(0x00010000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergr12" NameSpace="Standard">
+                <DisplayName>BayerGR12</DisplayName>
+                <Value>0x000100A0</Value><!--RGB8(0x00000020), RGB12(0x00000080), BayerGR8(0x00010000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergr14" NameSpace="Standard">
+                <DisplayName>BayerGR14</DisplayName>
+                <Value>0x00010120</Value><!--RGB8(0x00000020), RGB14(0x00000100), BayerGR8(0x00010000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergr16" NameSpace="Standard">
+                <DisplayName>BayerGR16</DisplayName>
+                <Value>0x00010220</Value><!--RGB8(0x00000020), RGB16(0x00000200), BayerGR8(0x00010000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerrg8" NameSpace="Standard">
+                <DisplayName>BayerRG8</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerrg10" NameSpace="Standard">
+                <DisplayName>BayerRG10</DisplayName>
+                <Value>0x00200060</Value><!--RGB8(0x00000020), RGB10(0x00000040), BayerRG8(0x00200000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerrg12" NameSpace="Standard">
+                <DisplayName>BayerRG12</DisplayName>
+                <Value>0x002000A0</Value><!--RGB8(0x00000020), RGB12(0x00000080), BayerRG8(0x00200000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerrg14" NameSpace="Standard">
+                <DisplayName>BayerRG14</DisplayName>
+                <Value>0x00200120</Value><!--RGB8(0x00000020), RGB14(0x00000100), BayerRG8(0x00200000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerrg16" NameSpace="Standard">
+                <DisplayName>BayerRG16</DisplayName>
+                <Value>0x00200220</Value><!--RGB8(0x00000020), RGB16(0x00000200), BayerRG8(0x00200000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergb8" NameSpace="Standard">
+                <DisplayName>BayerGB8</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergb10" NameSpace="Standard">
+                <DisplayName>BayerGB10</DisplayName>
+                <Value>0x04000060</Value><!--RGB8(0x00000020), RGB10(0x00000040), BayerGB8(0x04000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergb12" NameSpace="Standard">
+                <DisplayName>BayerGB12</DisplayName>
+                <Value>0x040000A0</Value><!--RGB8(0x00000020), RGB12(0x00000080), BayerGB8(0x04000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergb14" NameSpace="Standard">
+                <DisplayName>BayerGB14</DisplayName>
+                <Value>0x04000120</Value><!--RGB8(0x00000020), RGB14(0x00000100), BayerGB8(0x04000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayergb16" NameSpace="Standard">
+                <DisplayName>BayerGB16</DisplayName>
+                <Value>0x04000220</Value><!--RGB8(0x00000020), RGB16(0x00000200), BayerGB8(0x04000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerbg8" NameSpace="Standard">
+                <DisplayName>BayerBG8</DisplayName>
+                <Value>0x00000020</Value><!--RGB8(0x00000020)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerbg10" NameSpace="Standard">
+                <DisplayName>BayerBG10</DisplayName>
+                <Value>0x80000060</Value><!--RGB8(0x00000020), RGB10(0x00000040), BayerBG8(0x80000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerbg12" NameSpace="Standard">
+                <DisplayName>BayerBG12</DisplayName>
+                <Value>0x800000A0</Value><!--RGB8(0x00000020), RGB12(0x00000080), BayerBG8(0x80000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerbg14" NameSpace="Standard">
+                <DisplayName>BayerBG14</DisplayName>
+                <Value>0x80000120</Value><!--RGB8(0x00000020), RGB14(0x00000100), BayerBG8(0x80000000)-->
+            </EnumEntry>
+            <EnumEntry Name="bayerbg16" NameSpace="Standard">
+                <DisplayName>BayerBG16</DisplayName>
+                <Value>0x80000220</Value><!--RGB8(0x00000020), RGB16(0x00000200), BayerBG8(0x80000000)-->
+            </EnumEntry>
+
+            <pValue>PixelIFTransformEnableReg</pValue>
+        </Enumeration>        
+        <IntReg Name="PixelIFTransformEnableReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x00000000</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- Width -->
+        <Integer Name="Width" NameSpace="Standard">
+            <ToolTip>Width of the image, to override the one provided by the remote device (in pixels).</ToolTip>
+            <Description>Width of the image, to override the one provided by the remote device (in pixels).</Description>
+            <DisplayName>Width</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>WidthReg</pValue>
+        </Integer>
+        <IntReg Name="WidthReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xc</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- Height -->
+        <Integer Name="Height" NameSpace="Standard">
+            <ToolTip>Height of the image, to override the one provided by the remote device (in pixels).</ToolTip>
+            <Description>Height of the image, to override the one provided by the remote device (in pixels).</Description>
+            <DisplayName>Height</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>HeightReg</pValue>
+        </Integer>
+        <IntReg Name="HeightReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x10</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DecimationVerticalMode -->
+        <Enumeration Name="DecimationVerticalMode" NameSpace="Standard">
+            <ToolTip>Sets the mode used to reduce the Vertical resolution when DecimationVertical is used.</ToolTip>
+            <Description>Sets the mode used to reduce the Vertical resolution when DecimationVertical is used.</Description>
+            <DisplayName>Decimation Vertical Mode</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <EnumEntry Name="Discard" NameSpace="Standard">
+                <DisplayName>Discard</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="Average" NameSpace="Standard">
+                <DisplayName>Average</DisplayName>
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <pValue>DecimationVerticalModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="DecimationVerticalModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x18</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DecimationVertical -->
+        <Integer Name="DecimationVertical" NameSpace="Standard">
+            <ToolTip>Vertical sub-sampling of the image. This reduces the vertical resolution (height) of the image by the specified vertical decimation factor.</ToolTip>
+            <Description>Vertical sub-sampling of the image. This reduces the vertical resolution (height) of the image by the specified vertical decimation factor.</Description>
+            <DisplayName>Decimation Vertical</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <pValue>DecimationVerticalReg</pValue>
+            <Min>1</Min>
+            <Max>0xFFFF</Max>
+        </Integer>
+        <IntReg Name="DecimationVerticalReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x1c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DecimationHorizontalMode -->
+        <Enumeration Name="DecimationHorizontalMode" NameSpace="Standard">
+            <ToolTip>Sets the mode used to reduce the horizontal resolution when DecimationHorizontal is used.</ToolTip>
+            <Description>Sets the mode used to reduce the horizontal resolution when DecimationHorizontal is used.</Description>
+            <DisplayName>Decimation Horizontal Mode</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <EnumEntry Name="Discard" NameSpace="Standard">
+                <DisplayName>Discard</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="Average" NameSpace="Standard">
+                <DisplayName>Average</DisplayName>
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <pValue>DecimationHorizontalModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="DecimationHorizontalModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x20</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DecimationHorizontal -->
+        <Integer Name="DecimationHorizontal" NameSpace="Standard">
+            <ToolTip>Horizontal sub-sampling of the image. This reduces the horizontal resolution (width) of the image by the specified horizontal decimation factor.</ToolTip>
+            <Description>Horizontal sub-sampling of the image. This reduces the horizontal resolution (width) of the image by the specified horizontal decimation factor.</Description>
+            <DisplayName>Decimation Horizontal</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <pValue>DecimationHorizontalReg</pValue>
+            <Min>1</Min>
+            <Max>0xFFFF</Max>
+        </Integer>
+        <IntReg Name="DecimationHorizontalReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x24</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- ImageCompressionMode -->
+        <Enumeration Name="ImageCompressionMode" NameSpace="Standard">
+            <ToolTip>Enable a specific image compression mode as the base mode for image transfer.</ToolTip>
+            <Description>Enable a specific image compression mode as the base mode for image transfer.</Description>
+            <DisplayName>Image Compression Mode</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <EnumEntry Name="Off" NameSpace="Standard">
+                <DisplayName>Off</DisplayName>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <pValue>ImageCompressionModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="ImageCompressionModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x28</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- XRGB8888 -->
+        <Boolean Name="XRGB8888" NameSpace="Standard">
+            <ToolTip>Inserts a byte of padding for each 3 bytes of data.</ToolTip>
+            <Description>Inserts a byte of padding for each 3 bytes of data.</Description>
+            <DisplayName>XRGB8888 Enable</DisplayName>
+            <!-- <Visibility>Expert</Visibility> -->
+            <Visibility>Invisible</Visibility>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>XRGB8888Reg</pValue>
+        </Boolean>
+        <IntReg Name="XRGB8888Reg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x2c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    </Group>
+    
+    <!-- ******************************************************************* -->
+    <!-- TriggerControl                                                      -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="TriggerControl">
+
+        <!-- StreamTriggerControl_Imp -->
+        <Boolean Name="StreamTriggerControl_Imp" NameSpace="Standard">
+            <ToolTip>StreamTriggerControl_Imp access check implementation</ToolTip>
+            <Description>StreamTriggerControl_Imp access check implementation</Description>
+            <DisplayName>StreamTriggerControl_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>StreamTriggerControl_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="StreamTriggerControl_ImpReg">
+            <Address>0x94</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- TriggerMode -->
+        <Enumeration Name="TriggerMode" NameSpace="Standard">
+            <ToolTip>Controls if the selected trigger is active.</ToolTip>
+            <Description>Controls if the selected trigger is active.</Description>
+            <DisplayName>Trigger Mode</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <EnumEntry Name="Off" NameSpace="Standard">
+              <DisplayName>Off</DisplayName>
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="On" NameSpace="Standard">
+              <DisplayName>On</DisplayName>
+              <Value>1</Value>
+            </EnumEntry>
+            <pValue>TriggerModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerModeReg">
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x70</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TriggerActivation -->
+        <Enumeration Name="TriggerActivation" NameSpace="Standard">
+            <ToolTip>Specifies the activation mode of the trigger.</ToolTip>
+            <Description>Specifies the activation mode of the trigger.</Description>
+            <DisplayName>Trigger Activation</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <EnumEntry Name="RisingEdge" NameSpace="Standard">
+                <DisplayName>Rising Edge</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="FallingEdge" NameSpace="Standard">
+                <DisplayName>Falling Edge</DisplayName>
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <EnumEntry Name="AnyEdge" NameSpace="Standard">
+                <DisplayName>Any Edge</DisplayName>
+                <Value>0x00000002</Value>
+            </EnumEntry>
+            <EnumEntry Name="LevelHigh" NameSpace="Standard">
+                <DisplayName>Level High</DisplayName>
+                <Value>0x00000003</Value>
+            </EnumEntry>
+            <EnumEntry Name="LevelLow" NameSpace="Standard">
+                <DisplayName>Level Low</DisplayName>
+                <Value>0x00000004</Value>
+            </EnumEntry>
+            <pValue>TriggerActivationReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerActivationReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x74</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TriggerSource -->
+        <Enumeration Name="TriggerSource" NameSpace="Standard">
+            <ToolTip>Specifies the internal signal or physical input Line to use as the trigger source. The selected trigger must have its TriggerMode set to On.</ToolTip>
+            <Description>Specifies the internal signal or physical input Line to use as the trigger source. The selected trigger must have its TriggerMode set to On.</Description>
+            <DisplayName>Trigger Source</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <EnumEntry Name="KY_DISABLED" NameSpace="Standard">
+                <DisplayName>Disabled</DisplayName>
+                <Value>0x00</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_OPTO_IN_0" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN0_ImpReg</pIsImplemented>-->
+                <Value>0x01</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_1" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN1_ImpReg</pIsImplemented>-->
+                <Value>0x02</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_2" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN2_ImpReg</pIsImplemented>-->
+                <Value>0x03</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_3" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN3_ImpReg</pIsImplemented>-->
+                <Value>0x04</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_4" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN4_ImpReg</pIsImplemented>-->
+                <Value>0x05</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_5" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN5_ImpReg</pIsImplemented>-->
+                <Value>0x06</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_6" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN6_ImpReg</pIsImplemented>-->
+                <Value>0x07</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_7" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN7_ImpReg</pIsImplemented>-->
+                <Value>0x08</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_LVDS_IN_0" NameSpace="Standard">
+                <DisplayName>LVDS Input 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN0_ImpReg</pIsImplemented>-->
+                <Value>0x09</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_1" NameSpace="Standard">
+                <DisplayName>LVDS Input 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN1_ImpReg</pIsImplemented>-->
+                <Value>0x0A</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_2" NameSpace="Standard">
+                <DisplayName>LVDS Input 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN2_ImpReg</pIsImplemented>-->
+                <Value>0x0B</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_3" NameSpace="Standard">
+                <DisplayName>LVDS Input 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN3_ImpReg</pIsImplemented>-->
+                <Value>0x0C</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_TTL_0" NameSpace="Standard">
+                <DisplayName>TTL 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL0_ImpReg</pIsImplemented>-->
+                <Value>0x0D</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_1" NameSpace="Standard">
+                <DisplayName>TTL 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL1_ImpReg</pIsImplemented>-->
+                <Value>0x0E</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_2" NameSpace="Standard">
+                <DisplayName>TTL 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL2_ImpReg</pIsImplemented>-->
+                <Value>0x0F</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_3" NameSpace="Standard">
+                <DisplayName>TTL 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL3_ImpReg</pIsImplemented>-->
+                <Value>0x10</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_4" NameSpace="Standard">
+                <DisplayName>TTL 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL4_ImpReg</pIsImplemented>-->
+                <Value>0x11</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_5" NameSpace="Standard">
+                <DisplayName>TTL 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL5_ImpReg</pIsImplemented>-->
+                <Value>0x12</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_6" NameSpace="Standard">
+                <DisplayName>TTL 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL6_ImpReg</pIsImplemented>-->
+                <Value>0x13</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_7" NameSpace="Standard">
+                <DisplayName>TTL 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL7_ImpReg</pIsImplemented>-->
+                <Value>0x14</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_LVTTL_0" NameSpace="Standard">
+                <DisplayName>LVTTL 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL0_ImpReg</pIsImplemented>-->
+                <Value>0x15</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_1" NameSpace="Standard">
+                <DisplayName>LVTTL 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL1_ImpReg</pIsImplemented>-->
+                <Value>0x16</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_2" NameSpace="Standard">
+                <DisplayName>LVTTL 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL2_ImpReg</pIsImplemented>-->
+                <Value>0x17</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_3" NameSpace="Standard">
+                <DisplayName>LVTTL 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL3_ImpReg</pIsImplemented>-->
+                <Value>0x18</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_4" NameSpace="Standard">
+                <DisplayName>LVTTL 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL4_ImpReg</pIsImplemented>-->
+                <Value>0x19</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_5" NameSpace="Standard">
+                <DisplayName>LVTTL 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL5_ImpReg</pIsImplemented>-->
+                <Value>0x1A</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_6" NameSpace="Standard">
+                <DisplayName>LVTTL 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL6_ImpReg</pIsImplemented>-->
+                <Value>0x1B</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_7" NameSpace="Standard">
+                <DisplayName>LVTTL 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL7_ImpReg</pIsImplemented>-->
+                <Value>0x1C</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_CAM_TRIG" NameSpace="Standard">
+                <DisplayName>Camera Trigger</DisplayName>
+                <Value>0x29</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_SOFTWARE" NameSpace="Standard">
+                <DisplayName>Software</DisplayName>
+                <Value>0x2B</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_ENCODER_0" NameSpace="Standard">
+                <DisplayName>Encoder 0</DisplayName>
+                <!--<pIsImplemented>IOEncoder_0_Imp</pIsImplemented>-->
+                <Value>0x2C</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_1" NameSpace="Standard">
+                <DisplayName>Encoder 1</DisplayName>
+                <!--<pIsImplemented>IOEncoder_1_Imp</pIsImplemented>-->
+                <Value>0x2D</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_2" NameSpace="Standard">
+                <DisplayName>Encoder 2</DisplayName>
+                <!--<pIsImplemented>IOEncoder_2_Imp</pIsImplemented>-->
+                <Value>0x2E</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_3" NameSpace="Standard">
+                <DisplayName>Encoder 3</DisplayName>
+                <!--<pIsImplemented>IOEncoder_3_Imp</pIsImplemented>-->
+                <Value>0x2F</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_0" NameSpace="Standard">
+                <DisplayName>Timer 0 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_0_Imp</pIsImplemented>-->
+                <Value>0x30</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_1" NameSpace="Standard">
+                <DisplayName>Timer 1 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_1_Imp</pIsImplemented>-->
+                <Value>0x31</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_2" NameSpace="Standard">
+                <DisplayName>Timer 2 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_2_Imp</pIsImplemented>-->
+                <Value>0x32</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_3" NameSpace="Standard">
+                <DisplayName>Timer 3 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_3_Imp</pIsImplemented>-->
+                <Value>0x33</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_4" NameSpace="Standard">
+                <DisplayName>Timer 4 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_4_Imp</pIsImplemented>-->
+                <Value>0x34</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_5" NameSpace="Standard">
+                <DisplayName>Timer 5 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_5_Imp</pIsImplemented>-->
+                <Value>0x35</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_6" NameSpace="Standard">
+                <DisplayName>Timer 6 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_6_Imp</pIsImplemented>-->
+                <Value>0x36</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_7" NameSpace="Standard">
+                <DisplayName>Timer 7 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_7_Imp</pIsImplemented>-->
+                <Value>0x37</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="TriggerN0" NameSpace="Standard">
+                <DisplayName>TriggerN 0</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_0</pIsImplemented>-->
+                <Value>64</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN1" NameSpace="Standard">
+                <DisplayName>TriggerN 1</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_1</pIsImplemented>-->
+                <Value>65</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN2" NameSpace="Standard">
+                <DisplayName>TriggerN 2</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_2</pIsImplemented>-->
+                <Value>66</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN3" NameSpace="Standard">
+                <DisplayName>TriggerN 3</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_3</pIsImplemented>-->
+                <Value>67</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN4" NameSpace="Standard">
+                <DisplayName>TriggerN 4</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_4</pIsImplemented>-->
+                <Value>68</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN5" NameSpace="Standard">
+                <DisplayName>TriggerN 5</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_5</pIsImplemented>-->
+                <Value>69</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN6" NameSpace="Standard">
+                <DisplayName>TriggerN 6</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_6</pIsImplemented>-->
+                <Value>70</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN7" NameSpace="Standard">
+                <DisplayName>TriggerN 7</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_7</pIsImplemented>-->
+                <Value>71</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN8" NameSpace="Standard">
+                <DisplayName>TriggerN 8</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_8</pIsImplemented>-->
+                <Value>72</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN9" NameSpace="Standard">
+                <DisplayName>TriggerN 9</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_9</pIsImplemented>-->
+                <Value>73</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN10" NameSpace="Standard">
+                <DisplayName>TriggerN 10</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_10</pIsImplemented>-->
+                <Value>74</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN11" NameSpace="Standard">
+                <DisplayName>TriggerN 11</DisplayName>
+               <!-- <pIsImplemented>TriggerNImplemented_11</pIsImplemented>-->
+                <Value>75</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN12" NameSpace="Standard">
+                <DisplayName>TriggerN 12</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_12</pIsImplemented>-->
+                <Value>76</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN13" NameSpace="Standard">
+                <DisplayName>TriggerN 13</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_13</pIsImplemented>-->
+                <Value>77</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN14" NameSpace="Standard">
+                <DisplayName>TriggerN 14</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_14</pIsImplemented>-->
+                <Value>78</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN15" NameSpace="Standard">
+                <DisplayName>TriggerN 15</DisplayName>
+                <!--<pIsImplemented>TriggerNImplemented_15</pIsImplemented>-->
+                <Value>79</Value>
+            </EnumEntry>
+            <pValue>TriggerSourceReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerSourceReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x78</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TriggerDelay -->
+        <Float Name="TriggerDelay" NameSpace="Standard">
+            <ToolTip>Specifies the delay in microseconds(us) to apply after the trigger reception before activating it.</ToolTip>
+            <Description>Specifies the delay in microseconds(us) to apply after the trigger reception before activating it.</Description>
+            <DisplayName>Trigger Delay</DisplayName>
+            <Visibility>Expert</Visibility>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>TriggerDelayReg</pValue>
+            <Min>0</Min>
+            <Max>34359738</Max>
+            <Unit>us</Unit>
+        </Float>
+        <FloatReg Name="TriggerDelayReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x7c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- TriggerFilter -->
+        <Float Name="TriggerFilter" NameSpace="Standard">
+            <ToolTip>Filter for trigger, helps prevent signal de-bouncing. 8ns resolution, units in microseconds(us).</ToolTip>
+            <Description>Filter for trigger, helps prevent signal de-bouncing. 8ns resolution, units in microseconds(us).</Description>
+            <DisplayName>Trigger Filter</DisplayName>
+            <Visibility>Expert</Visibility>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>TriggerFilterReg</pValue>
+            <Min>0</Min>
+            <Max>34359738</Max>
+            <Unit>us</Unit>
+            <Representation>Linear</Representation>
+        </Float>
+        <FloatReg Name="TriggerFilterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x84</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- TriggerSoftware -->
+        <Command Name="TriggerSoftware" NameSpace="Standard">
+            <ToolTip>Generates an internal trigger. TriggerSource must be set to Software.</ToolTip>
+            <Description>Generates an internal trigger. TriggerSource must be set to Software.</Description>
+            <DisplayName>Trigger Software</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pValue>TriggerSoftwareReg</pValue>
+            <CommandValue>1</CommandValue>
+        </Command>
+        <IntReg Name="TriggerSoftwareReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x8c</Address>
+            <Length>4</Length>
+            <AccessMode>WO</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TriggerEventMode -->
+        <Enumeration Name="TriggerEventMode" NameSpace="Standard">
+            <ToolTip>Selects the trigger event generation mode.</ToolTip>
+            <Description>Selects the trigger event generation mode.</Description>
+            <DisplayName>Trigger Event Mode</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <EnumEntry Name="Disabled" NameSpace="Standard">
+              <DisplayName>Disabled</DisplayName>
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="RisingEdge" NameSpace="Standard">
+              <DisplayName>Rising Edge</DisplayName>
+              <Value>1</Value>
+            </EnumEntry>
+            <EnumEntry Name="FallingEdge" NameSpace="Standard">
+              <DisplayName>Falling Edge</DisplayName>
+              <Value>2</Value>
+            </EnumEntry>
+            <EnumEntry Name="AnyEdge" NameSpace="Standard">
+              <DisplayName>Any Edge</DisplayName>
+              <Value>3</Value>
+            </EnumEntry>
+            <pValue>TriggerEventModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="TriggerEventModeReg">
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x90</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+    </Group> 
+
+    <!-- ******************************************************************* -->
+    <!-- TransportLayerControl                                               -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="TransportLayerControl">
+        <!-- StreamPacketDataSize -->
+        <Integer Name="StreamPacketDataSize" NameSpace="Standard">
+            <ToolTip>This provides the stream packet data size.</ToolTip>
+            <Description>This provides the stream packet data size.</Description>
+            <Visibility>Expert</Visibility>
+            <!--<pIsImplemented>FWCapable_CoaXPress_Imp</pIsImplemented>   -->
+            <!--<pIsLocked>CameraFeatureAvailable</pIsLocked>              -->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>StreamPacketDataSizeReg</pValue>
+            <Min>0</Min>
+            <Max>65536</Max>
+            <Representation>Linear</Representation>
+        </Integer>
+        <IntReg Name="StreamPacketDataSizeReg" NameSpace="Standard">
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x450</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- Image1StreamID -->
+        <Integer Name="Image1StreamID" NameSpace="Standard">
+            <ToolTip>This gives the Stream ID of the primary image stream from the Device.</ToolTip>
+            <Description>This gives the Stream ID of the primary image stream from the Device.</Description>
+            <Visibility>Expert</Visibility>
+            <!--<pIsImplemented>FWCapable_CoaXPress_Imp</pIsImplemented>   -->
+            <!--<pIsLocked>CameraFeatureAvailable</pIsLocked>              -->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>Image1StreamIDReg</pValue>
+            <Min>-1</Min>
+            <Max>255</Max>
+            <Representation>Linear</Representation>
+        </Integer>
+        <IntReg Name="Image1StreamIDReg">
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x454</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Signed</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- Image2StreamID -->
+        <Integer Name="Image2StreamID" NameSpace="Standard">
+            <ToolTip>This gives the Stream ID of the secondary image stream from the Device.</ToolTip>
+            <Description>This gives the Stream ID of the secondary image stream from the Device.</Description>
+            <Visibility>Invisible</Visibility>
+            <!--<pIsImplemented>FWCapable_CoaXPress_Imp</pIsImplemented>     -->
+            <!--<pIsLocked>CameraFeatureAvailable</pIsLocked>                -->
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>Image2StreamIDReg</pValue>
+            <Min>-1</Min>
+            <Max>255</Max>
+            <Representation>Linear</Representation>
+        </Integer>
+        <IntReg Name="Image2StreamIDReg">
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x458</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Signed</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- ImageAcquisitionFilter_Implemented -->
+        <Boolean Name="ImageAcquisitionFilter_Imp" NameSpace="Standard">
+            <ToolTip>ImageAcquisitionFilter_Imp access check implementation</ToolTip>
+            <Description>ImageAcquisitionFilter_Imp access check implementation</Description>
+            <DisplayName>ImageAcquisitionFilter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>ImageAcquisitionFilter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="ImageAcquisitionFilter_ImpReg">
+            <Address>0x45c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- ImageAcquisitionFilterEnable -->
+        <Boolean Name="ImageAcquisitionFilterEnable" NameSpace="Standard">
+            <ToolTip>Enables condition filter, under which the image was acquired.</ToolTip>
+            <Description>Enables condition filter, under which the image was acquired.</Description>
+            <DisplayName>Image Acquisition Filter Enable</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>ImageAcquisitionFilter_Imp</pIsImplemented>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>ImageAcquisitionFilterEnableReg</pValue>
+        </Boolean>
+        <IntReg Name="ImageAcquisitionFilterEnableReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x460</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+  
+        <!-- ImageAcquisitionFilterSelector -->
+        <Integer Name="ImageAcquisitionFilterSelector" NameSpace="Standard">
+            <ToolTip>Condition filter selector, under which the image was acquired.</ToolTip>
+            <Description>Condition filter selector, under which the image was acquired.</Description>
+            <DisplayName>Image Acquisition Filter Selector</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>ImageAcquisitionFilter_Imp</pIsImplemented>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>ImageAcquisitionFilterSelectorReg</pValue>
+            <Max>255</Max>
+            <Representation>Linear</Representation>
+            <pSelected>ImageAcquisitionFilterValue</pSelected>
+        </Integer>
+        <IntReg Name="ImageAcquisitionFilterSelectorReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x464</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- ImageAcquisitionFilterValue -->
+        <Enumeration Name="ImageAcquisitionFilterValue" NameSpace="Standard">
+            <ToolTip>Rule for image acquisition, under condition filter selected by "ImageAcquisitionFilterSelector".</ToolTip>
+            <Description>Rule for image acquisition, under condition filter selected by "ImageAcquisitionFilterSelector".</Description>
+            <DisplayName>Image Acquisition Filter Value</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>ImageAcquisitionFilter_Imp</pIsImplemented>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <EnumEntry Name="Disabled" NameSpace="Standard">
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="Active" NameSpace="Standard">
+              <Value>1</Value>
+            </EnumEntry>
+            <pValue>ImageAcquisitionFilterValueReg</pValue>
+        </Enumeration>
+        <IntReg Name="ImageAcquisitionFilterValueReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x468</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- Transport channels max numbers (0-N)-1 -->
+        <IntSwissKnife Name="TransportChannelsMaxNumbers">
+            <pVariable Name="FG_MAX_VALUE">TransportChannelsMaxCountReg</pVariable>
+            <Formula>FG_MAX_VALUE-1</Formula>
+        </IntSwissKnife>
+    
+        <!-- TransportChannelsMaxCount -->
+        <Integer Name="TransportChannelsMaxCount" NameSpace="Standard">
+            <ToolTip>Indicates the maximum number of transport channels supported by the device associated with the current stream.</ToolTip>
+            <Description>Indicates the maximum number of transport channels supported by the device associated with the current stream.</Description>
+            <DisplayName>Transport Channels Max Count</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>TransportChannelsMaxCountReg</pValue>
+        </Integer>
+        <IntReg Name="TransportChannelsMaxCountReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x864</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- TransportChannelSelector_Imp -->
+        <Boolean Name="TransportChannelSelector_Imp" NameSpace="Standard">
+            <ToolTip>TransportChannelSelector_Imp access check implementation</ToolTip>
+            <Description>TransportChannelSelector_Imp access check implementation</Description>
+            <DisplayName>TransportChannelSelector_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransportChannelSelector_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="TransportChannelSelector_ImpReg">
+            <Address>0x9f0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- TransportChannelSelector -->
+        <Integer Name="TransportChannelSelector" NameSpace="Standard">
+            <ToolTip>Selects the transport channel of the stream for monitoring and control.</ToolTip>
+            <Description>Selects the transport channel of the stream for monitoring and control.</Description>
+            <DisplayName>Transport Channel Selector</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>TransportChannelSelector_Imp</pIsImplemented>
+            <pValue>TransportChannelSelectorReg</pValue>
+            <Min>0</Min>
+            <pMax>TransportChannelsMaxNumbers</pMax>
+            <pSelected>RevisionPackets</pSelected>
+            <pSelected>CommandPackets</pSelected>
+            <pSelected>FEC_RXPackets</pSelected>
+            <pSelected>FEC_CorrectedPackets</pSelected>
+            <pSelected>FEC_CorruptedPackets</pSelected>
+            <pSelected>TransportCountersReset</pSelected>
+        </Integer>
+        <IntReg Name="TransportChannelSelectorReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x868</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>WriteAround</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- RevisionPackets_Implemented -->
+        <Boolean Name="RevisionPackets_Imp" NameSpace="Standard">
+            <ToolTip>RevisionPackets_Imp access check implementation</ToolTip>
+            <Description>RevisionPackets_Imp access check implementation</Description>
+            <DisplayName>RevisionPackets_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>RevisionPackets_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="RevisionPackets_ImpReg">
+            <Address>0x9f4</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- RevisionPackets -->
+        <Integer Name="RevisionPackets" NameSpace="Standard">
+            <ToolTip>Number of Revision packets.</ToolTip>
+            <Description>Number of Revision packets.</Description>
+            <DisplayName>Revision Packets</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>RevisionPackets_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>RevisionPacketsReg</pValue>
+        </Integer>
+        <IntReg Name="RevisionPacketsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x86c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>TransportCountersReset</pInvalidator>          
+            <pInvalidator>TransportChannelSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CommandPackets_Implemented -->
+        <Boolean Name="CommandPackets_Imp" NameSpace="Standard">
+            <ToolTip>CommandPackets_Imp access check implementation</ToolTip>
+            <Description>CommandPackets_Imp access check implementation</Description>
+            <DisplayName>CommandPackets_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CommandPackets_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CommandPackets_ImpReg">
+            <Address>0x9f8</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CommandPackets -->
+        <Integer Name="CommandPackets" NameSpace="Standard">
+            <ToolTip>Number of Command packets.</ToolTip>
+            <Description>Number of Command packets.</Description>
+            <DisplayName>Command Packets</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>CommandPackets_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>CommandPacketsReg</pValue>
+        </Integer>
+        <IntReg Name="CommandPacketsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x8ac</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>TransportCountersReset</pInvalidator>          
+            <pInvalidator>TransportChannelSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- PRBS_Errors -->
+        <Integer Name="PRBS_Errors" NameSpace="Standard">
+            <ToolTip>Number of PRBS errors detected.</ToolTip>
+            <Description>Number of PRBS errors detected.</Description>
+            <DisplayName>PRBS Errors</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <!--<pIsImplemented>FWCapable_CLHS_Imp</pIsImplemented>-->
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>PRBS_ErrorsReg</pValue>
+        </Integer>
+        <IntReg Name="PRBS_ErrorsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x8ec</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FEC_RxPackets_Implemented -->
+        <Boolean Name="FEC_RxPackets_Imp" NameSpace="Standard">
+            <ToolTip>FEC_RxPackets_Imp access check implementation</ToolTip>
+            <Description>FEC_RxPackets access check implementation</Description>
+            <DisplayName>FEC_RxPackets access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>FEC_RxPackets_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="FEC_RxPackets_ImpReg">
+            <Address>0x9fc</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FEC_RXPackets -->
+        <Integer Name="FEC_RXPackets" NameSpace="Standard">
+            <ToolTip>Received packets by FEC.</ToolTip>
+            <Description>Received packets by FEC .</Description>
+            <DisplayName>FEC Received Packets</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>FEC_RxPackets_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>FEC_RXPacketsReg</pValue>
+        </Integer>
+        <IntReg Name="FEC_RXPacketsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x8f0</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>TransportCountersReset</pInvalidator>          
+            <pInvalidator>TransportChannelSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FEC_CorrectedPackets_Implemented -->
+        <Boolean Name="FEC_CorrectedPackets_Imp" NameSpace="Standard">
+            <ToolTip>FEC_CorrectedPackets_Imp access check implementation</ToolTip>
+            <Description>FEC_CorrectedPackets_Imp access check implementation</Description>
+            <DisplayName>FEC_CorrectedPackets_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>FEC_CorrectedPackets_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="FEC_CorrectedPackets_ImpReg">
+            <Address>0xa00</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FEC_CorrectedPackets -->
+        <Integer Name="FEC_CorrectedPackets" NameSpace="Standard">
+            <ToolTip>Number of corrected packets by FEC.</ToolTip>
+            <Description>Number of corrected packets by FEC.</Description>
+            <DisplayName>FEC Corrected Packets</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>FEC_CorrectedPackets_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>FEC_CorrectedPacketsReg</pValue>
+        </Integer>
+        <IntReg Name="FEC_CorrectedPacketsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x930</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>TransportCountersReset</pInvalidator>          
+            <pInvalidator>TransportChannelSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FECCorruptedPackets_Implemented -->
+        <Boolean Name="FEC_CorruptedPackets_Imp" NameSpace="Standard">
+            <ToolTip>FEC_CorruptedPackets_Imp access check implementation</ToolTip>
+            <Description>FEC_CorruptedPackets_Imp access check implementation</Description>
+            <DisplayName>FEC_CorruptedPackets_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>FEC_CorruptedPackets_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="FEC_CorruptedPackets_ImpReg">
+            <Address>0xa04</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FEC_CorruptedPackets -->
+        <Integer Name="FEC_CorruptedPackets" NameSpace="Standard">
+            <ToolTip>Number of uncorrectable packets.</ToolTip>
+            <Description>Number of uncorrectable packets.</Description>
+            <DisplayName>FEC Corrupted Packets</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>FEC_CorruptedPackets_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>FEC_CorruptedPacketsReg</pValue>
+        </Integer>
+        <IntReg Name="FEC_CorruptedPacketsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x970</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>TransportCountersReset</pInvalidator>          
+            <pInvalidator>TransportChannelSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransportCountersReset_Implemented -->
+        <Boolean Name="TransportCountersReset_Imp" NameSpace="Standard">
+            <ToolTip>TransportCountersReset_Imp access check implementation</ToolTip>
+            <Description>TransportCountersReset_Imp access check implementation</Description>
+            <DisplayName>TransportCountersReset_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>TransportCountersReset_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="TransportCountersReset_ImpReg">
+            <Address>0xa08</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- TransportCountersReset -->
+        <Command Name="TransportCountersReset" NameSpace="Standard">
+            <ToolTip>Reset all transport counters.</ToolTip>
+            <Description>Reset all transport counters.</Description>
+            <DisplayName>Transport Counters Reset</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>TransportCountersReset_Imp</pIsImplemented>
+            <pValue>TransportCountersResetReg</pValue>
+            <CommandValue>3</CommandValue>
+        </Command>
+        <IntReg Name="TransportCountersResetReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x9b0</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+    </Group>
+
+    <!-- ******************************************************************* -->
+    <!-- StatisticsAndTests                                                  -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="StatisticsAndTests">
+    
+        <!-- StreamStatistics_Imp -->
+        <Boolean Name="StreamStatistics_Imp" NameSpace="Standard">
+            <ToolTip>StreamStatistics_Imp access check implementation</ToolTip>
+            <Description>StreamStatistics_Imp access check implementation</Description>
+            <DisplayName>StreamStatistics_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>StreamStatistics_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="StreamStatistics_ImpReg">
+            <Address>0x44c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    
+        <!-- HW streams max numbers (0-N)-1 -->
+        <IntSwissKnife Name="HWStreamMaxNumbers">
+            <pVariable Name="FG_MAX_VALUE">HWStreamMaxCountReg</pVariable>
+            <Formula>FG_MAX_VALUE-1</Formula>
+        </IntSwissKnife>
+    
+        <!-- HWStreamMaxCount -->
+        <Integer Name="HWStreamMaxCount" NameSpace="Standard">
+            <ToolTip>Maximum HW streams count in the current stream.</ToolTip>
+            <Description>Maximum HW streams count in the current stream.</Description>
+            <DisplayName>HW Streams Count</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>HWStreamMaxCountReg</pValue>
+        </Integer>
+        <IntReg Name="HWStreamMaxCountReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa70</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    
+        <!-- HWStreamSelector -->
+        <Integer Name="HWStreamSelector" NameSpace="Standard">
+            <ToolTip>Selects the HW stream to monitoring and control.</ToolTip>
+            <Description>Selects the HW stream to monitoring and control.</Description>
+            <DisplayName>HW Stream Selector</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pValue>HWStreamSelectorReg</pValue>
+            <Min>0</Min>
+            <pMax>HWStreamMaxNumbers</pMax>
+            
+            <pSelected>StatisticsCountersReset</pSelected>
+            <pSelected>CRCErrorCounter</pSelected>
+            <pSelected>RXPacketCounter</pSelected>
+            <pSelected>DropPacketCounter</pSelected>
+            <pSelected>RXFrameCounter</pSelected>
+            <pSelected>DropFrameCounter</pSelected>
+            <pSelected>DropStreamIdCounter</pSelected>
+            <pSelected>RXLineCounter</pSelected>
+            <pSelected>RXIHCounter</pSelected>
+            <pSelected>DropIHCounter</pSelected>
+            <pSelected>LatencyCountersReset</pSelected>
+            <pSelected>LatencyFrameStart</pSelected>
+            <pSelected>LatencyFrameEnd</pSelected>
+            <pSelected>FifoThreshold</pSelected>
+            <pSelected>FifoThresholdMax</pSelected>
+        </Integer>
+        <IntReg Name="HWStreamSelectorReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x9c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>WriteAround</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    
+        <!-- CRCErrorCounter_Implemented -->
+        <Boolean Name="CRCErrorCounter_Imp" NameSpace="Standard">
+            <ToolTip>CRCErrorCounter_Imp access check implementation</ToolTip>
+            <Description>CRCErrorCounter_Imp access check implementation</Description>
+            <DisplayName>CRCErrorCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CRCErrorCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CRCErrorCounter_ImpReg">
+            <Address>0xa0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- CRCErrorCounter -->
+        <Integer Name="CRCErrorCounter" NameSpace="Standard">
+            <ToolTip>Camera CRC Error Counter. Number of CRC errors generated from corrupted data packets.</ToolTip>
+            <Description>Camera CRC Error Counter. Number of CRC errors generated from corrupted data packets.</Description>
+            <DisplayName>CRC Error Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>CRCErrorCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>CRCErrorCounterReg</pValue>
+        </Integer>
+        <IntReg Name="CRCErrorCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa4</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>          
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- RXPacketCounter_Implemented -->
+        <Boolean Name="RXPacketCounter_Imp" NameSpace="Standard">
+            <ToolTip>RXPacketCounter_Imp access check implementation</ToolTip>
+            <Description>RXPacketCounter_Imp access check implementation</Description>
+            <DisplayName>RXPacketCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>RXPacketCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="RXPacketCounter_ImpReg">
+            <Address>0xe4</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- RXPacketCounter -->
+        <Integer Name="RXPacketCounter" NameSpace="Standard">
+            <ToolTip>Camera RX Packet Counter. Total number of packets received from the camera.</ToolTip>
+            <Description>Camera RX Packet Counter. Total number of packets received from the camera.</Description>
+            <DisplayName>RX Packet Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>RXPacketCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>RXPacketCounterReg</pValue>
+        </Integer>
+        <IntReg Name="RXPacketCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xe8</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>            
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- DropPacketCounter_Implemented -->
+        <Boolean Name="DropPacketCounter_Imp" NameSpace="Standard">
+            <ToolTip>DropPacketCounter_Imp access check implementation</ToolTip>
+            <Description>DropPacketCounter_Imp access check implementation</Description>
+            <DisplayName>DropPacketCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>DropPacketCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="DropPacketCounter_ImpReg">
+            <Address>0x128</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DropPacketCounter -->
+        <Integer Name="DropPacketCounter" NameSpace="Standard">
+            <ToolTip>Camera Drop Packet Counter. Number of packets dropped due to corruption.</ToolTip>
+            <Description>Camera Drop Packet Counter. Number of packets dropped due to corruption.</Description>
+            <DisplayName>Drop Packet Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>DropPacketCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>DropPacketCounterReg</pValue>
+        </Integer>
+        <IntReg Name="DropPacketCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x12c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- RXFrameCounter_Implemented -->
+        <Boolean Name="RXFrameCounter_Imp" NameSpace="Standard">
+            <ToolTip>RXFrameCounter_Imp access check implementation</ToolTip>
+            <Description>RXFrameCounter_Imp access check implementation</Description>
+            <DisplayName>RXFrameCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>RXFrameCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="RXFrameCounter_ImpReg">
+            <Address>0x16c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- RXFrameCounter -->
+        <Integer Name="RXFrameCounter" NameSpace="Standard">
+            <ToolTip>RX Frame Counter. Number of received frames from camera.</ToolTip>
+            <Description>RX Frame Counter. Number of received frames from camera.</Description>
+            <DisplayName>RX Frame Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>RXFrameCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>RXFrameCounterReg</pValue>
+        </Integer>
+        <IntReg Name="RXFrameCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x170</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- DropFrameCounter_Implemented -->
+        <Boolean Name="DropFrameCounter_Imp" NameSpace="Standard">
+            <ToolTip>DropFrameCounter_Imp access check implementation</ToolTip>
+            <Description>DropFrameCounter_Imp access check implementation</Description>
+            <DisplayName>DropFrameCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>DropFrameCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="DropFrameCounter_ImpReg">
+            <Address>0x1b0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DropFrameCounter -->
+        <Integer Name="DropFrameCounter" NameSpace="Standard">
+            <ToolTip>Camera Drop Frame Counter. Number of frames dropped due to corruption.</ToolTip>
+            <Description>Camera Drop Frame Counter. Number of frames dropped due to corruption.</Description>
+            <DisplayName>Drop Frame Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>DropFrameCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>DropFrameCounterReg</pValue>
+        </Integer>
+        <IntReg Name="DropFrameCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x1b4</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- DropStreamIdCounter_Implemented -->
+        <Boolean Name="DropStreamIdCounter_Imp" NameSpace="Standard">
+            <ToolTip>DropStreamIdCounter_Imp access check implementation</ToolTip>
+            <Description>DropStreamIdCounter_Imp access check implementation</Description>
+            <DisplayName>DropStreamIdCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>DropStreamIdCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="DropStreamIdCounter_ImpReg">
+            <Address>0x1f4</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DropStreamIdCounter -->
+        <Integer Name="DropStreamIdCounter" NameSpace="Standard">
+            <ToolTip>Camera Drop Stream Id Counter. Number of frames dropped due to StreamId corruption.</ToolTip>
+            <Description>Camera Drop Stream Id Counter. Number of frames dropped due to StreamId corruption.</Description>
+            <DisplayName>Drop StreamId Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>DropStreamIdCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>DropStreamIdCounterReg</pValue>
+        </Integer>
+        <IntReg Name="DropStreamIdCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x1f8</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+      
+        <!-- RXLineCounter_Implemented -->
+        <Boolean Name="RXLineCounter_Imp" NameSpace="Standard">
+            <ToolTip>RXLineCounter_Imp access check implementation</ToolTip>
+            <Description>RXLineCounter_Imp access check implementation</Description>
+            <DisplayName>RXLineCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>RXLineCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="RXLineCounter_ImpReg">
+            <Address>0x238</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- RXLineCounter -->
+        <Integer Name="RXLineCounter" NameSpace="Standard">
+            <ToolTip>RX Line Counter</ToolTip>
+            <Description>RX Line Counter</Description>
+            <DisplayName>RX Line Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>RXLineCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>RXLineCounterReg</pValue>
+        </Integer>
+        <IntReg Name="RXLineCounterReg">
+          <Visibility>Invisible</Visibility>
+          <pAddress>VirtPerStreamRegsBase</pAddress>
+          <Address>0x23c</Address>
+          <Length>4</Length>
+          <AccessMode>RW</AccessMode>
+          <pPort>Device</pPort>
+          <Cachable>NoCache</Cachable>
+          <pInvalidator>StatisticsCountersReset</pInvalidator>
+          <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+          <Sign>Unsigned</Sign>
+          <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- RXIHCounter_Implemented -->
+        <Boolean Name="RXIHCounter_Imp" NameSpace="Standard">
+            <ToolTip>RXIHCounter_Imp access check implementation</ToolTip>
+            <Description>RXIHCounter_Imp access check implementation</Description>
+            <DisplayName>RXIHCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>RXIHCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="RXIHCounter_ImpReg">
+            <Address>0x27c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- RXIHCounter -->
+        <Integer Name="RXIHCounter" NameSpace="Standard">
+            <ToolTip>RX Image Header Counter</ToolTip>
+            <Description>RX Image Header Counter</Description>
+            <DisplayName>RX IH Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>RXIHCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>RXIHCounterReg</pValue>
+        </Integer>
+        <IntReg Name="RXIHCounterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x280</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <!-- DropIHCounter_Implemented -->
+        <Boolean Name="DropIHCounter_Imp" NameSpace="Standard">
+            <ToolTip>DropIHCounter_Imp access check implementation</ToolTip>
+            <Description>DropIHCounter_Imp access check implementation</Description>
+            <DisplayName>DropIHCounter_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>DropIHCounter_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="DropIHCounter_ImpReg">
+            <Address>0x2c0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- DropIHCounter -->
+        <Integer Name="DropIHCounter" NameSpace="Standard">
+            <ToolTip>Drop Image Header Counter</ToolTip>
+            <Description>Drop Image Header Counter</Description>
+            <DisplayName>Drop IH Counter</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>DropIHCounter_Imp</pIsImplemented>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>DropIHCounterReg</pValue>
+        </Integer>
+        <IntReg Name="DropIHCounterReg">
+          <Visibility>Invisible</Visibility>
+          <pAddress>VirtPerStreamRegsBase</pAddress>
+          <Address>0x2c4</Address>
+          <Length>4</Length>
+          <AccessMode>RW</AccessMode>
+          <pPort>Device</pPort>
+          <Cachable>NoCache</Cachable>
+          <pInvalidator>StatisticsCountersReset</pInvalidator>
+          <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+          <Sign>Unsigned</Sign>
+          <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- StatisticsCountersReset -->
+        <Command Name="StatisticsCountersReset" NameSpace="Standard">
+            <ToolTip>Reset all statistics counters.</ToolTip>
+            <Description>Reset all statistics counters.</Description>
+            <DisplayName>Statistics Counters Reset</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <pValue>StatisticsCountersResetReg</pValue>
+            <CommandValue>1</CommandValue>
+        </Command>
+        <IntReg Name="StatisticsCountersResetReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x304</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- LatencyFrameStart -->
+        <Integer Name="LatencyFrameStart" NameSpace="Standard">
+            <ToolTip>Latency time in microseconds(us) from frame reception start until user frame acquisition.</ToolTip>
+            <Description>Latency time in microseconds(us) from frame reception start until user frame acquisition.</Description>
+            <DisplayName>Frame reception start latency</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>LatencyFrameStartReg</pValue>
+        </Integer>
+        <IntReg Name="LatencyFrameStartReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x344</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>LatencyCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- LatencyFrameEnd -->
+        <Integer Name="LatencyFrameEnd" NameSpace="Standard">
+            <ToolTip>Latency time in microseconds(us) from frame reception finish until user frame acquisition.</ToolTip>
+            <Description>Latency time in microseconds(us) from frame reception finish until user frame acquisition.</Description>
+            <DisplayName>Frame reception finish latency</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>LatencyFrameEndReg</pValue>
+        </Integer>
+        <IntReg Name="LatencyFrameEndReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x384</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>LatencyCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- LatencyCountersReset -->
+        <Command Name="LatencyCountersReset" NameSpace="Standard">
+            <ToolTip>Reset all Latency related counters.</ToolTip>
+            <Description>Reset all Latency related counters.</Description>
+            <DisplayName>Latency Counters Reset</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_DecoderStatisticsControl_Imp</pIsImplemented>-->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <pValue>LatencyCountersResetReg</pValue>
+            <CommandValue>1</CommandValue>
+        </Command>
+        <IntReg Name="LatencyCountersResetReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x3c4</Address>
+            <Length>4</Length>
+            <AccessMode>WO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FifoThreshold_Imp -->
+        <Boolean Name="FifoThreshold_Imp" NameSpace="Standard">
+            <ToolTip>FifoThreshold_Imp access check implementation</ToolTip>
+            <Description>FifoThreshold_Imp access check implementation</Description>
+            <DisplayName>FifoThreshold_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>FifoThreshold_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="FifoThreshold_ImpReg">
+            <Address>0x404</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FifoThreshold -->
+        <Integer Name="FifoThreshold" NameSpace="Standard">
+            <ToolTip>FIFO threshold, FIFO fill level.</ToolTip>
+            <Description>FIFO threshold, FIFO fill level.</Description>
+            <DisplayName>FIFO threshold</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsImplemented>FifoThreshold_Imp</pIsImplemented>
+            <pValue>FifoThresholdReg</pValue>
+            <!--<pMax>FifoThresholdMax</pMax>-->
+            <Inc>16</Inc>
+        </Integer>  
+        <IntReg Name="FifoThresholdReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x408</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- FifoThresholdMax -->
+        <Integer Name="FifoThresholdMax" NameSpace="Standard">
+            <ToolTip>FIFO threshold, FIFO fill level.</ToolTip>
+            <Description>FIFO threshold maximum value.</Description>
+            <DisplayName>FIFO threshold MAX</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <pValue>FifoThresholdMaxReg</pValue>
+        </Integer>
+        <IntReg Name="FifoThresholdMaxReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x00000000</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>StatisticsCountersReset</pInvalidator>
+            <pInvalidator>HWStreamSelector</pInvalidator>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- AcquisitionFps -->
+        <Float Name="AcquisitionFps" NameSpace="Standard">
+            <ToolTip>Actual acquisition frame rate.</ToolTip>
+            <Description>Actual acquisition frame rate.</Description>
+            <DisplayName>Actual frame rate</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pValue>AcquisitionFpsReg</pValue>
+            <Representation>Linear</Representation>
+            <DisplayPrecision>2</DisplayPrecision>
+        </Float>
+        <FloatReg Name="AcquisitionFpsReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0x448</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+      
+    </Group>
+    
+    <!-- ******************************************************************* -->
+    <!--  Color Transformation Control                                       -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="ColorTransformationControl">
+        <!-- ColorTransformationRR -->
+        <Float Name="ColorTransformationRR" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef RR</ToolTip>
+            <Description>Color transformation matrix coef RR</Description>
+            <DisplayName>Color transformation matrix coef RR</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented> -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                -->
+            <pValue>ColorTransformationRRReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationRRReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa0c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationRG -->
+        <Float Name="ColorTransformationRG" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef RG</ToolTip>
+            <Description>Color transformation matrix coef RG</Description>
+            <DisplayName>Color transformation matrix coef RG</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>    -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                   -->
+            <pValue>ColorTransformationRGReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationRGReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa14</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationRB -->
+        <Float Name="ColorTransformationRB" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef RB</ToolTip>
+            <Description>Color transformation matrix coef RB</Description>
+            <DisplayName>Color transformation matrix coef RB</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented> -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                -->
+            <pValue>ColorTransformationRBReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationRBReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa1c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationR0 -->
+        <Float Name="ColorTransformationR0" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef R0</ToolTip>
+            <Description>Color transformation matrix coef R0</Description>
+            <DisplayName>Color transformation matrix coef R0</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented> -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                -->
+            <pValue>ColorTransformationR0Reg</pValue>
+            <Min>-65535</Min>
+            <Max>65535</Max>
+            <Inc>1</Inc>
+        </Float>
+        <FloatReg Name="ColorTransformationR0Reg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa24</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationGR -->
+        <Float Name="ColorTransformationGR" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef GR</ToolTip>
+            <Description>Color transformation matrix coef GR</Description>
+            <DisplayName>Color transformation matrix coef GR</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>-->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>-->
+            <pValue>ColorTransformationGRReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationGRReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa2c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationGG -->
+        <Float Name="ColorTransformationGG" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef GG</ToolTip>
+            <Description>Color transformation matrix coef GG</Description>
+            <DisplayName>Color transformation matrix coef GG</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>     -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                    -->
+            <pValue>ColorTransformationGGReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationGGReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa34</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationGB -->
+        <Float Name="ColorTransformationGB" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef GB</ToolTip>
+            <Description>Color transformation matrix coef GB</Description>
+            <DisplayName>Color transformation matrix coef GB</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>-->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>               -->
+            <pValue>ColorTransformationGBReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationGBReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa3c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationG0 -->
+        <Float Name="ColorTransformationG0" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef G0</ToolTip>
+            <Description>Color transformation matrix coef G0</Description>
+            <DisplayName>Color transformation matrix coef G0</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>  -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                 -->
+            <pValue>ColorTransformationG0Reg</pValue>
+            <Min>-65535</Min>
+            <Max>65535</Max>
+            <Inc>1</Inc>
+            <!--<DisplayPrecision>14</DisplayPrecision>-->
+        </Float>
+        <FloatReg Name="ColorTransformationG0Reg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa44</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationBR -->
+        <Float Name="ColorTransformationBR" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef BR</ToolTip>
+            <Description>Color transformation matrix coef BR</Description>
+            <DisplayName>Color transformation matrix coef BR</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>  -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                 -->
+            <pValue>ColorTransformationBRReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationBRReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa4c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationBG -->
+        <Float Name="ColorTransformationBG" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef BG</ToolTip>
+            <Description>Color transformation matrix coef BG</Description>
+            <DisplayName>Color transformation matrix coef BG</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>  -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                 -->
+            <pValue>ColorTransformationBGReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationBGReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa54</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationBB -->
+        <Float Name="ColorTransformationBB" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef BB</ToolTip>
+            <Description>Color transformation matrix coef BB</Description>
+            <DisplayName>Color transformation matrix coef BB</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented>-->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>               -->
+            <pValue>ColorTransformationBBReg</pValue>
+            <Min>-7.99993896484375</Min>
+            <Max>7.99993896484375</Max>
+            <Inc>0.00006103515625</Inc>
+            <DisplayPrecision>14</DisplayPrecision>
+        </Float>
+        <FloatReg Name="ColorTransformationBBReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa5c</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+        
+        <!-- ColorTransformationB0 -->
+        <Float Name="ColorTransformationB0" NameSpace="Standard">
+            <ToolTip>Color transformation matrix coef B0</ToolTip>
+            <Description>Color transformation matrix coef B0</Description>
+            <DisplayName>Color transformation matrix coef B0</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>FWCapable_ColorTransformation_Imp</pIsImplemented> -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>                -->
+            <pValue>ColorTransformationB0Reg</pValue>
+            <Min>-65535</Min>
+            <Max>65535</Max>
+            <Inc>1</Inc>
+            <!--<DisplayPrecision>14</DisplayPrecision>-->
+        </Float>
+        <FloatReg Name="ColorTransformationB0Reg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa64</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+    </Group>
+
+    <!-- ******************************************************************* -->
+    <!--  MetaDataControl                                                    -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="MetaDataControl">
+        <!-- MetaDataControl_Implemented -->
+        <Boolean Name="MetaDataControl_Imp" NameSpace="Standard">
+            <ToolTip>MetaDataControl_Imp access check implementation</ToolTip>
+            <Description>MetaDataControl_Imp access check implementation</Description>
+            <DisplayName>MetaDataControl_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>MetaDataControl_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="MetaDataControl_ImpReg">
+            <Address>0x98</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- MetaDataMode -->
+        <Enumeration Name="MetaDataMode" NameSpace="Standard">
+            <ToolTip>Inserts metadata information according to selected mode.</ToolTip>
+            <Description>Inserts metadata information according to selected mode.</Description>
+            <DisplayName>Meta Data Enable Mode</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsImplemented>MetaDataControl_Imp</pIsImplemented>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <EnumEntry Name="Disable" NameSpace="Standard">
+                <DisplayName>Disable</DisplayName>
+                <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="Mode1" NameSpace="Standard">
+                <DisplayName>Mode1</DisplayName>
+                <!--<pIsImplemented>FWCapableMetaData_Mode1_Imp</pIsImplemented>-->
+                <Value>1</Value>
+            </EnumEntry>
+            <pValue>MetaDataModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="MetaDataModeReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerStreamRegsBase</pAddress>
+            <Address>0xa6c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    </Group>
+
+</RegisterDescription>

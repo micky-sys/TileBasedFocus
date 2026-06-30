@@ -1,0 +1,1100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RegisterDescription
+    ModelName="KAYA_Local_Device_XML"
+    VendorName="KAYA_Instruments_Ltd"
+    ToolTip="KAYA_Local_Device_XML"
+    StandardNameSpace="None"
+    SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="0"
+    MajorVersion="4" MinorVersion="0" SubMinorVersion="0"
+    ProductGuid="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+    VersionGuid="11111111-2222-3333-4444-555555555555"
+    xmlns="http://www.genicam.org/GenApi/Version_1_1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_1
+    http://www.genicam.org/GenApi/GenApiSchema_Version_1_1.xsd">
+    
+    <!-- ******************************************************************* -->
+    <!-- Categories                                                             -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="RootCategory">
+        <Category Name="Root" NameSpace="Standard">
+            <ToolTip>Extended features and stream statistics related to connected camera.</ToolTip>
+            <Description>Extended features and stream statistics related to connected camera.</Description>
+            <DisplayName>Extended Stream Features</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pFeature>PolledParametersInvalidator</pFeature>
+            <pFeature>DeviceControl</pFeature>
+            <pFeature>DeviceSerialPortControl</pFeature>
+            <pFeature>CameraTriggerControl</pFeature>
+            <pFeature>ExtendedStreamCallbackMask</pFeature>
+            <pFeature>FrameStartCallbacks</pFeature>
+        </Category>
+    </Group>
+    
+    <!-- ******************************************************************* -->
+    <!-- Port                                                                -->
+    <!-- ******************************************************************* -->
+    
+    <Port Name="Device">
+        <ToolTip> Port node giving access to the camera</ToolTip>
+    </Port> 
+    
+    <!-- ******************************************************************* -->
+    <!-- Integers                                                             -->
+    <!-- ******************************************************************* -->
+
+    <Integer Name="VirtPerCamGrabRegsBase">
+        <Value>0x00000000</Value>
+    </Integer>
+    
+    <Integer Name="SoftwareCapabilitiesBase">
+        <Value>0xC0000000</Value>
+    </Integer>
+    
+    <!-- PolledParametersInvalidator -->
+    <Command Name="PolledParametersInvalidator">
+        <ToolTip>Inalidates the value of appointed parameters.</ToolTip>
+        <Description>Inalidates the value of appointed parameters. Triggered by background monitoring procedure</Description>
+        <Visibility>Invisible</Visibility>
+        <Value>0</Value>
+        <CommandValue>1</CommandValue>
+    </Command>
+    
+    <!-- ******************************************************************* -->
+    <!-- Categories                                                          -->
+    <!-- ******************************************************************* -->
+    
+    <Category Name="DeviceControl" NameSpace="Standard">
+        <ToolTip>Category for Device information and control.</ToolTip>
+        <Description>Category for Device information and control.</Description>
+        <DisplayName>Device Control</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>LinksConnectionMask</pFeature>                 
+    </Category>
+    
+    <Category Name="DeviceSerialPortControl" NameSpace="Standard">
+        <ToolTip>Category that contains the serial port control.</ToolTip>
+        <Description>Category that contains the serial port control.</Description>
+        <DisplayName>Device Serial Port Control</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RO</ImposedAccessMode>
+        <pFeature>DeviceSerialPortSelector</pFeature>
+        <pFeature>DeviceSerialPortNumber</pFeature>        
+        <pFeature>DeviceSerialPortComEnable</pFeature>     
+    </Category>
+
+    <Category Name="CameraTriggerControl" NameSpace="Standard">
+        <ToolTip>The Camera Trigger Control section describes all features related to image acquisition using camera trigger(s).</ToolTip>
+        <Description>The Camera Trigger Control section describes all features related to image acquisition using camera trigger(s).</Description>
+        <DisplayName>Camera Trigger Control</DisplayName>
+        <Visibility>Expert</Visibility>
+        <pIsImplemented>CameraTriggerControl_Imp</pIsImplemented>
+        <pFeature>CameraTriggerMode</pFeature>
+        <pFeature>CameraTriggerActivation</pFeature>
+        <pFeature>CameraTriggerSource</pFeature>
+        <pFeature>CameraTriggerDelay</pFeature>         
+        <pFeature>CameraTriggerFilter</pFeature>        
+        <pFeature>CameraTriggerSoftware</pFeature>      
+        <pFeature>CameraTriggerEventEnable</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN0_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN1_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN2_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN3_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN4_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN5_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN6_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN7_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN8_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN9_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN10_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN11_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN12_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN13_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN14_Imp</pFeature>
+        <pFeature>CameraTriggerSource_TriggerN15_Imp</pFeature>
+        <pFeature>CameraTriggerControl_Imp</pFeature>
+        <pFeature>CameraTriggerControlIsAvaialble</pFeature>
+    </Category>
+    
+    <StructReg Comment="SWFeaturesAvailableReg"> <!-- 63 bit is not working -->
+        <pAddress>SoftwareCapabilitiesBase</pAddress>
+        <Address>0x00000000</Address>
+        <Length>8</Length>
+        <AccessMode>RO</AccessMode>
+        <pPort>Device</pPort>
+        <Cachable>NoCache</Cachable>
+        <Endianess>LittleEndian</Endianess>
+        
+        <StructEntry Name="ManualDetectionAvaliable">
+            <Bit>0</Bit>
+        </StructEntry>
+    </StructReg>
+    
+    <!-- ******************************************************************* -->
+    <!-- Capabilities                                                        -->
+    <!-- ******************************************************************* -->
+    
+    <!-- ******************************************************************* -->
+    <!-- DeviceControl                                                       -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="DeviceControl">
+ 
+    <StringReg Name="LinksConnectionMask">
+        <ToolTip>Links on which camera is detected.</ToolTip>
+        <Description>Bitmask indicating grabber links on which camera is detected.</Description>
+        <DisplayName>Connection Mask</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <ImposedAccessMode>RW</ImposedAccessMode>
+        <Address>0x0</Address>
+        <pAddress>VirtPerCamGrabRegsBase</pAddress>
+        <Length>8</Length>
+        <AccessMode>RO</AccessMode>
+        <pPort>Device</pPort>
+        <Cachable>NoCache</Cachable>
+    </StringReg>
+ 
+    </Group>
+    
+    <!-- ******************************************************************* -->
+    <!-- TransportLayerControl                                               -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="DeviceSerialPortControl">
+        <!-- DeviceSerialPortSelector -->
+        <Enumeration Name="DeviceSerialPortSelector" NameSpace="Standard">
+            <ToolTip>Selects device available serial port.</ToolTip>
+            <Description>Selects device available serial port.</Description>
+            <DisplayName>Serial Port Selector</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>SWCapable_SerialPort_Imp</pIsImplemented>        -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>              -->
+            <EnumEntry Name="CameraLink" NameSpace="Standard">
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_0" NameSpace="Standard">
+              <Value>1</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_1" NameSpace="Standard">
+              <Value>2</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_2" NameSpace="Standard">
+              <Value>3</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_3" NameSpace="Standard">
+              <Value>4</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_4" NameSpace="Standard">
+              <Value>5</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_5" NameSpace="Standard">
+              <Value>6</Value>
+            </EnumEntry>
+            <EnumEntry Name="PeripheralGPIO_6" NameSpace="Standard">
+              <Value>7</Value>
+            </EnumEntry>
+            <pValue>DeviceSerialPortSelectorReg</pValue>
+            <pSelected>DeviceSerialPortNumber</pSelected>
+            <pSelected>DeviceSerialPortComEnable</pSelected>
+        </Enumeration>
+        <IntReg Name="DeviceSerialPortSelectorReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x8</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- DeviceSerialPortComEnable -->
+        <Boolean Name="DeviceSerialPortComEnable" NameSpace="Standard">
+            <ToolTip>Enables selected serial COM port channel.</ToolTip>
+            <Description>Enables selected serial COM port channel.</Description>
+            <DisplayName>Serial COM Port Enable</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>SWCapable_SerialPort_Imp</pIsImplemented>    -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>          -->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>DeviceSerialPortComEnableReg</pValue>
+        </Boolean>
+        <IntReg Name="DeviceSerialPortComEnableReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>DeviceSerialPortComEnableAddr</pAddress>
+            <Address>0x2c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <IntSwissKnife Name="DeviceSerialPortComEnableAddr">
+            <pVariable Name="BASE_VIRT_GRAB_CAM">VirtPerCamGrabRegsBase</pVariable>
+            <pVariable Name="SERIAL_PORT_SELECT">DeviceSerialPortSelectorReg</pVariable>
+            <Formula>BASE_VIRT_GRAB_CAM + SERIAL_PORT_SELECT*4</Formula>
+        </IntSwissKnife>
+        <!-- DeviceSerialPortNumber -->
+        <Integer Name="DeviceSerialPortNumber" NameSpace="Standard">
+            <ToolTip>Serial virtual COM port number.</ToolTip>
+            <Description>Serial virtual COM port number.</Description>
+            <DisplayName>Serial Port Number</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <!--<pIsImplemented>SWCapable_SerialPort_Imp</pIsImplemented>     -->
+            <!--<pIsAvailable>CameraFeatureAvailable</pIsAvailable>           -->
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>DeviceSerialPortNumberReg</pValue>
+            <Max>255</Max>
+        </Integer>
+        <IntReg Name="DeviceSerialPortNumberReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>pDeviceSerialPortConfigAddr</pAddress>
+            <Address>0xc</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+
+        <IntSwissKnife Name="pDeviceSerialPortConfigAddr">
+            <pVariable Name="BASE_VIRT_GRAB_CAM">VirtPerCamGrabRegsBase</pVariable>
+            <pVariable Name="SERIAL_PORT_SELECT">DeviceSerialPortSelectorReg</pVariable>
+            <Formula>BASE_VIRT_GRAB_CAM + SERIAL_PORT_SELECT*4</Formula>
+        </IntSwissKnife>
+    </Group>
+
+    <!-- ******************************************************************* -->
+    <!-- CameraTriggerControl                                                -->
+    <!-- ******************************************************************* -->
+    
+    <Group Comment="CameraTriggerControl">
+    
+        <!-- CameraTriggerControl_Imp -->
+        <Boolean Name="CameraTriggerControl_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerControl_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerControl_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerControl_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerControl_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerControl_ImpReg">
+            <Address>0xb0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    
+        <Boolean Name="CameraTriggerControlIsAvaialble" NameSpace="Standard">
+            <ToolTip>.</ToolTip>
+            <Description>.</Description>
+            <DisplayName>.</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerControlIsAvaialbleReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerControlIsAvaialbleReg">
+            <Address>0xb4</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <pInvalidator>PolledParametersInvalidator</pInvalidator>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    
+        <!-- CameraTriggerMode -->
+        <Enumeration Name="CameraTriggerMode" NameSpace="Standard">
+            <ToolTip>Controls if the selected camera trigger is active.</ToolTip>
+            <Description>Controls if the selected camera trigger is active.</Description>
+            <DisplayName>Camera Trigger Mode</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <EnumEntry Name="Off" NameSpace="Standard">
+              <DisplayName>Off</DisplayName>
+              <Visibility>Beginner</Visibility>
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="On" NameSpace="Standard">
+              <DisplayName>On</DisplayName>
+              <Visibility>Beginner</Visibility>
+              <Value>1</Value>
+            </EnumEntry>
+            <pValue>CameraTriggerModeReg</pValue>
+        </Enumeration>
+        <IntReg Name="CameraTriggerModeReg">
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x4c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CameraTriggerActivation -->
+        <Enumeration Name="CameraTriggerActivation" NameSpace="Standard">
+            <ToolTip>Specifies the activation mode of the camera trigger.</ToolTip>
+            <Description>Specifies the activation mode of the camera trigger.</Description>
+            <DisplayName>Camera Trigger Activation</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <EnumEntry Name="RisingEdge" NameSpace="Standard">
+                <DisplayName>Rising Edge</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000000</Value>
+            </EnumEntry>
+            <EnumEntry Name="FallingEdge" NameSpace="Standard">
+                <DisplayName>Falling Edge</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000001</Value>
+            </EnumEntry>
+            <EnumEntry Name="AnyEdge" NameSpace="Standard">
+                <DisplayName>Any Edge</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000002</Value>
+            </EnumEntry>
+            <EnumEntry Name="RisingEdgeInv" NameSpace="Standard">
+                <DisplayName>Rising Edge Invert</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000003</Value>
+            </EnumEntry>
+            <EnumEntry Name="FallingEdgeInv" NameSpace="Standard">
+                <DisplayName>Falling Edge Invert</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000004</Value>
+            </EnumEntry>
+            <EnumEntry Name="AnyEdgeInv" NameSpace="Standard">
+                <DisplayName>Any Edge Invert</DisplayName>
+                <Visibility>Beginner</Visibility>
+                <Value>0x00000005</Value>
+            </EnumEntry>
+            <pValue>CameraTriggerActivationReg</pValue>
+        </Enumeration>
+        <IntReg Name="CameraTriggerActivationReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x50</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CameraTriggerSource -->
+        <Boolean Name="CameraTriggerSource_TriggerN0_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN0_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN0_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN0_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN0_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN0_ImpReg">
+            <Address>0x70</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN1_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN1_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN1_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN1_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN1_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN1_ImpReg">
+            <Address>0x74</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN2_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN2_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN2_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN2_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN2_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN2_ImpReg">
+            <Address>0x78</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN3_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN3_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN3_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN3_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN3_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN3_ImpReg">
+            <Address>0x7c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN4_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN4_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN4_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN4_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN4_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN4_ImpReg">
+            <Address>0x80</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN5_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN5_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN5_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN5_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN5_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN5_ImpReg">
+            <Address>0x84</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN6_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN6_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN6_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN6_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN6_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN6_ImpReg">
+            <Address>0x88</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN7_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN7_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN7_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN7_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN7_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN7_ImpReg">
+            <Address>0x8c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN8_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN8_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN8_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN8_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN8_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN8_ImpReg">
+            <Address>0x90</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN9_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN9_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN9_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN9_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN9_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN9_ImpReg">
+            <Address>0x94</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN10_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN10_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN10_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN10_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN10_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN10_ImpReg">
+            <Address>0x98</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN11_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN11_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN11_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN11_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN11_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN11_ImpReg">
+            <Address>0x9c</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN12_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN12_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN12_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN12_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN12_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN12_ImpReg">
+            <Address>0xa0</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN13_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN13_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN13_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN13_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN13_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN13_ImpReg">
+            <Address>0xa4</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN14_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN14_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN14_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN14_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN14_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN14_ImpReg">
+            <Address>0xa8</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <Boolean Name="CameraTriggerSource_TriggerN15_Imp" NameSpace="Standard">
+            <ToolTip>CameraTriggerSource_TriggerN15_Imp access check implementation</ToolTip>
+            <Description>CameraTriggerSource_TriggerN15_Imp access check implementation</Description>
+            <DisplayName>CameraTriggerSource_TriggerN15_Imp access check implementation</DisplayName>
+            <Visibility>Invisible</Visibility>
+            <pValue>CameraTriggerSource_TriggerN15_ImpReg</pValue>
+        </Boolean>
+        <IntReg Name="CameraTriggerSource_TriggerN15_ImpReg">
+            <Address>0xac</Address>
+            <Length>4</Length>
+            <AccessMode>RO</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <Enumeration Name="CameraTriggerSource" NameSpace="Standard">
+            <ToolTip>Specifies the internal signal or physical input Line to use as the camera trigger source. The selected camera trigger must have its CameraTriggerMode set to On.</ToolTip>
+            <Description>Specifies the internal signal or physical input Line to use as the camera trigger source. The selected camera trigger must have its CameraTriggerMode set to On.</Description>
+            <DisplayName>Camera Trigger Source</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <EnumEntry Name="KY_DISABLED" NameSpace="Standard">
+                <DisplayName>Disabled</DisplayName>
+                <Value>0x00</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_OPTO_IN_0" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN0_ImpReg</pIsImplemented>-->
+                <Value>0x01</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_1" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN1_ImpReg</pIsImplemented>-->
+                <Value>0x02</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_2" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN2_ImpReg</pIsImplemented>-->
+                <Value>0x03</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_3" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN3_ImpReg</pIsImplemented>-->
+                <Value>0x04</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_4" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN4_ImpReg</pIsImplemented>-->
+                <Value>0x05</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_5" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN5_ImpReg</pIsImplemented>-->
+                <Value>0x06</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_6" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN6_ImpReg</pIsImplemented>-->
+                <Value>0x07</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_OPTO_IN_7" NameSpace="Standard">
+                <DisplayName>OptoCoupled Input 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYOPTOIN7_ImpReg</pIsImplemented>-->
+                <Value>0x08</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_LVDS_IN_0" NameSpace="Standard">
+                <DisplayName>LVDS Input 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN0_ImpReg</pIsImplemented>-->
+                <Value>0x09</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_1" NameSpace="Standard">
+                <DisplayName>LVDS Input 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN1_ImpReg</pIsImplemented>-->
+                <Value>0x0A</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_2" NameSpace="Standard">
+                <DisplayName>LVDS Input 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN2_ImpReg</pIsImplemented>-->
+                <Value>0x0B</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVDS_IN_3" NameSpace="Standard">
+                <DisplayName>LVDS Input 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVDSIN3_ImpReg</pIsImplemented>-->
+                <Value>0x0C</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_TTL_0" NameSpace="Standard">
+                <DisplayName>TTL 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL0_ImpReg</pIsImplemented>-->
+                <Value>0x0D</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_1" NameSpace="Standard">
+                <DisplayName>TTL 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL1_ImpReg</pIsImplemented>-->
+                <Value>0x0E</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_2" NameSpace="Standard">
+                <DisplayName>TTL 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL2_ImpReg</pIsImplemented>-->
+                <Value>0x0F</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_3" NameSpace="Standard">
+                <DisplayName>TTL 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL3_ImpReg</pIsImplemented>-->
+                <Value>0x10</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_4" NameSpace="Standard">
+                <DisplayName>TTL 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL4_ImpReg</pIsImplemented>-->
+                <Value>0x11</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_5" NameSpace="Standard">
+                <DisplayName>TTL 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL5_ImpReg</pIsImplemented>-->
+                <Value>0x12</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_6" NameSpace="Standard">
+                <DisplayName>TTL 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL6_ImpReg</pIsImplemented>-->
+                <Value>0x13</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TTL_7" NameSpace="Standard">
+                <DisplayName>TTL 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYTTL7_ImpReg</pIsImplemented>-->
+                <Value>0x14</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_LVTTL_0" NameSpace="Standard">
+                <DisplayName>LVTTL 0</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL0_ImpReg</pIsImplemented>-->
+                <Value>0x15</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_1" NameSpace="Standard">
+                <DisplayName>LVTTL 1</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL1_ImpReg</pIsImplemented>-->
+                <Value>0x16</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_2" NameSpace="Standard">
+                <DisplayName>LVTTL 2</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL2_ImpReg</pIsImplemented>-->
+                <Value>0x17</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_3" NameSpace="Standard">
+                <DisplayName>LVTTL 3</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL3_ImpReg</pIsImplemented>-->
+                <Value>0x18</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_4" NameSpace="Standard">
+                <DisplayName>LVTTL 4</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL4_ImpReg</pIsImplemented>-->
+                <Value>0x19</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_5" NameSpace="Standard">
+                <DisplayName>LVTTL 5</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL5_ImpReg</pIsImplemented>-->
+                <Value>0x1A</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_6" NameSpace="Standard">
+                <DisplayName>LVTTL 6</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL6_ImpReg</pIsImplemented>-->
+                <Value>0x1B</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_LVTTL_7" NameSpace="Standard">
+                <DisplayName>LVTTL 7</DisplayName>
+                <!--<pIsImplemented>LineSelector_KYLVTTL7_ImpReg</pIsImplemented>-->
+                <Value>0x1C</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_SOFTWARE" NameSpace="Standard">
+                <DisplayName>Software</DisplayName>
+                <Value>0x2B</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_ENCODER_0" NameSpace="Standard">
+                <DisplayName>Encoder 0</DisplayName>
+                <!--<pIsImplemented>IOEncoder_0_Imp</pIsImplemented>-->
+                <Value>0x2C</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_1" NameSpace="Standard">
+                <DisplayName>Encoder 1</DisplayName>
+                <!--<pIsImplemented>IOEncoder_1_Imp</pIsImplemented>-->
+                <Value>0x2D</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_2" NameSpace="Standard">
+                <DisplayName>Encoder 2</DisplayName>
+                <!--<pIsImplemented>IOEncoder_2_Imp</pIsImplemented>-->
+                <Value>0x2E</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_ENCODER_3" NameSpace="Standard">
+                <DisplayName>Encoder 3</DisplayName>
+                <!--<pIsImplemented>IOEncoder_3_Imp</pIsImplemented>-->
+                <Value>0x2F</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="KY_TIMER_ACTIVE_0" NameSpace="Standard">
+                <DisplayName>Timer 0 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_0_Imp</pIsImplemented>-->
+                <Value>0x30</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_1" NameSpace="Standard">
+                <DisplayName>Timer 1 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_1_Imp</pIsImplemented>-->
+                <Value>0x31</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_2" NameSpace="Standard">
+                <DisplayName>Timer 2 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_2_Imp</pIsImplemented>-->
+                <Value>0x32</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_3" NameSpace="Standard">
+                <DisplayName>Timer 3 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_3_Imp</pIsImplemented>-->
+                <Value>0x33</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_4" NameSpace="Standard">
+                <DisplayName>Timer 4 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_4_Imp</pIsImplemented>-->
+                <Value>0x34</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_5" NameSpace="Standard">
+                <DisplayName>Timer 5 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_5_Imp</pIsImplemented>-->
+                <Value>0x35</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_6" NameSpace="Standard">
+                <DisplayName>Timer 6 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_6_Imp</pIsImplemented>-->
+                <Value>0x36</Value>
+            </EnumEntry>
+            <EnumEntry Name="KY_TIMER_ACTIVE_7" NameSpace="Standard">
+                <DisplayName>Timer 7 Active</DisplayName>
+                <!--<pIsImplemented>IOTimer_7_Imp</pIsImplemented>-->
+                <Value>0x37</Value>
+            </EnumEntry>
+
+            <EnumEntry Name="TriggerN0" NameSpace="Standard">
+                <DisplayName>TriggerN 0</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN0_Imp</pIsImplemented>
+                <Value>64</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN1" NameSpace="Standard">
+                <DisplayName>TriggerN 1</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN1_Imp</pIsImplemented>
+                <Value>65</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN2" NameSpace="Standard">
+                <DisplayName>TriggerN 2</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN2_Imp</pIsImplemented>
+                <Value>66</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN3" NameSpace="Standard">
+                <DisplayName>TriggerN 3</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN3_Imp</pIsImplemented>
+                <Value>67</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN4" NameSpace="Standard">
+                <DisplayName>TriggerN 4</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN4_Imp</pIsImplemented>
+                <Value>68</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN5" NameSpace="Standard">
+                <DisplayName>TriggerN 5</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN5_Imp</pIsImplemented>
+                <Value>69</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN6" NameSpace="Standard">
+                <DisplayName>TriggerN 6</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN6_Imp</pIsImplemented>
+                <Value>70</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN7" NameSpace="Standard">
+                <DisplayName>TriggerN 7</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN7_Imp</pIsImplemented>
+                <Value>71</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN8" NameSpace="Standard">
+                <DisplayName>TriggerN 8</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN8_Imp</pIsImplemented>
+                <Value>72</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN9" NameSpace="Standard">
+                <DisplayName>TriggerN 9</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN9_Imp</pIsImplemented>
+                <Value>73</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN10" NameSpace="Standard">
+                <DisplayName>TriggerN 10</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN10_Imp</pIsImplemented>
+                <Value>74</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN11" NameSpace="Standard">
+                <DisplayName>TriggerN 11</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN11_Imp</pIsImplemented>
+                <Value>75</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN12" NameSpace="Standard">
+                <DisplayName>TriggerN 12</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN12_Imp</pIsImplemented>
+                <Value>76</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN13" NameSpace="Standard">
+                <DisplayName>TriggerN 13</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN13_Imp</pIsImplemented>
+                <Value>77</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN14" NameSpace="Standard">
+                <DisplayName>TriggerN 14</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN14_Imp</pIsImplemented>
+                <Value>78</Value>
+            </EnumEntry>
+            <EnumEntry Name="TriggerN15" NameSpace="Standard">
+                <DisplayName>TriggerN 15</DisplayName>
+                <pIsImplemented>CameraTriggerSource_TriggerN15_Imp</pIsImplemented>
+                <Value>79</Value>
+            </EnumEntry>
+
+            <pValue>CameraTriggerSourceReg</pValue>
+        </Enumeration>
+        <IntReg Name="CameraTriggerSourceReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x54</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CameraTriggerDelay -->
+        <Float Name="CameraTriggerDelay" NameSpace="Standard">
+            <ToolTip>Specifies the delay in microseconds(us) to apply after the camera trigger reception before activating it.</ToolTip>
+            <Description>Specifies the delay in microseconds(us) to apply after the camera trigger reception before activating it.</Description>
+            <DisplayName>Camera Trigger Delay</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>CameraTriggerDelayReg</pValue>
+            <Min>0</Min>
+            <Max>34359738</Max>
+            <Unit>us</Unit>
+            <Representation>Linear</Representation>
+        </Float>
+        <FloatReg Name="CameraTriggerDelayReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x58</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+    
+        <!-- CameraTriggerFilter -->
+        <Float Name="CameraTriggerFilter" NameSpace="Standard">
+            <ToolTip>Filter for camera trigger, helps prevent signal de-bouncing. 8ns resolution, units in microseconds(us).</ToolTip>
+            <Description>Filter for camera trigger, helps prevent signal de-bouncing. 8ns resolution, units in microseconds(us).</Description>
+            <DisplayName>Camera Trigger Filter</DisplayName>
+            <Visibility>Expert</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <pValue>CameraTriggerFilterReg</pValue>
+            <Min>0</Min>
+            <Max>34359738</Max>
+            <Unit>us</Unit>
+        </Float>
+        <FloatReg Name="CameraTriggerFilterReg">
+            <Visibility>Invisible</Visibility>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x60</Address>
+            <Length>8</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Endianess>LittleEndian</Endianess>
+        </FloatReg>
+    
+        <!-- CameraTriggerSoftware -->
+        <Command Name="CameraTriggerSoftware" NameSpace="Standard">
+            <ToolTip>Generates an internal camera trigger. CameraTriggerSource must be set to Software.</ToolTip>
+            <Description>Generates an internal camera trigger. CameraTriggerSource must be set to Software.</Description>
+            <DisplayName>Camera Trigger Software</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <pValue>CameraTriggerSoftwareReg</pValue>
+            <CommandValue>1</CommandValue>
+        </Command>
+        <IntReg Name="CameraTriggerSoftwareReg">
+            <ToolTip>Issue the Camera Trigger Software command.</ToolTip>
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x68</Address>
+            <Length>4</Length>
+            <AccessMode>WO</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        
+        <!-- CameraTriggerEventEnable -->
+        <Enumeration Name="CameraTriggerEventEnable" NameSpace="Standard">
+            <ToolTip>Enable event from camera trigger on every activation.</ToolTip>
+            <Description>Enable event from camera trigger on every activation.</Description>
+            <DisplayName>Camera Trigger Event Enable</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <pIsAvailable>CameraTriggerControlIsAvaialble</pIsAvailable>
+            <EnumEntry Name="Disable" NameSpace="Standard">
+              <DisplayName>Disable</DisplayName>
+              <Visibility>Beginner</Visibility>
+              <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="Enable" NameSpace="Standard">
+              <DisplayName>Enable</DisplayName>
+              <Visibility>Beginner</Visibility>
+              <Value>1</Value>
+            </EnumEntry>
+            <pValue>CameraTriggerEventEnableReg</pValue>
+        </Enumeration>
+        <IntReg Name="CameraTriggerEventEnableReg">
+            <pAddress>VirtPerCamGrabRegsBase</pAddress>
+            <Address>0x6c</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    </Group>
+
+    <!-- ******************************************************************* -->
+    <!-- ExtendedStreamCallbackMask                                          -->
+    <!-- ******************************************************************* -->
+    
+    <Integer Name="ExtendedStreamCallbackMask" NameSpace="Standard">
+        <ToolTip>Request extended stream callbacks with selected flags.</ToolTip>
+        <Description>Request extended stream callbacks with selected flags.</Description>
+        <DisplayName>Extended stream callbacks</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <pValue>ExtendedStreamCallbackReg</pValue>
+        <Min>0</Min>
+         <Max>255</Max>
+        <Inc>1</Inc>
+        <Representation>HexNumber</Representation>
+        <pSelected>FrameStartCallbacks</pSelected>
+    </Integer>
+    <IntReg Name="ExtendedStreamCallbackReg">
+        <Visibility>Invisible</Visibility>
+        <pAddress>VirtPerCamGrabRegsBase</pAddress>
+        <Address>0xb8</Address>
+        <Length>4</Length>
+        <AccessMode>RO</AccessMode>
+        <pPort>Device</pPort>
+        <Cachable>NoCache</Cachable>
+        <pInvalidator>FrameStartCallbacks</pInvalidator>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+
+    </IntReg>
+    <Boolean Name="FrameStartCallbacks" NameSpace="Standard">
+        <ToolTip>Generate callback when DMA starts filling a frame (if supported by the HW).</ToolTip>
+        <Description>Generate callback when DMA starts filling a frame (if supported by the HW).</Description>
+        <DisplayName>Frame Start Callbacks</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <!--<pIsAvailable>FW_Dma_Capable_FrameStartCallback_Imp</pIsAvailable>-->
+        <pValue>FrameStartReg</pValue>
+    </Boolean>
+    <IntReg Name="FrameStartReg">
+        <pAddress>VirtPerCamGrabRegsBase</pAddress>
+        <Address>0xbc</Address>
+        <Length>4</Length>
+        <AccessMode>RW</AccessMode>
+        <pPort>Device</pPort>
+        <Cachable>WriteThrough</Cachable>
+        <Sign>Unsigned</Sign>
+        <Endianess>LittleEndian</Endianess>
+    </IntReg>
+
+</RegisterDescription>

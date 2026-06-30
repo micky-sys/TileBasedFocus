@@ -1,0 +1,12 @@
+harvesters>=1.4.0
+PySide6>=6.5.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+# Unified capture + focus app
+tifffile>=2024.5.10        # classic TIFF writer for focus crops + offline bay14->tif tool
+imagecodecs>=2024.6.1      # fallback packints encoder used by raw_bay_writer (~210 ms/frame)
+numba>=0.59                # primary fast pack backend in raw_bay_writer (JIT pack, ~30-70 ms/frame)
+blosc2>=2.0                # .bay14line payload compression in writer subprocesses
+psutil>=5.9                # drive enumeration in the per-camera target dropdowns
+pyserial>=3.5              # ClearCore PCB and GNSS receiver serial links
+pynmea2>=1.19              # parse NMEA 0183 GGA / RMC sentences

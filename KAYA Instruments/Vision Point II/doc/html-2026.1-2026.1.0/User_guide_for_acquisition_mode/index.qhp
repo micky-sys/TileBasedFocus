@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<QtHelpProject version="1.0">
+<namespace>org.gui_acquisition_mode.Project</namespace>
+<virtualFolder>doc</virtualFolder>
+<filterSection>
+<filterAttribute>doxygen</filterAttribute>
+<toc>
+<section title="User guide for acquisition mode 2026.1-2026.1.0" ref="index.html">
+<section title="Revision History" ref="_revision__history_page.html"/>
+<section title="Introduction" ref="_introduction_page.html"/>
+<section title="Vision Point II app components" ref="_vision__point__i_i_app_components_page.html"/>
+<section title="Vision Point II app Basics" ref="_vision__point__i_i_app__basics_page.html"/>
+<section title="Save Operation" ref="_save__operation_page.html"/>
+<section title="Firmware update" ref="_firmware_update_page.html"/>
+<section title="Troubleshooting" ref="_troubleshooting_page.html"/>
+<section title="GUI features" ref="_g_u_i_features_page.html"/>
+</section>
+</toc>
+<keywords>
+<keyword name="Revision History" id="Revision History_" ref="_revision__history_page.html"/>
+<keyword name="Introduction" id="Introduction_" ref="_introduction_page.html"/>
+<keyword name="Vision Point II app components" id="Vision Point II app components_" ref="_vision__point__i_i_app_components_page.html"/>
+<keyword name="Vision Point II app Basics" id="Vision Point II app Basics_" ref="_vision__point__i_i_app__basics_page.html"/>
+<keyword name="Save Operation" id="Save Operation_" ref="_save__operation_page.html"/>
+<keyword name="Firmware update" id="Firmware update_" ref="_firmware_update_page.html"/>
+<keyword name="Troubleshooting" id="Troubleshooting_" ref="_troubleshooting_page.html"/>
+<keyword name="GUI features" id="GUI features_" ref="_g_u_i_features_page.html"/>
+</keywords>
+<files>
+<file>_firmware_update_page.html</file>
+<file>_g_u_i_features_page.html</file>
+<file>_introduction_page.html</file>
+<file>_revision__history_page.html</file>
+<file>_save__operation_page.html</file>
+<file>_troubleshooting_page.html</file>
+<file>_vision___point___i_i___app___user___guide___for___acquisition___mode_8h_source.html</file>
+<file>_vision__point__i_i_app__basics_page.html</file>
+<file>_vision__point__i_i_app_components_page.html</file>
+<file>bc_s.png</file>
+<file>bc_sd.png</file>
+<file>closed.png</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e.html</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e_dep.jpg</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e_dep.pdf</file>
+<file>dir_68267d1309a1af8e8297ef4c3efbcdba.html</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e.html</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e_dep.jpg</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e_dep.pdf</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be.html</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be_dep.jpg</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be_dep.pdf</file>
+<file>doxygen.svg</file>
+<file>dynsections.js</file>
+<file>full_styles.css</file>
+<file>graph_legend.html</file>
+<file>graph_legend.jpg</file>
+<file>image10.png</file>
+<file>image11.png</file>
+<file>image12.png</file>
+<file>image13.png</file>
+<file>image14.png</file>
+<file>image15.png</file>
+<file>image16.png</file>
+<file>image17.png</file>
+<file>image18.png</file>
+<file>image19.png</file>
+<file>image20.png</file>
+<file>image21.png</file>
+<file>image22.png</file>
+<file>image23.png</file>
+<file>image24.png</file>
+<file>image25.png</file>
+<file>image26.png</file>
+<file>image27.png</file>
+<file>image28.png</file>
+<file>image29.png</file>
+<file>image30.png</file>
+<file>image32.png</file>
+<file>image34.png</file>
+<file>image35.png</file>
+<file>image37.png</file>
+<file>image39.png</file>
+<file>image41.png</file>
+<file>image43.png</file>
+<file>image45.png</file>
+<file>image47.png</file>
+<file>image49.png</file>
+<file>image5.png</file>
+<file>image51.png</file>
+<file>image52.PNG</file>
+<file>image53.PNG</file>
+<file>image54.PNG</file>
+<file>image55.PNG</file>
+<file>image56.png</file>
+<file>image57.png</file>
+<file>image58.png</file>
+<file>image59.tiff</file>
+<file>image6.png</file>
+<file>image60.jpeg</file>
+<file>image61.png</file>
+<file>image62.png</file>
+<file>image63.png</file>
+<file>image64.png</file>
+<file>image65.png</file>
+<file>image66.png</file>
+<file>image7.png</file>
+<file>image8.png</file>
+<file>image9.png</file>
+<file>index.html</file>
+<file>jquery.js</file>
+<file>logo.png</file>
+<file>nav_f.png</file>
+<file>nav_fd.png</file>
+<file>nav_g.png</file>
+<file>nav_h.png</file>
+<file>nav_hd.png</file>
+<file>open.png</file>
+<file>pages.html</file>
+<file>script.js</file>
+<file>splitbar.png</file>
+<file>splitbard.png</file>
+<file>style.css</file>
+<file>svg.min.js</file>
+<file>sync_off.png</file>
+<file>sync_on.png</file>
+<file>tab_a.png</file>
+<file>tab_ad.png</file>
+<file>tab_b.png</file>
+<file>tab_bd.png</file>
+<file>tab_h.png</file>
+<file>tab_hd.png</file>
+<file>tab_s.png</file>
+<file>tab_sd.png</file>
+<file>tabs.css</file>
+</files>
+</filterSection>
+</QtHelpProject>

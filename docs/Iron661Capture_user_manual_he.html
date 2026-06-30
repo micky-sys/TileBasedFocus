@@ -1,0 +1,400 @@
+<!DOCTYPE html><html dir="rtl" lang="he"><head><meta charset="utf-8"/><style>
+@page {
+    size: A4;
+    margin: 2cm 2.2cm;
+}
+html, body {
+    direction: rtl;
+    text-align: right;
+    font-family: "Segoe UI", "David", "Arial", sans-serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    color: #111;
+}
+h1 {
+    font-size: 22pt;
+    font-weight: 700;
+    margin-top: 0;
+    text-align: right;
+}
+h2 {
+    font-size: 16pt;
+    font-weight: 700;
+    margin-top: 1.2em;
+    border-bottom: 1px solid #ccc;
+    padding-bottom: 0.2em;
+    text-align: right;
+}
+h3 {
+    font-size: 13pt;
+    font-weight: 700;
+    margin-top: 1em;
+    text-align: right;
+}
+p, li, td, th {
+    text-align: right;
+}
+ul, ol {
+    padding-right: 1.5em;
+    padding-left: 0;
+    margin-right: 0;
+}
+blockquote {
+    border-right: 3px solid #4472C4;
+    border-left: none;
+    margin: 1em 0;
+    padding: 0.5em 1em 0.5em 0;
+    background: #f5f8ff;
+    text-align: right;
+}
+code {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 9pt;
+    direction: ltr;
+    unicode-bidi: embed;
+}
+pre {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 9pt;
+    direction: ltr;
+    text-align: left;
+    background: #f4f4f4;
+    padding: 0.5em;
+    border: 1px solid #ddd;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+    direction: rtl;
+}
+th, td {
+    border: 1px solid #999;
+    padding: 6px 8px;
+    vertical-align: top;
+    text-align: right;
+}
+th {
+    background: #eef2f7;
+    font-weight: 700;
+}
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 1.5em 0;
+}
+a {
+    color: #1a5490;
+    text-decoration: none;
+}
+@media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style></head><body><h1>מדריך משתמש – אפליקציית Iron 661 Capture</h1>
+<p>מדריך הפעלה למפעיל <strong>מערכת פארלקס</strong> (שלוש מצלמות Iron 661).
+האפליקציה (כותרת חלון: <strong>Iron 661 Capture + Focus</strong>) רצה על מחשב Windows ושולטת במערכת פארלקס – שלוש המצלמות, בלוח ה‑ClearCore (מנועי פוקוס וטריגר) ובמקלט ה‑GPS.</p>
+<blockquote>
+<p><strong>הערה לגבי שפה:</strong> ממשק האפליקציה באנגלית. במדריך זה שמות הכפתורים והשדות מופיעים באנגלית בדיוק כפי שהם על המסך (למשל <code>Continous</code>, <code>Reset cameras (deep)</code>), וההסברים בעברית.</p>
+</blockquote>
+<hr />
+<h2>תוכן עניינים</h2>
+<ol>
+<li><a href="#section-0">לפני שמתחילים – חיבורים והכנה</a></li>
+<li><a href="#section-1">מתן שם לפרויקט</a></li>
+<li><a href="#section-2">וידוא שכל המצלמות תקינות (מצב Continous, ואם צריך – Deep reset)</a></li>
+<li><a href="#section-3">וידוא חיבור כבלים נכון (M4 ובדיקת סיבוב מנוע הפוקוס)</a></li>
+<li><a href="#section-4">איפוס מונים בהמראה</a></li>
+<li><a href="#section-5">כוונון פוקוס בגובה היעד</a></li>
+<li><a href="#section-6">צילום: מצב Normal בתנאים רגילים, מצב CollectionON בחריגות</a></li>
+<li><a href="#section-7">סיום טיסה וכיבוי מסודר</a></li>
+<li><a href="#section-8">טבלת מצבים ופקודות – סיכום מהיר</a></li>
+<li><a href="#section-9">פתרון תקלות נפוצות</a></li>
+</ol>
+<hr />
+<p><a name="section-0"></a></p>
+<h2>1. לפני שמתחילים – חיבורים והכנה</h2>
+<p>לפני כל פעולה אחרת, ודאו את השלבים הבאים:</p>
+<ol>
+<li><strong>הפעלת מערכת פארלקס</strong> – ודאו שמערכת פארלקס מופעלת ושאף יישום אחר (למשל Vision Point) אינו מחזיק במצלמות.</li>
+<li><strong>חיבור ה‑ClearCore PCB:</strong>
+   - בדרך כלל האפליקציה מתחברת <strong>אוטומטית</strong> בעת ההפעלה (זיהוי COM port).
+   - ודאו שבקבוצה <strong>ClearCore PCB</strong> הסטטוס מציג <code>connected</code>.
+   - אם לא התחבר: בחרו ידנית את ה‑COM port המתאים ולחצו <strong>Connect</strong>.
+   - חיבור זה הכרחי לשליטה במצבים (Modes), בטריגר ובמנועי הפוקוס של מערכת פארלקס.</li>
+<li><strong>חיבור ה‑GPS:</strong>
+   - בדרך כלל האפליקציה מתחברת <strong>אוטומטית</strong> בעת ההפעלה (זיהוי COM port של Septentrio).
+   - ודאו שבקבוצה <strong>GPS (Septentrio SBF)</strong> הסטטוס מציג <code>connected</code>.
+   - אם לא התחבר: בחרו COM port ידנית ולחצו <strong>Connect</strong>.</li>
+<li><strong>המתנה לסיום אתחול (Bring‑up):</strong>
+   - המתינו עד שכותרות שלוש שורות המצלמות (קבוצה <strong>Cameras</strong>) יהפכו ל<strong>ירוקות</strong> ושורת הסטטוס תציג <code>Bring-up: 3/3 cameras ready, all armed</code>.
+   - <strong>שימו לב:</strong> כפתורי המצבים וכפתורי האיפוס/Reset נשארים מנוטרלים עד שהאתחול והחימום (warmup) הסתיימו. זה תקין – המתינו.</li>
+<li><strong>בחירת כוננים (Drives):</strong>
+   - לחצו <strong>Refresh drives</strong> ובכל שורת מצלמה בחרו את כונן ה‑U.2 שאליו ייכתבו הקבצים בעמודת <strong>Drive:</strong>.</li>
+</ol>
+<blockquote>
+<p>כותרת מצלמה אפורה = המצלמה לא נפתחה. אם מופיעה הודעת <strong>"Camera open failed"</strong>, ודאו ש‑Vision Point סגור, שאין תהליך Python שנשאר פתוח, ושמערכת פארלקס מקבלת חשמל – ואז הפעילו מחדש.</p>
+</blockquote>
+<hr />
+<p><a name="section-1"></a></p>
+<h2>2. מתן שם לפרויקט</h2>
+<p>שם הפרויקט משמש גם כשם התיקייה וגם כרכיב בשם כל קובץ שנשמר.</p>
+<ol>
+<li>בקבוצה <strong>Project</strong>, בשדה <strong>Name:</strong>, הקלידו את שם הפרויקט (ברירת המחדל היא <code>Project</code>).</li>
+<li>צאו מהשדה (לחיצה במקום אחר או Enter) כדי להחיל את השם.</li>
+<li>ביומן (Log) תופיע שורת אישור <code>project = '...'</code>.</li>
+</ol>
+<p><strong>כללי תקינות לשם (נאכפים אוטומטית):</strong></p>
+<ul>
+<li>שם ריק נדחה (<code>Project name is empty.</code>).</li>
+<li>תווים אסורים ב‑Windows ( <code>&lt; &gt; : " / \ | ? *</code> ) ותווי בקרה מוחלפים אוטומטית בקו תחתון <code>_</code>.</li>
+<li>רווחים/נקודות בסוף השם מוסרים.</li>
+<li>שמות שמורים של Windows (כמו <code>CON</code>, <code>COM1</code>) נדחים.</li>
+</ul>
+<p>אם השם נדחה תופיע ביומן שורה <code>project name rejected: ...</code> ושום קובץ לא יישמר עד שיוגדר שם תקין.</p>
+<p><strong>מבנה על הדיסק:</strong> <code>&lt;כונן&gt;:\&lt;שם הפרויקט&gt;\</code> והקבצים ייקראו בתבנית
+<code>Cam&lt;serial&gt;_&lt;תאריך&gt;_&lt;שם הפרויקט&gt;_L&lt;line&gt;_S&lt;sweep&gt;_&lt;frame&gt;.bay14</code>.</p>
+<blockquote>
+<p>חשוב: ודאו שגם <strong>שם הפרויקט</strong> וגם <strong>הכוננים</strong> מוגדרים לפני כניסה למצבי הקלטה (Normal / Continous). כניסה למצב הקלטה ללא שם פרויקט תרשום אזהרה ולא יישמר דבר.</p>
+</blockquote>
+<hr />
+<p><a name="section-2"></a></p>
+<h2>3. וידוא שכל המצלמות תקינות – מצב Continous</h2>
+<p>מטרת השלב: לוודא שכל שלוש המצלמות מזרימות תמונות (frames) בקצב יציב.</p>
+<ol>
+<li>בקבוצה <strong>Mode</strong> לחצו על כפתור <strong><code>Continous</code></strong> (מצב M1).
+   - שורת הסטטוס תציג <code>Current: Continous</code>.
+   - במצב זה מערכת פארלקס מבצעת לולאת sweep רציפה והפריימים נכתבים לדיסק.</li>
+<li>בקבוצה <strong>Cameras</strong> עקבו אחרי המונים בכל שורת מצלמה:
+   - <strong><code>acq:N  hz:X.X</code></strong> – מספר הפריימים שנקלטו והקצב. הערך <code>N</code> צריך לעלות בכל שלוש המצלמות, וה‑<code>hz</code> צריך להיות יציב (סדר גודל של ~4.8 פריימים לשנייה הוא המקסימום של מערכת פארלקס).
+   - <strong><code>written:N</code></strong> – פריימים שנכתבו לדיסק; צריך לעלות בהתאם.
+   - <strong><code>dropped:N</code></strong> – פריימים שאבדו; אמור להישאר 0 או נמוך מאוד.</li>
+<li><strong>מצלמה תקינה</strong> = ה‑<code>acq</code> שלה עולה בקצב דומה לשאר. <strong>מצלמה תקועה</strong> = ה‑<code>acq</code> שלה לא זז או נמוך משמעותית.</li>
+</ol>
+<h3>אם מצלמה אינה זורמת – שחזור (Recovery)</h3>
+<p>נסו תחילה <strong><code>Reset cameras</code></strong> (שחזור רך), ורק אם אינו עוזר עברו ל‑<strong><code>Reset cameras (deep)</code></strong> (שחזור עמוק):</p>
+<ol>
+<li><strong>שחזור רך – <code>Reset cameras</code>:</strong> סוגר ופותח מחדש את כל המצלמות ובונה מחדש את ה‑grabber (המצלמות מנוטרלות ל‑~10–15 שניות). מכסה את רוב מצבי התקיעות הנפוצים.</li>
+<li><strong>שחזור עמוק – <code>Reset cameras (deep)</code>:</strong> כל מה שעושה השחזור הרך, ובנוסף מבצע <strong>DeviceReset</strong> חומרתי (אתחול firmware) לכל מצלמה (~20–25 שניות נטרול).
+   - השתמשו בו רק כשהשחזור הרך + re‑arm לא הספיק, למשל מצלמה שעדיין מציגה אפס פריימים.</li>
+</ol>
+<blockquote>
+<p><strong>למה רך לפני עמוק?</strong> זו ההנחיה המובנית באפליקציה: השחזור הרך מהיר יותר (~10–15 ש' לעומת ~20–25 ש'), פחות פולשני (סגירה/פתיחה מחדש של המצלמות בלבד), ומספיק ברוב המקרים. השחזור העמוק מוסיף אתחול firmware חומרתי – מיותר אם הרך פתר את הבעיה, ומאריך את זמן הנטרול של מערכת פארלקס.</p>
+</blockquote>
+<p>תהליך השחזור (לשני הסוגים):</p>
+<ol>
+<li>תופיע תיבת אישור (<code>Run DEEP camera recovery?</code> / <code>Run SOFT camera recovery?</code>) – אשרו.</li>
+<li>האפליקציה שולחת <code>$M0*</code> לעצירת הטריגרים, מנטרלת את המצלמות, מריצה את השחזור ברקע, ואז מחזירה את מערכת פארלקס לפעולה (re‑arm).</li>
+<li>בסיום, <strong>המונים מתאפסים אוטומטית</strong> והכפתורים נדלקים מחדש.</li>
+</ol>
+<p>לאחר השחזור חזרו ל‑<strong><code>Continous</code></strong> וודאו ששלוש המצלמות זורמות שוב.</p>
+<hr />
+<p><a name="section-3"></a></p>
+<h2>4. וידוא חיבור כבלים נכון – מצב M4 ובדיקת סיבוב מנוע הפוקוס</h2>
+<p>מטרת השלב: לוודא שהכבלים מחוברים נכון – שכאשר בוחרים מצלמה מסוימת, <strong>מנוע הפוקוס של אותה מצלמה</strong> הוא זה שמסתובב (ולא מנוע של מצלמה אחרת).</p>
+<ol>
+<li>בקבוצה <strong>Mode</strong> לחצו על כפתור <strong><code>Focus</code></strong> (מצב M4).
+   - המסך עובר לתצוגת <strong>Focus panel</strong> במסך מלא; השליחה ללוח היא <code>$M4*</code>.</li>
+<li>בלוח הפוקוס, תחת <strong>Camera:</strong>, בחרו מצלמה: <strong><code>cam1</code></strong>, <strong><code>cam2</code></strong> או <strong><code>cam3</code></strong>.
+   - בחירה זו שולחת ללוח את הפקודה המתאימה (<code>$C1*</code> / <code>$C2*</code> / <code>$C3*</code>) שמכוונת את מנוע הפוקוס של אותה מצלמה.</li>
+<li>הזיזו את הפוקוס בעזרת מקשי החיצים:
+   - <strong>חץ למעלה / למטה</strong> = צעד פוקוס פנימה/החוצה (שולח <code>+</code> / <code>-</code> למנוע).
+   - <strong>חץ ימינה / שמאלה</strong> = מרווח הזמן בין פריימים במצב M4.</li>
+<li><strong>בדקו פיזית</strong> שמנוע הפוקוס שמסתובב הוא של המצלמה שנבחרה במסך:
+   - בוחרים <code>cam1</code> → מנוע מצלמה 1 מסתובב.
+   - בוחרים <code>cam2</code> → מנוע מצלמה 2 מסתובב.
+   - בוחרים <code>cam3</code> → מנוע מצלמה 3 מסתובב.</li>
+<li>אם המנוע שמסתובב <strong>אינו</strong> תואם למצלמה שנבחרה – יש החלפה/טעות בחיבור הכבלים. עצרו ותקנו את החיווט לפני המשך.</li>
+</ol>
+<blockquote>
+<p>טכני: מנועי הפוקוס נעים רק במצב M4. עוצמת הפעימה למנוע נקבעת ע"י <strong>Strength</strong> (<code>1</code>=7000, <code>2</code>=10000, <code>3</code>=14000). מיפוי המצלמה במסך לחריץ בלוח נקבע לפי החיווט הסריאלי הקבוע, ולכן בדיקה פיזית זו חשובה.</p>
+</blockquote>
+<hr />
+<p><a name="section-4"></a></p>
+<h2>5. איפוס מונים בהמראה</h2>
+<p>ברגע ההמראה, אפסו את המונים כדי שהספירה תתחיל מבסיס נקי עבור הטיסה.</p>
+<ol>
+<li>ודאו ששם הפרויקט והכוננים מוגדרים.</li>
+<li>בקבוצה <strong>Project</strong> לחצו <strong><code>Reset counters</code></strong>.
+   - הפעולה מאפסת לאפס את המונים <code>acq</code> / <code>written</code> / <code>dropped</code> בכל שלוש המצלמות.
+   - מאפסת את מיקום ה‑sweep ל‑<code>S1 F1</code>.
+   - <strong>אינה</strong> מנטרלת מצלמות, אינה נוגעת בחומרה או בקובץ שורה (line) פתוח – רק מאפסת את הספירה שעל המסך.</li>
+</ol>
+<blockquote>
+<p>אם בחרתם להגדיר <strong>Line</strong> לטיסה זו, עשו זאת לפני/בעת ההמראה. שינוי שדה <strong>Line</strong> (או הכפתורים <strong>Line ↑ / Line ↓</strong>) מאתחל את מספור ה‑sweep, ובמצבי Normal/Continous גם מגלגל את קבצי השורה.</p>
+</blockquote>
+<hr />
+<p><a name="section-5"></a></p>
+<h2>6. כוונון פוקוס בגובה היעד</h2>
+<p>לאחר ההגעה לגובה הטיסה (גובה היעד), בצעו כוונון פוקוס סופי לכל מצלמה.</p>
+<ol>
+<li>היכנסו למצב <strong><code>Focus</code></strong> (M4) – ראו סעיף 4.</li>
+<li>בחרו מצלמה תחת <strong>Camera:</strong> (<code>cam1</code> / <code>cam2</code> / <code>cam3</code>).</li>
+<li>עברו ל‑<strong>Fine mode</strong> (לחצן מצב בלוח הפוקוס) כדי לקבל תצוגה ברזולוציה מלאה של ה"אריח" החד ביותר עם ניקוד חדות.
+   - ניתן להפעיל <strong>Debayer</strong> ו‑<strong>CLAHE</strong> לשיפור הצפייה.</li>
+<li>כוונו פוקוס במקשי החיצים <strong>למעלה/למטה</strong> עד שערך החדות <strong><code>tile #N  score=X.X</code></strong> מגיע למקסימום (ערך גבוה יותר = חד יותר).
+   - גודל הצעד נקבע בשדה הצעד (1–50, ברירת מחדל 1).
+   - התאימו <strong>Strength</strong> (<code>1</code>/<code>2</code>/<code>3</code>) לפי הצורך לעוצמת תנועת המנוע.</li>
+<li>חזרו על הכוונון עבור כל אחת משלוש המצלמות.</li>
+<li>אופציונלי: סמנו <strong>Save focus view</strong> כדי לשמור תמונת TIFF של האריח הטוב ביותר לתת‑תיקיית <code>focus\</code> שבפרויקט – שימושי לתיעוד.</li>
+</ol>
+<blockquote>
+<p>שימו לב: האפליקציה אינה מכווננת פוקוס אוטומטית לפי גובה. הגובה מ‑GPS נרשם כמטא‑דאטה בלבד; הכוונון נעשה ידנית לפי ניקוד החדות במצב M4. לכן חשוב לבצע את הכוונון בפועל בגובה היעד.</p>
+</blockquote>
+<hr />
+<p><a name="section-6"></a></p>
+<h2>7. צילום: Normal בתנאים רגילים, CollectionON בחריגות</h2>
+<p>לאחר שהפוקוס מכוונן והמונים אופסו, עברו למצב הצילום המתאים לתנאי הטיסה.</p>
+<h3>7.1 תנאים רגילים – מצב Normal</h3>
+<ol>
+<li>בקבוצה <strong>Mode</strong> לחצו <strong><code>Normal</code></strong> (מצב M0).
+   - שורת הסטטוס תציג <code>Current: Normal</code>.
+   - במצב זה הפריימים מצולמים לפי נקודות ניווט (nav points) ונכתבים לדיסק אוטומטית.
+   - זהו מצב ברירת המחדל לצילום בתנאים תקינים.</li>
+</ol>
+<blockquote>
+<p>מעבר בין <code>Normal</code> ל‑<code>Continous</code> כולל השהיה מתוכננת (כ‑10 שניות) כדי לאפשר ללוח לסיים sweep וחזרה לבית (homing). זה תקין – המתינו לסיום המעבר.</p>
+</blockquote>
+<h3>7.2 חריגות – מצב CollectionON</h3>
+<p>השתמשו במצב <strong><code>CollectionON</code></strong> (מצב M3) במצבים הבאים:</p>
+<ul>
+<li><strong>הפרעות GPS</strong> – כאשר קליטת ה‑GPS אינה אמינה (מופיע <code>NO GPS</code> באדום בתצוגה, או קליטה לא יציבה).</li>
+<li><strong>מהירות טיסה החורגת מהמפרט</strong> – כאשר מהירות הטיסה גבוהה מהמותר ונקודות הניווט אינן מתאימות לתזמון אוטומטי.</li>
+</ul>
+<p>במצב זה אתם שולטים ידנית בתיחום כל שורת צילום (line):</p>
+<ol>
+<li>לחצו <strong><code>CollectionON</code></strong> (M3). שורת הסטטוס תציג <code>Current: CollectionON</code>.</li>
+<li>בתחילת כל שורת צילום לחצו <strong><code>Start line</code></strong> (שולח <code>?</code> ללוח – סימון תחילת שורה).</li>
+<li>בסוף כל שורה לחצו <strong><code>End line</code></strong> (שולח <code>!</code> ללוח – סימון סוף שורה).</li>
+<li>חזרו על כך עבור כל שורת צילום בטיסה.</li>
+</ol>
+<blockquote>
+<p>הכפתורים <strong>Start line</strong> / <strong>End line</strong> פעילים רק במצב M3 וכאשר ה‑ClearCore מחובר.</p>
+</blockquote>
+<h3>מעקב במהלך הצילום</h3>
+<ul>
+<li>עקבו אחרי <strong><code>acq</code> / <code>written</code> / <code>dropped</code></strong> בכל המצלמות – <code>dropped</code> צריך להישאר נמוך.</li>
+<li>עקבו אחרי שכבת ה‑GPS בתצוגה (פינה ימנית עליונה): ירוק עם נ"צ/גובה/לוויינים = קליטה תקינה; <strong><code>NO GPS</code></strong> אדום = אין קליטה (שקלו מעבר ל‑CollectionON).</li>
+</ul>
+<hr />
+<p><a name="section-7"></a></p>
+<h2>8. סיום טיסה וכיבוי מסודר</h2>
+<ol>
+<li>בסיום איסוף הנתונים, החזירו את מערכת פארלקס למצב <strong><code>Normal</code></strong> (M0) או למצב המתאים לעצירה.</li>
+<li>ודאו שהכתיבה לדיסק הסתיימה (המתינו כמה שניות לניקוז – האפליקציה ממתינה כ‑5 שניות לאחר <code>$M0*</code> לפני נטרול).</li>
+<li>נתקו את ה‑GPS (<strong>Disconnect</strong> בקבוצת GPS) ואת ה‑<strong>ClearCore</strong> (<strong>Disconnect</strong>) לפי הצורך.</li>
+<li>סגרו את האפליקציה. יומני הסשן נשמרים בקובץ <code>Iron661_session_YYYYMMDD_HHMMSS.txt</code>.</li>
+</ol>
+<hr />
+<p><a name="section-8"></a></p>
+<h2>9. טבלת מצבים ופקודות – סיכום מהיר</h2>
+<table>
+<thead>
+<tr>
+<th>כפתור במסך</th>
+<th>מצב</th>
+<th>מתי משתמשים</th>
+<th>מה קורה</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>Normal</code></strong></td>
+<td>M0</td>
+<td>צילום בתנאים רגילים</td>
+<td>צילום לפי נקודות ניווט, כתיבה אוטומטית לדיסק</td>
+</tr>
+<tr>
+<td><strong><code>Continous</code></strong></td>
+<td>M1</td>
+<td>בדיקת תקינות מצלמות / צילום רציף</td>
+<td>sweep רציף, כתיבה לדיסק</td>
+</tr>
+<tr>
+<td><strong><code>CollectionON</code></strong></td>
+<td>M3</td>
+<td>הפרעות GPS / מהירות מעל המפרט</td>
+<td>תיחום ידני של כל שורה עם <strong>Start line</strong> / <strong>End line</strong></td>
+</tr>
+<tr>
+<td><strong><code>Focus</code></strong></td>
+<td>M4</td>
+<td>כוונון פוקוס ובדיקת חיווט מנועים</td>
+<td>תצוגת פוקוס מלאה, ניקוד חדות; ללא כתיבת sweep</td>
+</tr>
+<tr>
+<td><strong><code>Reset cameras</code></strong></td>
+<td>–</td>
+<td>מצלמה תקועה (ניסיון ראשון)</td>
+<td>סגירה/פתיחה מחדש של המצלמות (~10–15 ש')</td>
+</tr>
+<tr>
+<td><strong><code>Reset cameras (deep)</code></strong></td>
+<td>–</td>
+<td>מצלמה תקועה גם אחרי שחזור רך</td>
+<td>+ DeviceReset חומרתי (~20–25 ש')</td>
+</tr>
+<tr>
+<td><strong><code>Reset counters</code></strong></td>
+<td>–</td>
+<td>בהמראה / בסיס נקי</td>
+<td>איפוס מונים <code>acq/written/dropped</code> ו‑<code>S1 F1</code></td>
+</tr>
+<tr>
+<td><strong><code>Test trigger ($T)</code></strong></td>
+<td>–</td>
+<td>לאחר reset, אימות זרימה</td>
+<td>פעימת טריגר אחת לכל המצלמות; כל <code>acq</code> אמור לעלות ב‑1</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<p><a name="section-9"></a></p>
+<h2>10. פתרון תקלות נפוצות</h2>
+<table>
+<thead>
+<tr>
+<th>תופעה</th>
+<th>פעולה מומלצת</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>כותרת מצלמה אפורה / <code>Camera open failed</code></td>
+<td>סגרו Vision Point, ודאו שאין תהליך Python פתוח, בדקו חשמל, ואז הפעילו מחדש</td>
+</tr>
+<tr>
+<td>מצלמה אחת <code>acq</code> לא עולה</td>
+<td>לחצו <strong><code>Test trigger ($T)</code></strong> לאימות; אם לא זז – <strong><code>Reset cameras</code></strong>, ואם עדיין תקוע – <strong><code>Reset cameras (deep)</code></strong></td>
+</tr>
+<tr>
+<td><code>dropped</code> עולה במהירות</td>
+<td>בדקו עומס דיסק/כונן היעד ובחירת ה‑Drive הנכון בכל שורה</td>
+</tr>
+<tr>
+<td>כפתורי מצב מנוטרלים</td>
+<td>המתינו לסיום Bring‑up + warmup; ודאו ש‑ClearCore מחובר</td>
+</tr>
+<tr>
+<td><code>NO GPS</code> אדום בתצוגה</td>
+<td>בדקו חיבור ה‑GPS (Connect); אם ההפרעה נמשכת – עברו ל‑<strong><code>CollectionON</code></strong> ותחמו שורות ידנית</td>
+</tr>
+<tr>
+<td>מנוע הפוקוס הלא נכון מסתובב</td>
+<td>יש החלפת כבלים – תקנו את החיווט (ראו סעיף 4)</td>
+</tr>
+<tr>
+<td>לא נשמרים קבצים</td>
+<td>ודאו ששם הפרויקט הוגדר ושנבחרו כוננים (Drives) לפני כניסה למצב הקלטה</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3>הצעות נוספות שנכללו במדריך</h3>
+<p>מעבר לששת השלבים שביקשת, הוספתי:</p>
+<ul>
+<li><strong>סעיף הכנה (1)</strong> – אימות חיבור ClearCore ו‑GPS (בדרך כלל אוטומטי), המתנה ל‑Bring‑up ובחירת כוננים, כי בלעדיהם שאר השלבים לא יעבדו.</li>
+<li><strong><code>Test trigger ($T)</code></strong> כצעד אימות מהיר לאחר reset של מצלמה.</li>
+<li><strong>מעקב מונים ושכבת GPS</strong> במהלך הצילום.</li>
+<li><strong>כיבוי מסודר (8)</strong> עם המתנה לניקוז כתיבה.</li>
+<li><strong>טבלת סיכום מהיר (9)</strong> ו<strong>טבלת פתרון תקלות (10)</strong>.</li>
+</ul></body></html>

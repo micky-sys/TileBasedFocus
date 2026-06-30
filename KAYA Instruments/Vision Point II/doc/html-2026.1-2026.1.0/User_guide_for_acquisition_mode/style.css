@@ -1,0 +1,94 @@
+body {
+   font-family: "Verdana";
+   font-size: 14px;
+   max-width: 80%;
+   margin: auto;
+}
+
+h1, h2, h3 {
+   color: #004875;
+}
+
+div.sidebar {
+    float: right;
+}
+
+pre {
+    padding: 15px;
+}
+div.qmlproto {
+    padding-left: 15px;
+    padding-right: 15px;
+}
+pre, div.qmlproto {
+    font-family: "Courier New";
+    font-size: 20px;
+    margin-left: 2em;
+    background-color: #F2F2F2;
+}
+
+hr {
+    margin-top: 2em;
+    margin-bottom: 2em;
+}
+
+p.header {
+    margin-bottom: -1em;
+}
+p.footer {
+    text-align: right;
+    margin-top: -1em;
+}
+a {
+  color: green; /* Цвет ссылки */
+  text-decoration: none; /* Убирает подчеркивание */
+}
+
+a:hover {
+  color: green; /* Цвет ссылки при наведении */
+}
+
+a:active {
+  color: green; /* Цвет ссылки при активации (нажатии) */
+}
+
+a:visited {
+  color: green; /* Цвет посещенной ссылки */
+}
+a.el {
+  color: green; /* Цвет ссылки */
+  text-decoration: none; /* Убирает подчеркивание */
+}
+
+a.el:hover {
+  color: green; /* Цвет ссылки при наведении */
+}
+
+a.el:active {
+  color: green; /* Цвет ссылки при активации (нажатии) */
+}
+
+a.el:visited {
+  color: green; /* Цвет посещенной ссылки */
+}
+ol {
+  list-style-type: none;
+  margin: 0;
+  padding: 0;
+}
+
+#navrow1 li {
+  float: left;
+  margin-right: 10px; /* добавьте отступ между элементами, если нужно */
+}
+.tablist {
+    margin: 0;
+    padding: 0;
+    display: block;
+}
+
+.tablist li {
+    line-height: 36px;
+    list-style-type: none;
+    display: inline-block;
+}

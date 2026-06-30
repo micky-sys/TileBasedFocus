@@ -1,0 +1,131 @@
+{
+    "YUV2RGB": 
+    {
+        "YUV":
+        {
+             // Shift source ['Y', 'U'(aka Cb), 'V' (aka Cr)] values before multiplying on the following 3x3 matrix
+            "YUV_Shift": [0, -128, -128]
+            
+            ,"CoefficientsSelector": "CXP"
+            ,"Orig": // from origilal code in function Ycbcr2RGB()
+               [
+                 [ 1.0,  0.0   ,  1.4065 ]
+                ,[ 1.0, -0.3455, -0.7169 ]
+                ,[ 1.0,  1.7790,  0.0    ]
+               ] 
+            ,"CXP": // from the CXP standard (using https://www.symbolab.com/solver/matrix-inverse-calculator)
+               [
+                 [ 1.00042,  0.00030,  1.40465 ]
+                ,[ 0.99944, -0.34493, -0.71568 ]
+                ,[ 1.00177,  1.77530,  0.00099 ]
+               ] 
+            ,"Wiki.SDTV_with_BT.470": // from https://en.wikipedia.org/wiki/YUV#SDTV_with_BT.470
+               [
+                 [ 1.0,  0.0    ,  1.13983]  // [ 1.0,  0.0  ,  1.140]
+                ,[ 1.0, -0.39465, -0.58060]  // [ 1.0, -0.395, -0.581] // https://web.archive.org/web/20180421030430/http://www.equasys.de/colorconversion.html
+                ,[ 1.0,  2.03211,  0.0    ]  // [ 1.0,  2.032,  0.0  ]
+               ] 
+            ,"Wiki.HDTV_with_BT.709": // from https://en.wikipedia.org/wiki/YUV#HDTV_with_BT.709
+               [
+                 [ 1.0,  0.0    ,  1.28033]
+                ,[ 1.0, -0.21482, -0.38059]
+                ,[ 1.0,  2.12798,  0.0    ]
+               ] 
+        }
+        ,"YCBCR601":
+        {
+            "YUV_Shift": [-16, -128, -128]
+            
+            ,"CoefficientsSelector": "CXP"
+            ,"Orig": // from origilal code in function Ycbcr2RGB()
+               [
+                 [ 1.0,  0.0   ,  1.4065 ]
+                ,[ 1.0, -0.3455, -0.7169 ]
+                ,[ 1.0,  1.7790,  0.0    ]
+               ] 
+            ,"CXP": // from the CXP standard (using https://www.symbolab.com/solver/matrix-inverse-calculator)
+               [
+                 [ 1.00027,  0.00018 ,  1.37172 ]
+                ,[ 0.99952, -0.333677, -0.69886 ]
+                ,[ 1.00173,  1.73359 ,  0.00076 ]
+               ] 
+            ,"Wiki.BT.601": // from https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.601_conversion
+               [
+                 [ 1.0,  0.0    , 1.28033  ]
+                ,[ 1.0, -0.21482, -0.38059 ]
+                ,[ 1.0,  2.12798, 0.0      ]
+               ] 
+            ,"ITU-R BT.601": // from https://web.archive.org/web/20180421030430/http://www.equasys.de/colorconversion.html
+               [
+                 // The possible range of values for chrominance and luminance reserves some footroom and headroom, 
+                 // which is necessary to provide some space for overshooting, e.g. in combination with analog video equipment. 
+                 [ 1.164,  0.0  ,  1.596] // Y - 16
+                ,[ 1.164, -0.392, -0.813] // CB - 128
+                ,[ 1.164,  2.017,  0.0  ] // Cr - 128
+               ] 
+            ,"ITU-R BT.601 Full Range": // from https://web.archive.org/web/20180421030430/http://www.equasys.de/colorconversion.html
+               [
+                 // For computer based applications using RGB and YCbCr color formats, in many cases the complete possible range of 8 bit is used, 
+                 // without providing a footroom or headroom. Typically, this full-range color format is used for JPEG images.
+                 [ 1.0,  0.0  ,  1.400] // Y
+                ,[ 1.0, -0.343, -0.711] // CB - 128
+                ,[ 1.0,  1.765,  0.0  ] // Cr - 128
+               ] 
+        }
+        ,"YCBCR709":
+        {
+            "YUV_Shift": [-16, -128, -128]
+            
+            ,"CoefficientsSelector": "CXP"
+            ,"Orig": // from origilal code in function Ycbcr2RGB()
+               [
+                 [ 1.0,  0.0   ,  1.4065 ]
+                ,[ 1.0, -0.3455, -0.7169 ]
+                ,[ 1.0,  1.7790,  0.0    ]
+               ] 
+            ,"CXP": // from the CXP standard (using https://www.symbolab.com/solver/matrix-inverse-calculator)
+               [
+                 [ 1.00118,  0.00015,  1.53958]
+                ,[ 0.99938, -0.18329, -0.45854]
+                ,[ 0.99979,  1.81558,  0.00104]
+               ] 
+            ,"Wiki.BT.709": // from https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.709_conversion
+               [
+                 [ 1.0,  0.0   ,  1.5748]
+                ,[ 1.0, -0.1873, -0.4681]
+                ,[ 1.0,  1.8556,  0.0   ]
+               ] 
+            ,"ITU-R BT.709": // from https://web.archive.org/web/20180421030430/http://www.equasys.de/colorconversion.html
+               [
+                 [ 1.164,  0.0  ,  1.793] // Y - 16
+                ,[ 1.164, -0.213, -0.533] // CB - 128
+                ,[ 1.164,  2.112,  0.0  ] // Cr - 128
+               ] 
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,94 @@
+Microsoft (R) COFF/PE Dumper Version 14.16.27051.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+
+Dump of file E:\Jenkins\workspace\Vision_Point_II\0503f512\TESTDIR\x64\Common\bin\KYVPLibExtension_vc141.dll
+
+File Type: DLL
+
+  Section contains the following exports for KYVPLibExtension_vc141.dll
+
+    00000000 characteristics
+    FFFFFFFF time date stamp
+        0.00 version
+           1 ordinal base
+          66 number of functions
+          66 number of names
+
+    ordinal hint RVA      name
+
+          1    0 0001EF10 KYVPExtension_AppLog_V1 = KYVPExtension_AppLog_V1
+          2    1 0002A4B0 KYVPExtension_DataStream_Callback_Register = KYVPExtension_DataStream_Callback_Register
+          3    2 0002D9E0 KYVPExtension_DataStream_Callback_Register_V1 = KYVPExtension_DataStream_Callback_Register_V1
+          4    3 0002AD10 KYVPExtension_DataStream_Callback_Unregister = KYVPExtension_DataStream_Callback_Unregister
+          5    4 0002DA70 KYVPExtension_DataStream_Callback_Unregister_V1 = KYVPExtension_DataStream_Callback_Unregister_V1
+          6    5 00029CD0 KYVPExtension_DataStream_Close = KYVPExtension_DataStream_Close
+          7    6 0002D970 KYVPExtension_DataStream_Close_V1 = KYVPExtension_DataStream_Close_V1
+          8    7 00028910 KYVPExtension_DataStream_Create = KYVPExtension_DataStream_Create
+          9    8 0002D8E0 KYVPExtension_DataStream_Create_V1 = KYVPExtension_DataStream_Create_V1
+         10    9 0002C8A0 KYVPExtension_DetectDevicesManually = KYVPExtension_DetectDevicesManually
+         11    A 0002DB70 KYVPExtension_DetectDevicesManually_V1 = KYVPExtension_DetectDevicesManually_V1
+         12    B 0002E890 KYVPExtension_PCIInterface_AdcReadout = KYVPExtension_PCIInterface_AdcReadout
+         13    C 00025E80 KYVPExtension_PCIInterface_AuxDataCallback_Register = KYVPExtension_PCIInterface_AuxDataCallback_Register
+         14    D 0002D7D0 KYVPExtension_PCIInterface_AuxDataCallback_Register_V1 = KYVPExtension_PCIInterface_AuxDataCallback_Register_V1
+         15    E 000266E0 KYVPExtension_PCIInterface_AuxDataCallback_Unregister = KYVPExtension_PCIInterface_AuxDataCallback_Unregister
+         16    F 0002D860 KYVPExtension_PCIInterface_AuxDataCallback_Unregister_V1 = KYVPExtension_PCIInterface_AuxDataCallback_Unregister_V1
+         17   10 0001FA10 KYVPExtension_PCIInterface_CheckUpdateFile = KYVPExtension_PCIInterface_CheckUpdateFile
+         18   11 00021490 KYVPExtension_PCIInterface_DirectHWReadReg = KYVPExtension_PCIInterface_DirectHWReadReg
+         19   12 0002D170 KYVPExtension_PCIInterface_DirectHWReadReg_V1 = KYVPExtension_PCIInterface_DirectHWReadReg_V1
+         20   13 00022020 KYVPExtension_PCIInterface_DirectHWWriteReg = KYVPExtension_PCIInterface_DirectHWWriteReg
+         21   14 0002D220 KYVPExtension_PCIInterface_DirectHWWriteReg_V1 = KYVPExtension_PCIInterface_DirectHWWriteReg_V1
+         22   15 000203E0 KYVPExtension_PCIInterface_EventCallBackRegister = KYVPExtension_PCIInterface_EventCallBackRegister
+         23   16 0002DC20 KYVPExtension_PCIInterface_EventCallBackRegister_V1 = KYVPExtension_PCIInterface_EventCallBackRegister_V1
+         24   17 00020C40 KYVPExtension_PCIInterface_EventCallBackUnregister = KYVPExtension_PCIInterface_EventCallBackUnregister
+         25   18 0002DCB0 KYVPExtension_PCIInterface_EventCallBackUnregister_V1 = KYVPExtension_PCIInterface_EventCallBackUnregister_V1
+         26   19 0001F1A0 KYVPExtension_PCIInterface_FirmwareUpdate = KYVPExtension_PCIInterface_FirmwareUpdate
+         27   1A 000255D0 KYVPExtension_PCIInterface_GetLinkStatus = KYVPExtension_PCIInterface_GetLinkStatus
+         28   1B 0002D710 KYVPExtension_PCIInterface_GetLinkStatus_V1 = KYVPExtension_PCIInterface_GetLinkStatus_V1
+         29   1C 00022BB0 KYVPExtension_PCIInterface_LockLink = KYVPExtension_PCIInterface_LockLink
+         30   1D 0002D4B0 KYVPExtension_PCIInterface_LockLink_V1 = KYVPExtension_PCIInterface_LockLink_V1
+         31   1E 00023C50 KYVPExtension_PCIInterface_ReadLink = KYVPExtension_PCIInterface_ReadLink
+         32   1F 0002D5B0 KYVPExtension_PCIInterface_ReadLink_V1 = KYVPExtension_PCIInterface_ReadLink_V1
+         33   20 00024D50 KYVPExtension_PCIInterface_SendLinkEvent = KYVPExtension_PCIInterface_SendLinkEvent
+         34   21 00023400 KYVPExtension_PCIInterface_UnlockLink = KYVPExtension_PCIInterface_UnlockLink
+         35   22 0002D530 KYVPExtension_PCIInterface_UnlockLink_V1 = KYVPExtension_PCIInterface_UnlockLink_V1
+         36   23 0002DD30 KYVPExtension_PCIInterface_UpdateFlashBoardInfo = KYVPExtension_PCIInterface_UpdateFlashBoardInfo
+         37   24 000244D0 KYVPExtension_PCIInterface_WriteLink = KYVPExtension_PCIInterface_WriteLink
+         38   25 0002D660 KYVPExtension_PCIInterface_WriteLink_V1 = KYVPExtension_PCIInterface_WriteLink_V1
+         39   26 00026F30 KYVPExtension_RemoteDevice_DirectHWReadReg = KYVPExtension_RemoteDevice_DirectHWReadReg
+         40   27 0002D2D0 KYVPExtension_RemoteDevice_DirectHWReadReg_V1 = KYVPExtension_RemoteDevice_DirectHWReadReg_V1
+         41   28 000277F0 KYVPExtension_RemoteDevice_DirectHWWriteReg = KYVPExtension_RemoteDevice_DirectHWWriteReg
+         42   29 0002D370 KYVPExtension_RemoteDevice_DirectHWWriteReg_V1 = KYVPExtension_RemoteDevice_DirectHWWriteReg_V1
+         43   2A 0002C050 KYVPExtension_RemoteDevice_GetParamsCollectionHandle = KYVPExtension_RemoteDevice_GetParamsCollectionHandle
+         44   2B 0002DAF0 KYVPExtension_RemoteDevice_GetParamsCollectionHandle_V1 = KYVPExtension_RemoteDevice_GetParamsCollectionHandle_V1
+         45   2C 000280B0 KYVPExtension_RemoteDevice_SetImageDetails = KYVPExtension_RemoteDevice_SetImageDetails
+         46   2D 0002D410 KYVPExtension_RemoteDevice_SetImageDetails_V1 = KYVPExtension_RemoteDevice_SetImageDetails_V1
+         47   2E 0002B560 KYVPExtension_Serial_Callback_Register = KYVPExtension_Serial_Callback_Register
+         48   2F 0002BDD0 KYVPExtension_Serial_Callback_Unregister = KYVPExtension_Serial_Callback_Unregister
+         49   30 00005830 clCallbackRegister = clCallbackRegister
+         50   31 00005930 clCallbackUnregister = clCallbackUnregister
+         51   32 00005040 clFlushPort = clFlushPort
+         52   33 00005E30 clGetErrorText = clGetErrorText
+         53   34 000060C0 clGetManufacturerInfo = clGetManufacturerInfo
+         54   35 00005120 clGetNumBytesAvail = clGetNumBytesAvail
+         55   36 00005AE0 clGetNumSerialPorts = clGetNumSerialPorts
+         56   37 00004F80 clGetNumSerialPortsEx = clGetNumSerialPortsEx
+         57   38 000063E0 clGetSerialPortIdentifier = clGetSerialPortIdentifier
+         58   39 00006320 clGetSupportedBaudRates = clGetSupportedBaudRates
+         59   3A 000052A0 clSerialClose = clSerialClose
+         60   3B 00005A80 clSerialComPortClose = clSerialComPortClose
+         61   3C 00005A20 clSerialComPortInitEx = clSerialComPortInitEx
+         62   3D 00005BB0 clSerialInit = clSerialInit
+         63   3E 00004FE0 clSerialInitEx = clSerialInitEx
+         64   3F 00005330 clSerialRead = clSerialRead
+         65   40 00005610 clSerialWrite = clSerialWrite
+         66   41 000066D0 clSetBaudRate = clSetBaudRate
+
+  Summary
+
+        2000 .data
+        4000 .pdata
+       12000 .rdata
+        1000 .reloc
+        1000 .rsrc
+       38000 .text

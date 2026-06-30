@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<QtHelpProject version="1.0">
+<namespace>org.api.Project</namespace>
+<virtualFolder>doc</virtualFolder>
+<filterSection>
+<filterAttribute>doxygen</filterAttribute>
+<toc>
+<section title="KY_XML_Documentation 2026.1-2026.1.0" ref="index.html">
+<section title="KYVPLib_xml xml" ref="_k_y_v_p_lib_xml.html">
+<section title="CoaXPress" ref="_k_y_v_p_lib_xml.html#CoaXPress">
+<section title="CoaXPress Enum Entries" ref="_k_y_v_p_lib_xml.html#CoaXPress_EnumEntries"/>
+</section>
+<section title="Debug" ref="_k_y_v_p_lib_xml.html#Debug"/>
+<section title="Device Control" ref="_k_y_v_p_lib_xml.html#Device_Control"/>
+<section title="Digital I/O Control" ref="_k_y_v_p_lib_xml.html#Digital_IO_Control">
+<section title="Digital I/O Control Enum Entries" ref="_k_y_v_p_lib_xml.html#Digital_IO_Control_EnumEntries"/>
+</section>
+<section title="Encoder Control" ref="_k_y_v_p_lib_xml.html#Encoder_Control">
+<section title="Encoder Control Enum Entries" ref="_k_y_v_p_lib_xml.html#Encoder_Control_EnumEntries"/>
+</section>
+<section title="Fan Control" ref="_k_y_v_p_lib_xml.html#Fan_Control"/>
+<section title="I/O Control" ref="_k_y_v_p_lib_xml.html#IO_Control"/>
+<section title="Hardware Information" ref="_k_y_v_p_lib_xml.html#Hardware_Information"/>
+<section title="Link Trigger Control" ref="_k_y_v_p_lib_xml.html#Link_Trigger_Control">
+<section title="Link Trigger Control Enum Entries" ref="_k_y_v_p_lib_xml.html#Link_Trigger_Control_EnumEntries"/>
+</section>
+<section title="Macom Control" ref="_k_y_v_p_lib_xml.html#Macom_Control"/>
+<section title="Manual Detection Configuration" ref="_k_y_v_p_lib_xml.html#Manual_Detection_Configuration"/>
+<section title="Device 0" ref="_k_y_v_p_lib_xml.html#Device_0">
+<section title="Device 0 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_0_EnumEntries"/>
+</section>
+<section title="Links" ref="_k_y_v_p_lib_xml.html#Links">
+<section title="Links Enum Entries" ref="_k_y_v_p_lib_xml.html#Links_EnumEntries"/>
+</section>
+<section title="Device 1" ref="_k_y_v_p_lib_xml.html#Device_1">
+<section title="Device 1 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_1_EnumEntries"/>
+</section>
+<section title="Device 2" ref="_k_y_v_p_lib_xml.html#Device_2">
+<section title="Device 2 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_2_EnumEntries"/>
+</section>
+<section title="Device 3" ref="_k_y_v_p_lib_xml.html#Device_3">
+<section title="Device 3 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_3_EnumEntries"/>
+</section>
+<section title="Device 4" ref="_k_y_v_p_lib_xml.html#Device_4">
+<section title="Device 4 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_4_EnumEntries"/>
+</section>
+<section title="Device 5" ref="_k_y_v_p_lib_xml.html#Device_5">
+<section title="Device 5 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_5_EnumEntries"/>
+</section>
+<section title="Device 6" ref="_k_y_v_p_lib_xml.html#Device_6">
+<section title="Device 6 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_6_EnumEntries"/>
+</section>
+<section title="Device 7" ref="_k_y_v_p_lib_xml.html#Device_7">
+<section title="Device 7 Enum Entries" ref="_k_y_v_p_lib_xml.html#Device_7_EnumEntries"/>
+</section>
+<section title="PoCXP Control" ref="_k_y_v_p_lib_xml.html#PoCXP_Control">
+<section title="PoCXP Control Enum Entries" ref="_k_y_v_p_lib_xml.html#PoCXP_Control_EnumEntries"/>
+</section>
+<section title="PoCXP Voltage and Current" ref="_k_y_v_p_lib_xml.html#PoCXP_Voltage_and_Current"/>
+<section title="Pulse Message Control" ref="_k_y_v_p_lib_xml.html#Pulse_Message_Control">
+<section title="Pulse Message Control Enum Entries" ref="_k_y_v_p_lib_xml.html#Pulse_Message_Control_EnumEntries"/>
+</section>
+<section title="System Monitor Control" ref="_k_y_v_p_lib_xml.html#System_Monitor_Control">
+<section title="System Monitor Control Enum Entries" ref="_k_y_v_p_lib_xml.html#System_Monitor_Control_EnumEntries"/>
+</section>
+<section title="Timer Control" ref="_k_y_v_p_lib_xml.html#Timer_Control">
+<section title="Timer Control Enum Entries" ref="_k_y_v_p_lib_xml.html#Timer_Control_EnumEntries"/>
+</section>
+<section title="TriggerN Control" ref="_k_y_v_p_lib_xml.html#TriggerN_Control">
+<section title="TriggerN Control Enum Entries" ref="_k_y_v_p_lib_xml.html#TriggerN_Control_EnumEntries"/>
+</section>
+</section>
+<section title="KYVPLocalDevice_xml xml" ref="_k_y_v_p_local_device_xml.html">
+<section title="Camera Trigger Control" ref="_k_y_v_p_local_device_xml.html#Camera_Trigger_Control">
+<section title="Camera Trigger Control Enum Entries" ref="_k_y_v_p_local_device_xml.html#Camera_Trigger_Control_EnumEntries"/>
+</section>
+<section title="Device Serial Port Control" ref="_k_y_v_p_local_device_xml.html#Device_Serial_Port_Control">
+<section title="Device Serial Port Control Enum Entries" ref="_k_y_v_p_local_device_xml.html#Device_Serial_Port_Control_EnumEntries"/>
+</section>
+</section>
+<section title="KYVPStream_xml xml" ref="_k_y_v_p_stream_xml.html">
+<section title="Color Transformation Control" ref="_k_y_v_p_stream_xml.html#Color_Transformation_Control"/>
+<section title="Image Format Control" ref="_k_y_v_p_stream_xml.html#Image_Format_Control">
+<section title="Image Format Control Enum Entries" ref="_k_y_v_p_stream_xml.html#Image_Format_Control_EnumEntries"/>
+</section>
+<section title="Meta Data Control" ref="_k_y_v_p_stream_xml.html#Meta_Data_Control">
+<section title="Meta Data Control Enum Entries" ref="_k_y_v_p_stream_xml.html#Meta_Data_Control_EnumEntries"/>
+</section>
+<section title="Statistics and Tests" ref="_k_y_v_p_stream_xml.html#Statistics_and_Tests"/>
+<section title="Transport Layer Control" ref="_k_y_v_p_stream_xml.html#Transport_Layer_Control">
+<section title="Transport Layer Control Enum Entries" ref="_k_y_v_p_stream_xml.html#Transport_Layer_Control_EnumEntries"/>
+</section>
+<section title="Trigger Control" ref="_k_y_v_p_stream_xml.html#Trigger_Control">
+<section title="Trigger Control Enum Entries" ref="_k_y_v_p_stream_xml.html#Trigger_Control_EnumEntries"/>
+</section>
+</section>
+</section>
+</toc>
+<keywords>
+<keyword name="KYVPLib_xml xml" id="KYVPLib_xml xml_" ref="_k_y_v_p_lib_xml.html"/>
+<keyword name="KYVPLocalDevice_xml xml" id="KYVPLocalDevice_xml xml_" ref="_k_y_v_p_local_device_xml.html"/>
+<keyword name="KYVPStream_xml xml" id="KYVPStream_xml xml_" ref="_k_y_v_p_stream_xml.html"/>
+</keywords>
+<files>
+<file>_k_y_v_p_lib__xml_8h_source.html</file>
+<file>_k_y_v_p_lib_xml.html</file>
+<file>_k_y_v_p_local_device__xml_8h_source.html</file>
+<file>_k_y_v_p_local_device_xml.html</file>
+<file>_k_y_v_p_stream__xml_8h_source.html</file>
+<file>_k_y_v_p_stream_xml.html</file>
+<file>bc_s.png</file>
+<file>bc_sd.png</file>
+<file>closed.png</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e.html</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e_dep.jpg</file>
+<file>dir_511b3d3120b45893f57f2a8fd468528e_dep.pdf</file>
+<file>dir_68267d1309a1af8e8297ef4c3efbcdba.html</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e.html</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e_dep.jpg</file>
+<file>dir_7267a1dd504c294823f5e1c052415b7e_dep.pdf</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be.html</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be_dep.jpg</file>
+<file>dir_c0f85d8ffdd378c4053eb6a83fbfb7be_dep.pdf</file>
+<file>doxygen.svg</file>
+<file>dynsections.js</file>
+<file>full_styles.css</file>
+<file>graph_legend.html</file>
+<file>graph_legend.jpg</file>
+<file>index.html</file>
+<file>jquery.js</file>
+<file>logo.png</file>
+<file>nav_f.png</file>
+<file>nav_fd.png</file>
+<file>nav_g.png</file>
+<file>nav_h.png</file>
+<file>nav_hd.png</file>
+<file>open.png</file>
+<file>pages.html</file>
+<file>script.js</file>
+<file>splitbar.png</file>
+<file>splitbard.png</file>
+<file>style.css</file>
+<file>svg.min.js</file>
+<file>sync_off.png</file>
+<file>sync_on.png</file>
+<file>tab_a.png</file>
+<file>tab_ad.png</file>
+<file>tab_b.png</file>
+<file>tab_bd.png</file>
+<file>tab_h.png</file>
+<file>tab_hd.png</file>
+<file>tab_s.png</file>
+<file>tab_sd.png</file>
+<file>tabs.css</file>
+</files>
+</filterSection>
+</QtHelpProject>

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RegisterDescription
+	ModelName="KY_TLBufferGenTL"
+	VendorName="KAYA_Instruments"
+	ToolTip="KAYA TLBuffer GenTL"
+	StandardNameSpace="None"
+	SchemaMajorVersion="1"
+	SchemaMinorVersion="1"
+	SchemaSubMinorVersion="0"
+	MajorVersion="1"
+	MinorVersion="1"
+	SubMinorVersion="0"
+	ProductGuid="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+	VersionGuid="11111111-2222-3333-4444-555555555555"
+	xmlns="http://www.genicam.org/GenApi/Version_1_1"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_1
+	http://www.genicam.org/GenApi/GenApiSchema_Version_1_1.xsd">
+	
+	<!-- Root categories -->
+	<Group Comment="RootCategory">
+		<Category Name="Root" NameSpace="Standard">
+			<Visibility>Beginner</Visibility>
+			<ImposedAccessMode>RO</ImposedAccessMode>
+		</Category>
+	</Group>
+	
+	<!-- Device -->
+	<Port Name="Device">
+		<ToolTip>Port giving access to the device.</ToolTip>
+		<Visibility>Invisible</Visibility>
+	</Port>
+</RegisterDescription>

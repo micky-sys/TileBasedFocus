@@ -1,0 +1,230 @@
+;/*++
+;
+;Copyright (c) KAYA Instruments  All rights reserved.
+;
+;   THIS CODE AND INFORMATION IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY
+;   KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+;   IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A PARTICULAR
+;   PURPOSE.
+;
+;Module Name:
+;
+;    KAYAKERN.inf
+;
+;Abstract:
+;    INF file for a KAYAKERN device.
+;
+;--*/
+
+[Version]
+CatalogFile               = KAYAKERN.cat
+Class                     = %ClassName% 
+ClassGuid                 = {30451C46-7B03-4D96-9145-7C06226965B7}
+DriverPackageDisplayName  = %KAYAKERN.DRVDESC%
+DriverPackageType         = PlugAndPlay
+DriverVer = 02/26/2025,66.0.10774.0354
+                                           ; and to $(KAYA_MAJOR_VERSION)$(KAYA_MINOR_VERSION).10$(KAYA_PATCH_VERSION).$(KAYA_SVN_REVISION_QT).%H%M in Debug mode
+Provider                  = %Companyname%
+Signature                 = "$WINDOWS NT$"
+
+[DestinationDirs]
+DefaultDestDir  = 12
+CoInstaller_CopyFiles = 11
+
+; ====================== Class Section ========================================
+[ClassInstall32]
+Addreg        = KAYAKERN.ClassReg
+
+[KAYAKERN.ClassReg]
+HKR,,,0,%ClassName%
+HKR,,Icon,,-5
+HKR,,DeviceCharacteristics,0x10001,0x100     ;Use same security checks on relative opens
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)" ;Allow generic all access to system, built-in Admin and World
+
+; ====================== Device Install Section ===============================
+[ControlFlags]
+ExcludeFromSelect = *
+
+[Manufacturer]
+%Companyname%=KAYA,NTamd64
+
+[SourceDisksFiles]
+KAYAKERN.sys    = 1
+WdfCoInstaller01011.dll = 1 ; make sure the number matches with SourceDisksNames
+
+[SourceDisksNames]
+1="KAYAKERN Install Disk",
+
+; For XP and later
+[KAYA.NTamd64]
+; DisplayName           Section           DeviceId
+; -----------           -------           --------
+"Chameleon CXP Camera Simulator"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_01001D2A&REV_01
+
+"Predator CXP Frame Grabber"            = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02001D2A&REV_07
+
+"Komodo CXP Frame Grabber"              = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02101D2A&REV_07
+"Komodo 4R4T CXP Frame Grabber"         = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02111D2A&REV_07
+
+"Komodo CXP Fiber Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02201D2A&REV_07
+"Komodo CLHS-X Frame Grabber"           = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02211D2A&REV_07
+"Komodo 10GigE Frame Grabber"           = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02221D2A&REV_07
+
+"Komodo-C CXP Frame Grabber"            = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02301D2A&REV_07
+
+"KAYA FNC Custom Device"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_02401D2A&REV_07
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; 2-nd generation device series: PIDs 3xxx and 4xxx :
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+"Chameleon II CXP Camera Simulator"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_03001D2A&REV_07
+"Chameleon II CoF Camera Simulator"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_03241D2A&REV_07
+"Chameleon II CLHS-X Camera Simulator"  = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_03211D2A&REV_07
+
+"Predator II CXP Frame Grabber"         = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04001D2A&REV_07
+"Predator II CXP 104 Frame Grabber"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14001D2A&REV_07
+"Komodo II CXP Frame Grabber"           = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04101D2A&REV_07
+"Komodo II CXP 104 Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14101D2A&REV_07
+"Komodo II 4R4T CXP Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04111D2A&REV_07
+"Komodo II 4R4T CXP 104 Frame Grabber"  = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14111D2A&REV_07
+"Komodo II CXP 8CH Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04121D2A&REV_07
+
+"Komodo II CXP Fiber Frame Grabber"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04201D2A&REV_07
+"Komodo II CXP Fiber 104 Frame Grabber" = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14201D2A&REV_07
+"Komodo II CLHS-X Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04211D2A&REV_07
+"Komodo II CLHS-X 104 Frame Grabber"    = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14211D2A&REV_07
+"Komodo II 10GigE Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04221D2A&REV_07
+"Komodo II 10GigE 104 Frame Grabber"    = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14221D2A&REV_07
+"Komodo II CLHS-X 8CH Frame Grabber"    = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04251D2A&REV_07
+"Komodo II CoF 8CH Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04261D2A&REV_07
+
+"Komodo II CLHS-X-16G Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04231D2A&REV_07
+"Komodo II CLHS-X-16G 104 Frame Grabber"   = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14231D2A&REV_07
+
+"Komodo II CoF Frame Grabber" = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04241D2A&REV_07
+"Komodo II CoF 104 Frame Grabber" = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_14241D2A&REV_07
+
+
+"Komodo-C II CXP Frame Grabber"         = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04301D2A&REV_07
+"Komodo-C II CLHS-X Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04311D2A&REV_07
+"Komodo-C II 10GigE Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04321D2A&REV_07
+
+"Komodo II CXP MXM Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_24101D2A&REV_07
+"Komodo II CXP 8CH MXM Frame Grabber"    = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_24121D2A&REV_07
+"Komodo II CoF MXM Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_24241D2A&REV_07
+"Komodo II CoF 8CH MXM Frame Grabber"    = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_24261D2A&REV_07
+
+"Predator II CoF Frame Grabber"          = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04011D2A&REV_07
+"Predator II CLHS-X Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04021D2A&REV_07
+
+"Komodo II CLHS-X 2CH Frame Grabber"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04271D2A&REV_07
+"Komodo II CoF 2CH Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04281D2A&REV_07
+
+"Komodo II CXP M.2 Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34101D2A&REV_07
+"Komodo II CoF M.2 Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34241D2A&REV_07
+"Komodo II CLHS-X M.2 Frame Grabber"     = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34211D2A&REV_07
+"Predator II CXP M.2 Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34011D2A&REV_07
+"Predator II CoF M.2 Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34001D2A&REV_07
+"Predator II CLHS-X M.2 Frame Grabber"   = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_34021D2A&REV_07
+"Chameleon II CXP M.2 Camera Simulator"  = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_33001D2A&REV_07
+"Chameleon II CoF M.2 Camera Simulator"  = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_33241D2A&REV_07
+
+
+"KAYA FNC II Custom Device"             = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04401D2A&REV_07
+"Vislinx-M PCIe Camera"                 = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04501D2A&REV_07
+"Vislinx-L PCIe Camera"                 = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04511D2A&REV_07
+"Zinc 3265 PCIe Camera"                 = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04601D2A&REV_07
+"Zinc 661 PCIe Camera"                  = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_04611D2A&REV_07
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; 3-rd generation device series: PIDs 5xxx and 6xxx :
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+"Komodo III CXP 8CH Frame Grabber"       = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_06121D2A&REV_07
+"Komodo III CXP Frame Grabber"           = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_06101D2A&REV_07
+"Komodo III CLHS-X Frame Grabber"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_06211D2A&REV_07
+"Komodo III CoF Frame Grabber"           = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_06241D2A&REV_07
+"Komodo III 4R4T CXP Frame Grabber"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_06111D2A&REV_07
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Reserved for development devices:
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+"KAYA Dev Device 0xD000"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0001D2A&REV_07
+"KAYA Dev Device 0xD001"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0011D2A&REV_07
+"KAYA Dev Device 0xD002"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0021D2A&REV_07
+"KAYA Dev Device 0xD003"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0031D2A&REV_07
+"KAYA Dev Device 0xD004"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0041D2A&REV_07
+"KAYA Dev Device 0xD005"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0051D2A&REV_07
+"KAYA Dev Device 0xD006"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0061D2A&REV_07
+"KAYA Dev Device 0xD007"                = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_1000&SUBSYS_D0071D2A&REV_07
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Legacy IDs - available only for firmware update
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+"Komodo-C Frame Grabber (Legacy)"          = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0230&SUBSYS_02301D2A&REV_07
+"Predator CXP Frame Grabber (Legacy)"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0200&SUBSYS_02001D2A&REV_07
+"Komodo CXP Frame Grabber (Legacy)"        = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0210&SUBSYS_02101D2A&REV_07
+"Komodo 4R4T CXP Frame Grabber (Legacy)"   = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0211&SUBSYS_02111D2A&REV_07
+"Komodo Fiber Frame Grabber (Legacy)"      = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0220&SUBSYS_02201D2A&REV_07
+"Komodo Fiber CLHS Frame Grabber (Legacy)" = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0221&SUBSYS_02211D2A&REV_07
+"Chameleon CXP Simulator (Legacy)"         = KAYAKERN_Inst, PCI\VEN_1D2A&DEV_0100&SUBSYS_01001D2A&REV_01
+
+[KAYAKERN_Inst.NT]
+CopyFiles      = KAYAKERN.CopyFiles
+
+[KAYAKERN.CopyFiles]
+KAYAKERN.sys
+
+; MSI/MSI-X support
+[KAYAKERN_Inst.NT.HW]
+AddReg = KAYAKERN.EnableMSI
+
+; 24 Interrupt resources are required - 16 for user events and 8 for dma channels
+[KAYAKERN.EnableMSI]
+HKR,"Interrupt Management",,0x00000010
+HKR,"Interrupt Management\MessageSignaledInterruptProperties",,0x00000010
+HKR,"Interrupt Management\MessageSignaledInterruptProperties",MSISupported,0x00010001,1
+HKR,"Interrupt Management\MessageSignaledInterruptProperties",MessageNumberLimit,0x00010001,32
+
+
+[KAYAKERN_Inst.NT.Services]
+AddService     = KAYAKERN,0x00000002,KAYAKERN_Service
+
+[KAYAKERN_Service]
+DisplayName    = %KAYAKERN.SVCDESC%
+ServiceType    = 1                  ; SERVICE_KERNEL_DRIVER
+StartType      = 3                  ; SERVICE_DEMAND_START
+ErrorControl   = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\KAYAKERN.sys
+AddReg         = KAYAKERN_Inst.NT.Services.AddReg
+
+[KAYAKERN_Inst.NT.Services.AddReg]
+HKR,Parameters,"POLL_MODE",0x00010001,0 ; set to 1 for hardware polling, default is 0 (interrupts)
+
+; ====================== WDF Coinstaller installation =========================
+
+[KAYAKERN_Inst.NT.CoInstallers]
+AddReg         = CoInstaller_AddReg
+CopyFiles      = CoInstaller_CopyFiles
+
+[CoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000, "WdfCoInstaller01011.dll,WdfCoInstaller"
+
+[CoInstaller_CopyFiles]
+WdfCoInstaller01011.dll
+
+[KAYAKERN_Inst.NT.Wdf]
+KmdfService    = KAYAKERN, KAYAKERN_wdfsect
+
+[KAYAKERN_wdfsect]
+KmdfLibraryVersion = 1.11
+
+;======================= String Definitions ===================================
+[Strings]
+Companyname             = "KAYA Instruments Ltd."
+ClassName               = "KAYA Instruments devices"
+KAYAKERN.SVCDESC        = "KAYA Instruments PCI Driver Service"
+KAYAKERN.DRVDESC        = "PCI Driver"
+DeviceDescription       = "KAYA Instruments PCI device"

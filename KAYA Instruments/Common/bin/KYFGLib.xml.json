@@ -1,0 +1,1495 @@
+{
+	"XmlNodeExtensions" :
+	{
+        "X": 1 // Just first dummy entry - no meaning
+        
+		,"BandwidthTestPerform":
+		{
+			"DeviceXmlParameterReflector": {"Trigger" : {
+														  // Can optionaly contain: '"value" : ...' (default: null, i.e. reflect any changes) and|or '"ReflectInternalChanges": true|false (default: false)'
+														  "ReflectInternalChanges": false // Avoid reflector invocation caused by InvalidateNodes(), etc.
+														}
+											,"Sequence" : [ {"parameter" : ""} ]
+										   }
+		}
+        
+		,"BandwidthTestAbort":
+		{
+			"DeviceXmlParameterReflector": {"Trigger" : {
+														  "ReflectInternalChanges": false // Avoid reflector invocation caused by InvalidateNodes(), etc.
+														}
+											,"Sequence" : [ {"parameter" : ""} ]
+										   }
+		}
+        
+		,"kernLogLevelsApply":
+		{
+			"DeviceXmlParameterReflector": {"Trigger" : {
+														  // Can optionaly contain: '"value" : ...' (default: null, i.e. reflect any changes) and|or '"ReflectInternalChanges": true|false (default: false)'
+														  "ReflectInternalChanges": false // Avoid reflector invocation caused by InvalidateNodes(), etc.
+														}
+											,"Sequence" : [ {"parameter" : ""} ]
+										   }
+		}
+        
+		,"DeviceUserIDWrite":
+		{
+			"DeviceXmlParameterReflector": {"Trigger" : {
+														  // Can optionaly contain: '"value" : ...' (default: null, i.e. reflect any changes) and|or '"ReflectInternalChanges": true|false (default: false)'
+														  "ReflectInternalChanges": false // Avoid reflector invocation caused by InvalidateNodes(), etc.
+														}
+											,"Sequence" : [ {"parameter" : ""} ]
+										   }
+		}
+        
+		,"DeviceReset":
+		{
+			"DeviceXmlParameterReflector": {"Trigger" : {
+														  "ReflectInternalChanges": false // Avoid reflector invocation caused by InvalidateNodes(), etc.
+														}
+											,"Sequence" : [	{"KYHW_Call" : ""}]
+										   }
+		}
+		
+		
+		// 
+		// For IO Controller:
+		//
+        
+		,"DirectAuxListener":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xC0002044"
+				,"BypassHwWrite" : false
+				
+				,"WriteSequence" : 
+				[
+					//{"operation": "parameter"} // "parameter" creates SequenceStep_Parameter (pStep = KY_NEW SequenceStep_Script(SequenceStep::TriggerType::PARAMETER, parameterNameValue, refFG_HANDLE_INFO.ptrKYFG_DEVICE->GetFgHandle());)
+					{"operation": "KYHW_Call", "address": "DirectAuxListener"} // "KYHW_Call" creates SequenceStep_KYHW_Call (pStep = KY_NEW SequenceStep_KYHW_Call(SequenceStep::TriggerType::PARAMETER, parameterNameValue, refFG_HANDLE_INFO.ptrKYFG_DEVICE->GetFgHandle());)
+				]
+			}
+		}
+        
+		,"ServiceHwMsgSimulate":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xC0002046"
+				,"BypassHwWrite" : false
+				
+				,"WriteSequence" : 
+				[
+					//{"operation": "parameter"} 
+					{"operation": "KYHW_Call", "address": "ServiceHwMsgSimulate"} 
+				]
+			}
+		}
+        
+		,"LineSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000000",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "LineSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "LineSelector"} 
+				]
+			}
+		}
+		
+		,"LineMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000080",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000080"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000080"}
+				]
+			}
+		}
+		
+		,"LineInverter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000084",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000084"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000084"}
+				]
+			}
+		}
+		
+		,"LineSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000088",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000088"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000088"}
+				]
+			}
+		}
+		
+		,"LineStatus":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000008C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000008C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000008C"}
+				]
+			}
+		}
+		
+		,"LineStatusAll":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000030",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000030"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000030"}
+				]
+			}
+		}
+		
+		,"LineFormat":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000090",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000090"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000090"}
+				]
+			}
+		}
+		
+		,"LineEventMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000094",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000094"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000094"}
+				]
+			}
+		}
+
+		,"LineSelectorListReq":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000028",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000028"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000000", "value": "LineSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000028"}
+				]
+			}
+		}
+		
+		,"UserOutputSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000010",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "UserOutputSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "UserOutputSelector"} 
+				]
+			}
+		}	
+
+		,"UserOutputValue":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000018",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000018"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000018"}
+				]
+			}
+		}
+
+		,"UserOutputValueAll":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000001C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000001C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000001C"}
+				]
+			}
+		}	
+
+		,"UserOutputValueAllMask":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000020",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000020"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000010", "value": "UserOutputSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000020"}
+				]
+			}
+		}		
+
+		,"TriggerSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000004",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "TriggerSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "TriggerSelector"} 
+				]
+			}
+		}	
+
+		,"TriggerMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000004C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000004C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000004C"}
+				]
+			}
+		}	
+
+		,"TriggerActivation":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000040",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000040"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000040"}
+				]
+			}
+		}	
+
+		,"TriggerSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000048",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000048"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000048"}
+				]
+			}
+		}	
+
+		,"TriggerDelay":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000050",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000050"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000050"}
+				]
+			}
+		}	
+
+		,"TriggerFilter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000054",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000054"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000054"}
+				]
+			}
+		}	
+
+		,"TriggerSoftware":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000044",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000044"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000044"}
+				]
+			}
+		}	
+
+		,"TriggerEventMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000058",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000058"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000004", "value": "TriggerSelector"} 
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000058"}
+				]
+			}
+		}	
+
+		,"TimerSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000008",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "TimerSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "TimerSelector"} 
+				]
+			}
+		}		
+
+		,"TimerDelay":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000C4",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000C4"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000C4"}
+				]
+			}
+		}	
+
+		,"TimerDuration":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000C8",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000C8"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000C8"}
+				]
+			}
+		}	
+
+		,"TimerActivation":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000D4",
+
+				// string type of the "value" means virtual named variable will be used 
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000D4"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000D4"}
+				]
+			}
+		}	
+
+		,"TimerOutputInverter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000CC",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000CC"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000CC"}
+				]
+			}
+		}
+
+		,"TimerTriggerSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000C0",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000C0"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000C0"}
+				]
+			}
+		}	
+
+		,"TimerTriggerSoftware":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000D0",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000D0"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000D0"}
+				]
+			}
+		}
+
+		,"TimerReset":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000D8",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000D8"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000D8"}
+				]
+			}
+		}		
+		
+		,"TimerEventMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA00000DC",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA00000DC"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000008", "value": "TimerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA00000DC"}
+				]
+			}
+		}	
+		
+		,"EncoderSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000000C",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "EncoderSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "EncoderSelector"} 
+				]
+			}
+		}		
+
+		,"EncoderOutputMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000118",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000118"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000118"}
+				]
+			}
+		}
+
+		,"EncoderInverter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000010C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000010C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000010C"}
+				]
+			}
+		}	
+
+		,"EncoderASource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000100",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000100"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000100"}
+				]
+			}
+		}
+
+		,"EncoderBSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000104",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000104"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000104"}
+				]
+			}
+		}
+
+		,"EncoderValue":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000110",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000110"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000110"}
+				]
+			}
+		}	
+
+		,"EncoderPositionTrigger":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000114",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000114"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000114"}
+				]
+			}
+		}
+
+		,"EncoderResetSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000108",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000108"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000108"}
+				]
+			}
+		}	
+
+		,"EncoderFilter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000011C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000011C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000011C"}
+				]
+			}
+		}	
+
+		,"EncoderResetActivation":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000120",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000120"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000120"}
+				]
+			}
+		}
+
+		,"EncoderReset":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000128",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000128"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000128"}
+				]
+			}
+		}
+
+		,"EncoderValueAtReset":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000012C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000012C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000012C"}
+				]
+			}
+		}	
+
+		,"EncoderEventEnable":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000130",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000130"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA000000C", "value": "EncoderSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000130"}
+				]
+			}
+		}
+
+		,"CameraTriggerSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000024",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "CameraTriggerSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "CameraTriggerSelector"} 
+				]
+			}
+		}	
+
+		,"CameraTriggerMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA000014C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA000014C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA000014C"}
+				]
+			}
+		}	
+
+		,"CameraTriggerActivation":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000140",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000140"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000140"}
+				]
+			}
+		}
+
+		,"CameraTriggerSource":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000148",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000148"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000148"}
+				]
+			}
+		}	
+
+		,"CameraTriggerDelay":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000150",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000150"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000150"}
+				]
+			}
+		}	
+
+		,"CameraTriggerFilter":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000154",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000154"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000154"}
+				]
+			}
+		}
+
+		,"CameraTriggerSoftware":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000144",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000144"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000144"}
+				]
+			}
+		}	
+
+		,"CameraTriggerEventEnable":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0000158",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0000158"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0000024", "value": "CameraTriggerSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0000158"}
+				]
+			}
+		}
+
+		,"CxpConnectionSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0400000",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "CxpConnectionSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "CxpConnectionSelector"} 
+				]
+			}
+		}
+
+		,"CxpConnectionTestMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0400010",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0400010"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0400010"}
+				]
+			}
+		}
+
+		,"CxpConnectionTestErrorCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA040000C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA040000C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA040000C"}
+				]
+			}
+		}	
+
+		,"CxpConnectionTestRxPacketCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA040002C",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA040002C"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA040002C"}
+				]
+			}
+		}	
+
+		,"CxpConnectionTestTxPacketCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0400034",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0400034"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0400034"}
+				]
+			}
+		}	
+
+		,"TriggerMissedCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA04003C0",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA04003C0"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA04003C0"}
+				]
+			}
+		}	
+
+		,"TriggerSentCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA04003C4",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA04003C4"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA04003C4"}
+				]
+			}
+		}	
+
+		,"TriggerAcknowledgeCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA04003C8",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA04003C8"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA04003C8"}
+				]
+			}
+		}	
+
+		,"TriggerChangeCount":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA04003CC",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA04003CC"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0400000", "value": "CxpConnectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA04003CC"}
+				]
+			}
+		}	
+
+		,"ColorDistortionCorrectionSelector":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0500084",
+				
+				// String type of the "address" not starting with "0x" names virtual variable to be read/written
+				// no "value" in a step means runtime pass parameters (void *pBuffer, int64_t length) will be used
+				"ReadSequence" : 
+				[
+					{"operation": "read", "address": "ColorDistortionCorrectionSelector", "InitialValue": 0} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "address": "ColorDistortionCorrectionSelector"} 
+				]
+			}
+		}	
+
+		,"ColorDistortionCorrectionEnable":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0500080",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0500080"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0500080"}
+				]
+			}
+		}
+		
+		,"ColorDistortionCorrectionLoadMode":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0500080",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0500080"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0500080"}
+				]
+			}
+		}	
+
+		,"ColorDistortionCorrectionAddress":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0500084",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0500084"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0500084"}
+				]
+			}
+		}	
+
+		,"ColorDistortionCorrectionValue":
+		{
+			"ScriptedReflector":
+			{
+				"hw_address" : "0xA0500088",
+
+				// string type of the "value" means virtual named variable will be used
+				"ReadSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"} 
+					,
+					{"operation": "read",  "bar": 0, "address": "0xA0500088"} 
+				]
+				,"WriteSequence" : 
+				[
+					{"operation": "write", "bar": 0, "address": "0xA0500084", "value": "ColorDistortionCorrectionSelector"}
+					,
+					{"operation": "write", "bar": 0, "address": "0xA0500088"}
+				]
+			}
+		}	
+	} // "Extensions"  
+}

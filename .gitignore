@@ -20,7 +20,9 @@ bench_outputs/
 _tmp*/
 build/
 dist/
-*.spec
+Session logs/
+*.bay14
+*.bay14line
 
 # Local backups
 _backups/
@@ -35,4 +37,5 @@ _backups/
 Iron661_session_*.txt
 log.sbf*.txt
 gps_correlation*.csv
+tools/taps/
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<QHelpCollectionProject version="1.0">
+
+  <docFiles>
+    <register>
+      <file>User_guide_for_acquisition_mode.qch</file>
+      <file>ParametersHandlerLib.qch</file>
+    </register>
+  </docFiles>
+</QHelpCollectionProject>

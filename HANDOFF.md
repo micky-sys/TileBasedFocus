@@ -1,10 +1,12 @@
 # Iron 661 Capture — Handoff Notes
 
-_Last updated: 2026-06-29 — GPS correlator **latest-fix fallback** (§12), Parallax
-Export Studio GUI tweaks (§12), and both apps rebuilt + redeployed to
-`C:\Parallax Apps`. Previous: 2026-06-04 (PM session — GPS correlation TOW fix
-validated, log-noise reduction, GPS port preference, PKG-build fix). Use this to pick
-up work on another machine._
+_Last updated: 2026-06-30 — project is now under Git (§13); Iron661Capture,
+Parallax Export Studio, shared source, build specs, docs, ClearCore sketch, and the
+KAYA runtime dependency copy are intended to be committed so the apps can be run
+from the repository going forward. Previous: 2026-06-29 — GPS correlator
+**latest-fix fallback** (§12), Parallax Export Studio GUI tweaks (§12), and both
+apps rebuilt + redeployed to `C:\Parallax Apps`. Use this to pick up work on
+another machine._
 
 > **TL;DR of current state:** The GPS correlation pipeline is **fixed and validated
 > end-to-end** (TOW-based sweep segmentation — see §9). A 1820-frame / 140-sweep /
@@ -42,10 +44,10 @@ work done in the most recent session, so you can continue seamlessly elsewhere.
 - Session logging (added this session): `host/capture/session_log.py`.
 - PyInstaller spec: `host/Iron661Capture.spec`.
 
-> The repo is **not** under git. Snapshots are kept manually under `_backups/`
-> (timestamped folders). The project lives on Google Drive (`My Drive/...`), so
-> file sync is how it moves between machines. **Take a fresh `_backups/` copy
-> before large changes.**
+> The project is now a **Git repository** on branch `main`. Use Git commits for
+> restore points instead of manual `_backups/` snapshots where possible. The project
+> still lives on Google Drive (`My Drive/...`), so avoid building PyInstaller output
+> directly into the repo folder; see §4.
 
 ---
 
@@ -413,3 +415,39 @@ warning) — then mirrored with `robocopy /MIR`:
 > `Parallax Iron661 Capture.lnk` desktop shortcut may need to be (re)created by hand.
 > Neither deployed EXE was smoke-launched this session (Iron661 needs the camera
 > hardware; the dev machine self-exits without it).
+
+---
+
+## 13. Git workflow (2026-06-30)
+
+The repository was initialized on branch `main` with a first source-only commit:
+
+```
+16c57b7 Initial project setup
+```
+
+The current Git baseline should include the runnable/rebuildable app source:
+
+- `host/` — Iron661Capture app, including `host/Iron661Capture.spec`, build/deploy
+  scripts, assets, requirements, and `host/capture/`.
+- `tools/` — Parallax Export Studio (`tools/gps_export_studio_gui.py`,
+  `tools/gps_export_studio_core.py`, `tools/ParallaxExportStudio.spec`) plus shared
+  Bay14/GPS/export utilities used by the studio.
+- `Parallax_CLRCR_V2_4/` — current ClearCore sketch used by the capture rig.
+- `KAYA Instruments/` — local copy of the KAYA runtime/GenTL dependency used for
+  hardware bring-up when the system install is unavailable.
+- `docs/` and `HANDOFF.md` — operational notes and build/run documentation.
+
+Ignored on purpose: generated `build/` and `dist/` folders, logs, session logs,
+Python caches, raw captures, TIFF exports, archives, temporary folders, and manual
+backup snapshots. Those can be regenerated or are too large/noisy for normal Git
+history.
+
+Useful commands from the repo root:
+
+```
+git status
+git add <files-or-folders>
+git commit -m "Describe the checkpoint"
+git log --oneline --max-count=5
+```

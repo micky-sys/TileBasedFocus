@@ -1,0 +1,16 @@
+#ifndef KYVP_LIB_EXTENSION_DEFINES_H_
+#define KYVP_LIB_EXTENSION_DEFINES_H_
+
+#ifdef _MSC_VER
+#ifdef KYVP_EXTENSION_EXPORTS
+#define KYVP_EXTENSION_EXTERNAL_DLL __declspec(dllexport)
+#else
+#define KYVP_EXTENSION_EXTERNAL_DLL __declspec(dllimport)
+#endif
+#else
+#define KYVP_EXTENSION_EXTERNAL_DLL
+#endif
+
+#define KYVP_EXTENSION_API          KYVP_EXTERNAL_C KYVP_EXTENSION_EXTERNAL_DLL
+
+#endif  // #ifndef KYVP_LIB_EXTENSION_DEFINES_H_

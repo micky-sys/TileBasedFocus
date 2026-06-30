@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RegisterDescription
+    ModelName="KAYA_System_Interface_XML"
+    VendorName="KAYA_Instruments"
+    ToolTip="KAYA_System_Interface_XML"
+    StandardNameSpace="None"
+    SchemaMajorVersion="1"
+    SchemaMinorVersion="1"
+    SchemaSubMinorVersion="0"
+    MajorVersion="1"
+    MinorVersion="1"
+    SubMinorVersion="0"
+    ProductGuid="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+    VersionGuid="11111111-2222-3333-4444-555555555555"
+    xmlns="http://www.genicam.org/GenApi/Version_1_1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.genicam.org/GenApi/Version_1_1
+    http://www.genicam.org/GenApi/GenApiSchema_Version_1_1.xsd">
+    <!-- ******************************************************************* -->
+    <!-- Root categories                                                     -->
+    <!-- ******************************************************************* -->
+    <Group Comment="RootCategory">
+        <Category Name="Root" NameSpace="Standard">
+            <Visibility>Beginner</Visibility>
+            <ImposedAccessMode>RO</ImposedAccessMode>
+            <pFeature>SystemPoCXPControl</pFeature>
+        </Category>
+    </Group>
+    <!-- ******************************************************************* -->
+    <!-- Defines                                                             -->
+    <!-- ******************************************************************* -->
+    <!-- Device -->
+    <Port Name="Device">
+        <ToolTip>Port giving access to the device.</ToolTip>
+        <Visibility>Invisible</Visibility>
+    </Port>
+    <!-- ******************************************************************* -->
+    <!-- Categories                                                          -->
+    <!-- ******************************************************************* -->
+    <Category Name="SystemPoCXPControl" NameSpace="Standard">
+        <ToolTip>Category for PoCXP control.</ToolTip>
+        <Description>Category for PoCXP control.</Description>
+        <DisplayName>PoCXP Control</DisplayName>
+        <Visibility>Beginner</Visibility>
+        <pFeature>SystemPoCXPAutoActive</pFeature>
+        <pFeature>SystemPoCxpInitialState</pFeature>
+    </Category>
+    <!--SystemPoCXPControl-->
+    <Group Comment="SystemPoCXPControl">
+        <!-- PoCXPAutoActive-->
+        <Boolean Name="SystemPoCXPAutoActive" NameSpace="Standard">
+            <ToolTip>Activates / deactivates automatic PoCXP monitor.</ToolTip>
+            <Description>Activates / deactivates automatic PoCXP monitor.</Description>
+            <DisplayName>PoCXP Auto monitoring active</DisplayName>
+            <Visibility>Guru</Visibility>
+            <pValue>SystemPoCXPAutoActiveReg</pValue>
+        </Boolean>
+        <IntReg Name="SystemPoCXPAutoActiveReg">
+            <Address>0x00000000</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Unsigned</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+        <!-- PoCxpInitialState-->
+        <Enumeration Name="SystemPoCxpInitialState" NameSpace="Standard">
+            <ToolTip>Set initial system the Power over CoaXPress (PoCXP) state.</ToolTip>
+            <Description>Set initial system the Power over CoaXPress (PoCXP) state.</Description>
+            <DisplayName>System PoCxp Initial State</DisplayName>
+            <Visibility>Beginner</Visibility>
+            <ImposedAccessMode>RW</ImposedAccessMode>
+            <EnumEntry Name="Auto">
+                <DisplayName>Automatically managed</DisplayName>
+                <Value>0</Value>
+            </EnumEntry>
+            <EnumEntry Name="Off">
+                <DisplayName>Forced Off</DisplayName>
+                <Value>1</Value>
+            </EnumEntry>
+            <pValue>SystemPoCxpInitialStateReg</pValue>
+        </Enumeration>
+        <IntReg Name="SystemPoCxpInitialStateReg">
+            <Visibility>Invisible</Visibility>
+            <Address>0x00000004</Address>
+            <Length>4</Length>
+            <AccessMode>RW</AccessMode>
+            <pPort>Device</pPort>
+            <Cachable>NoCache</Cachable>
+            <Sign>Signed</Sign>
+            <Endianess>LittleEndian</Endianess>
+        </IntReg>
+    </Group>
+</RegisterDescription>

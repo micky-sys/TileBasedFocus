@@ -1,0 +1,3 @@
+# One-time / CI deps for packaging (not needed on-camera runtime venv).
+pyinstaller>=6.3
+Pillow>=10.0

@@ -1,0 +1,26 @@
+{
+  "port": "(synthesized)",
+  "baud": 115200,
+  "duration_requested_s": 27.0,
+  "started_iso_utc": "2026-05-26T10:50:10Z",
+  "total_bytes": 9880,
+  "parser_stats": {
+    "good_blocks": 130,
+    "events_decoded": 130,
+    "bad_crc": 0,
+    "bad_length": 0,
+    "skipped_bytes": 0,
+    "events_skipped_unknown": 0,
+    "buffered": 0
+  },
+  "synth_args": {
+    "sweeps": 10,
+    "frames_per_sweep": 13,
+    "intra_sweep_ms": 200.0,
+    "inter_sweep_extra_ms": 100.0,
+    "sbf_latency_ms": 5.0,
+    "latitude_deg": 32.17025,
+    "longitude_deg": 34.831361,
+    "height_m": 72.12
+  }
+}
