@@ -1,0 +1,38 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime logs and temporary outputs
+*.log
+bench_outputs/
+_tmp*/
+build/
+dist/
+*.spec
+
+# Local backups
+_backups/
+
+# Large experiment/capture artifacts
+*.tif
+*.tiff
+*.rar
+*.zip
+*.7z
+*_debug_frame.png
+Iron661_session_*.txt
+log.sbf*.txt
+gps_correlation*.csv
+
