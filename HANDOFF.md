@@ -451,3 +451,129 @@ git add <files-or-folders>
 git commit -m "Describe the checkpoint"
 git log --oneline --max-count=5
 ```
+
+---
+
+## 14. Autofocus — M4 (2026-06-30)
+
+Contrast-detection autofocus (CDAF) for the M4 focus mode. It copes with the
+in-flight scene (which changes rapidly but overlaps frame-to-frame) by tracking a
+high-texture patch and hill-climbing the open-loop focus motor. Implemented in
+`host/capture/autofocus.py` (`AutoFocusEngine` = hardware-free state machine;
+`AutoFocusController(QObject)` = Qt wrapper + multi-camera sequencing), wired into
+`host/capture/focus_panel.py` and `host/capture/app.py`, reusing the winning-tile
+scorer (`sharpness.find_best_tile` / `score_tile_subsampled`) and `tile_geometry.TileGrid`.
+
+### 14.1 Requirements (as specified)
+
+- The aircraft is **in flight**: the scene changes rapidly, but consecutive frames
+  overlap heavily, so it is **not** an independently pollable variable — a focus
+  metric measured across focus positions is confounded by content motion unless we
+  track the same physical patch.
+- **Hardware limits:** brushed DC focus motors, **no encoder**, all **3 motors driven
+  by one H-bridge, relay-selectable** (`$Cn*`). Therefore autofocus runs on **one
+  camera at a time**. (Per-motor encoders are planned later — see 14.8.)
+- Use the **winning-tile** strategy to pick an object to focus on and **keep it in
+  the FOV as long as possible** — but pick it from the **leading edge of the frame**
+  (the side facing flight direction: top/bottom/left/right) so the object traverses
+  the whole frame before exiting (maximum dwell time), rather than from the central
+  circle.
+- Support an **operator-assisted** workflow: the operator does a coarse focus to get
+  close, and AF fine-tunes from there (default). A **full-auto** bracket search is
+  also available.
+- The focus loop need **not be human-usable**, so the M4 cadence is pushed toward the
+  camera's **~210 ms (~4.76 Hz)** trigger limit (faster convergence + smaller
+  per-step scene shift). NOTE: firmware floors `picsInPlaceDelay` at **250 ms**;
+  reaching ~210 ms requires lowering that floor in `Parallax_CLRCR_V2_4`. Until then
+  the host clamps to 250 ms. Host `FOCUS_TAP_MIN_INTERVAL_S` was lowered 0.25→0.21 so
+  the focus tap isn't the bottleneck.
+
+### 14.2 Approach
+
+1. **Leading-edge winning tile.** `tile_geometry.TileGrid` gained a selection region
+   (`region="circle"` default, or `region="edge"` with `lead_edge` ∈
+   {top,bottom,left,right} and `edge_band` band-depth fraction). AF lays candidate
+   tiles along the leading-edge band and scores them with the existing sharpness
+   metric to pick a high-texture target. The M4 fine preview still uses
+   `region="circle"`.
+2. **Automatic leading-edge detection.** The leading edge = the edge **opposite the
+   image-motion vector**, which the patch tracker measures via phase correlation
+   (`cv2.phaseCorrelate`). So the band is derived automatically; an explicit
+   `lead_edge` hint (e.g. from GPS track) can seed it. If motion is indeterminate
+   (hover / no parallax), AF falls back to the central circle.
+3. **Patch tracking.** Each frame the tracker estimates the global shift and moves the
+   ROI to follow the same physical content, so the sharpness metric is comparable
+   across focus positions. Re-acquire when tracking is lost or the patch reaches the
+   trailing edge.
+4. **Open-loop hill climb.** No encoder, so "position" = cumulative signed pulse count
+   (1 pulse = 10 ms drive). Climb to the sharpness peak, remember the best, and return
+   to it (approximate; backlash-compensated).
+
+### 14.3 State machine
+
+`IDLE → ACQUIRE (pick leading-edge target) → MEASURE (median of N frames) → MOVE
+(pulse + settle) → … → RETURN_TO_BEST → DONE`, with `FAILED` on persistent low
+texture / lost tracking / safety cap. Each focus frame advances the machine; pulses
+are clocked by frame arrivals plus a settle count.
+
+### 14.4 Config (`AutoFocusConfig`)
+
+`assisted` (default True), `step_pulses` / `coarse_step_pulses`,
+`assisted_bracket_pulses` (max excursion per side in assisted mode),
+`max_total_pulses` (hard safety cap), `settle_frames`, `measure_frames`,
+`improve_frac` (min relative improvement to count as better), `patience`,
+`backlash_pulses` (extra pulses sent on every direction reversal — calibratable),
+`strength` (`$Sn` level used during a run), `min_texture_score` /
+`max_low_texture_frames`, `edge_band`, `drive_cadence_to_min`.
+
+### 14.5 UI (`FocusPanel`)
+
+Adds **Auto-focus** (current camera), **Auto-focus all** (cycles cam1→2→3 via the
+`$Cn*` relay), **Stop**, an **assisted / full-auto** selector, and a status/progress
+readout. Strength + camera radios are reused. Camera/strength/mode controls are
+locked while a run is active.
+
+### 14.6 Failure-mode & non-flight-motion handling
+
+- **Intermittent** low texture (e.g. oblique sky phase) → **pause and resume**: those
+  frames are not counted, focus is held, and the climb resumes when texture returns.
+  **Persistent** low texture (> `max_low_texture_frames`) → abort.
+- **Oscillating / reversing motion** → hysteresis: the same patch is tracked through
+  reversals (long dwell); the leading edge is locked at acquisition, not re-picked per
+  reversal.
+- **Keep exposure/gain fixed during a run** (auto-exposure off) so the metric isn't
+  confounded; the M4 sensor controls are already disabled in M4.
+- A genuine **GPS/motion outage** never fabricates motion — AF just falls back to the
+  central circle.
+
+### 14.7 Ground testing (cameras stationary, mirrors move)
+
+The mirror rig is not aircraft-like: the **vertical (nadir)** camera sees **left↔right**
+travel; the **oblique** cameras trace a **circle whose top is sky-only**. The AF is
+motion-agnostic (leading edge derived from measured motion; cyclic/oscillating cases
+handled above), so the rig is a valid and *repeatable* exerciser. Layered tests:
+
+1. **Hardware-free closed loop (CI):** `tools/test_autofocus.py` runs the full engine
+   against a software **focus simulator** in `frame_grabber_sim.py`
+   (`FocusSceneSimulator`) — a textured scene whose **blur is a function of a simulated
+   focus position**, with selectable motion profiles: flight translation, nadir L-R
+   oscillation, and oblique circle-with-sky. AF pulses drive the simulated motor →
+   blur changes → loop closes entirely in software. Asserts convergence near the
+   optimum, sky-phase pause/resume, and reversal/backlash handling.
+2. **Optical bench (rig validation):** fixed textured **resolution target**
+   (slanted-edge / Siemens star) at constant distance + moving mirror. Manually find
+   true best focus, defocus by a known amount, run AF, and measure **accuracy**
+   (vs manual best), **repeatability** (spread over N runs), **convergence time**
+   (frames/pulses), and **sky-sector behavior**. Mirror motion is repeatable, so the
+   numbers are comparable run-to-run. Keep the target far enough that mirror angle
+   doesn't materially change subject distance.
+3. **Offline replay (partial):** push recorded frames (captures, `Training pictures/`,
+   `exp_123.tif`) through the tracker + leading-edge + sharpness metric to validate
+   selection/tracking/metric on real imagery. Focus *actuation* can't be replayed.
+
+### 14.8 Future: per-motor encoders
+
+Encoders (planned) will allow closed-loop positioning, exact and repeatable
+return-to-best, and faster convergence. The engine is structured so a future
+`FocusAxis` abstraction (reporting real position instead of cumulative pulse counts)
+can replace the open-loop pulse bookkeeping without touching the search logic.

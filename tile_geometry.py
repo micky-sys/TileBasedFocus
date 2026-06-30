@@ -59,7 +59,20 @@ class TileGrid:
     overlap:
         Fractional overlap between adjacent tiles (0 = none, 0.5 = 50 %).
         Default 0 (non-overlapping grid).
+    region:
+        Tile selection region. ``"circle"`` (default) lays tiles inside the
+        centre circle. ``"edge"`` lays them along the *leading edge* band of the
+        frame (the side facing flight direction), so a target picked there has
+        maximum dwell time in the FOV before it exits the trailing edge.
+    lead_edge:
+        Which edge is the leading edge when ``region="edge"``: one of
+        ``"top"``, ``"bottom"``, ``"left"``, ``"right"``.
+    edge_band:
+        Band depth as a fraction of the perpendicular frame dimension when
+        ``region="edge"`` (e.g. 0.25 = the leading 25 % of the frame).
     """
+
+    VALID_EDGES = ("top", "bottom", "left", "right")
 
     def __init__(
         self,
@@ -70,6 +83,9 @@ class TileGrid:
         zoom: float = 1.5,
         circle_fraction: float = 0.2,
         overlap: float = 0.0,
+        region: str = "circle",
+        lead_edge: str = "top",
+        edge_band: float = 0.25,
     ) -> None:
         self.frame_w = frame_width
         self.frame_h = frame_height
@@ -86,11 +102,19 @@ class TileGrid:
         self.circle_cy = frame_height / 2
 
         self._overlap = overlap
+        self.region = region if region in ("circle", "edge") else "circle"
+        self.lead_edge = lead_edge if lead_edge in self.VALID_EDGES else "top"
+        self.edge_band = float(edge_band)
         self.tiles: list[Tile] = self._build_grid()
 
     # ------------------------------------------------------------------
 
     def _build_grid(self) -> list[Tile]:
+        if self.region == "edge":
+            return self._build_grid_edge()
+        return self._build_grid_circle()
+
+    def _build_grid_circle(self) -> list[Tile]:
         step_x = max(1, int(self.tile_w * (1 - self._overlap)))
         step_y = max(1, int(self.tile_h * (1 - self._overlap)))
         half_w = self.tile_w // 2
@@ -119,6 +143,49 @@ class TileGrid:
                 cx += step_x
             cy += step_y
 
+        return tiles
+
+    def _build_grid_edge(self) -> list[Tile]:
+        """Lay tiles across the leading-edge band of the frame.
+
+        The band spans the full perpendicular extent of the frame and is
+        ``edge_band`` deep (clamped to at least one tile). Tile origins are
+        Bayer-aligned (even).
+        """
+        step_x = max(1, int(self.tile_w * (1 - self._overlap)))
+        step_y = max(1, int(self.tile_h * (1 - self._overlap)))
+
+        if self.lead_edge in ("top", "bottom"):
+            depth = max(self.tile_h, int(round(self.frame_h * self.edge_band)))
+            bx0, bx1 = 0, self.frame_w
+            if self.lead_edge == "top":
+                by0, by1 = 0, min(self.frame_h, depth)
+            else:
+                by0, by1 = max(0, self.frame_h - depth), self.frame_h
+        else:  # left / right
+            depth = max(self.tile_w, int(round(self.frame_w * self.edge_band)))
+            by0, by1 = 0, self.frame_h
+            if self.lead_edge == "left":
+                bx0, bx1 = 0, min(self.frame_w, depth)
+            else:
+                bx0, bx1 = max(0, self.frame_w - depth), self.frame_w
+
+        y_positions = list(range(by0, max(by0 + 1, by1 - self.tile_h + 1), step_y))
+        x_positions = list(range(bx0, max(bx0 + 1, bx1 - self.tile_w + 1), step_x))
+        if not y_positions:
+            y_positions = [by0]
+        if not x_positions:
+            x_positions = [bx0]
+
+        tiles: list[Tile] = []
+        for y in y_positions:
+            for x in x_positions:
+                x0 = x & ~1
+                y0 = y & ~1
+                x1 = x0 + self.tile_w
+                y1 = y0 + self.tile_h
+                if x0 >= 0 and y0 >= 0 and x1 <= self.frame_w and y1 <= self.frame_h:
+                    tiles.append(Tile(x0, y0, x1, y1))
         return tiles
 
     def reconfigure(

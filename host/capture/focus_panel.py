@@ -139,6 +139,12 @@ class FocusPanel(QWidget):
 
     fine_demosaic_changed = Signal(bool)
 
+    # Autofocus controls. The MainWindow owns the AutoFocusController; the panel
+    # just emits intent (with the assisted flag) and reflects run state/status.
+    autofocus_requested = Signal(bool)       # assisted -> AF the active camera
+    autofocus_all_requested = Signal(bool)   # assisted -> AF cam1..3 in sequence
+    autofocus_stop_requested = Signal()
+
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
     diag_log = Signal(str)
@@ -152,6 +158,8 @@ class FocusPanel(QWidget):
         self._last_fine_rgb: Optional[np.ndarray] = None
         self._last_fine_meta: Optional[dict] = None
         self._cam_device_ids: dict[int, str] = {}
+        self._cam_available: dict[int, bool] = {}
+        self._controls_locked = False
 
         self._build_ui()
         self._install_m4_arrow_hotkeys()
@@ -276,6 +284,7 @@ class FocusPanel(QWidget):
         outer.addWidget(self._display, 1)
 
         outer.addLayout(self._build_bottom_control_row())
+        outer.addLayout(self._build_autofocus_row())
         self._focus_step_box.hide()
         self._period_box.hide()
         self._debayer_chk.setEnabled(self._fine_toggle.isChecked())
@@ -397,9 +406,18 @@ class FocusPanel(QWidget):
     def set_camera_available(self, camera_number: int, available: bool) -> None:
         """Enable / disable a camera's radio. Called from MainWindow as
         each pipeline comes up (or fails to)."""
+        self._cam_available[int(camera_number)] = bool(available)
         rb = self._cam_radios.get(int(camera_number))
-        if rb is not None:
+        if rb is not None and not self._controls_locked:
             rb.setEnabled(bool(available))
+
+    def set_controls_locked(self, locked: bool) -> None:
+        """Lock camera + strength controls while autofocus drives them."""
+        self._controls_locked = bool(locked)
+        for n, rb in self._cam_radios.items():
+            rb.setEnabled(not self._controls_locked and self._cam_available.get(n, False))
+        for btn in self._strength_group.buttons():
+            btn.setEnabled(not self._controls_locked)
 
     def set_active_camera(self, camera_number: Optional[int]) -> None:
         """Reflect the externally-selected active camera in our radio
@@ -477,6 +495,70 @@ class FocusPanel(QWidget):
         self._period_box.hide()
 
         return row
+
+    def _build_autofocus_row(self) -> QHBoxLayout:
+        """Autofocus controls: run / run-all / stop + assisted toggle + status."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 2, 0, 2)
+
+        self._af_button = QPushButton("Auto-focus")
+        self._af_button.setToolTip(
+            "Autofocus the active camera (M4 only). Tracks a high-texture patch "
+            "on the leading edge and hill-climbs the focus motor."
+        )
+        self._af_button.clicked.connect(self._on_af_clicked)
+        row.addWidget(self._af_button)
+
+        self._af_all_button = QPushButton("Auto-focus all")
+        self._af_all_button.setToolTip(
+            "Autofocus cam1, cam2 and cam3 in sequence (relay-selected, one at "
+            "a time)."
+        )
+        self._af_all_button.clicked.connect(self._on_af_all_clicked)
+        row.addWidget(self._af_all_button)
+
+        self._af_stop_button = QPushButton("Stop AF")
+        self._af_stop_button.setEnabled(False)
+        self._af_stop_button.clicked.connect(self._on_af_stop_clicked)
+        row.addWidget(self._af_stop_button)
+
+        self._af_assisted_chk = QCheckBox("Assisted")
+        self._af_assisted_chk.setChecked(True)
+        self._af_assisted_chk.setToolTip(
+            "Assisted: operator coarse-focuses first; AF fine-tunes within a "
+            "small bracket. Uncheck for a full-auto coarse search."
+        )
+        row.addWidget(self._af_assisted_chk)
+
+        row.addStretch(1)
+
+        self._af_status_label = QLabel("autofocus: idle")
+        self._af_status_label.setStyleSheet(
+            "font-family:Consolas, monospace; color:#9c9; font-size:11px;"
+        )
+        self._af_status_label.setMinimumWidth(260)
+        row.addWidget(self._af_status_label)
+        return row
+
+    def _on_af_clicked(self) -> None:
+        self.autofocus_requested.emit(self._af_assisted_chk.isChecked())
+
+    def _on_af_all_clicked(self) -> None:
+        self.autofocus_all_requested.emit(self._af_assisted_chk.isChecked())
+
+    def _on_af_stop_clicked(self) -> None:
+        self.autofocus_stop_requested.emit()
+
+    def set_autofocus_running(self, running: bool) -> None:
+        """Lock start buttons / unlock Stop while an AF run is in progress."""
+        self._af_button.setEnabled(not running)
+        self._af_all_button.setEnabled(not running)
+        self._af_assisted_chk.setEnabled(not running)
+        self._af_stop_button.setEnabled(running)
+
+    def set_autofocus_status(self, text: str) -> None:
+        self._af_status_label.setText(text)
 
     def _build_focus_step_box(self) -> QWidget:
         box = QGroupBox("Focus")

@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .autofocus import AutoFocusController
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
 from .file_naming import sanitize_project_name
@@ -2078,6 +2079,30 @@ class MainWindow(QMainWindow):
         self._focus_panel.fine_demosaic_changed.connect(
             self._on_fine_demosaic_changed
         )
+        # Autofocus controller (M4). Drives the relay-selected focus motor via
+        # the serial client; gated to M4 + connected PCB. ``AutoFocusController``
+        # is None only if PySide6 is unavailable (never in the GUI).
+        self._autofocus = (
+            AutoFocusController(
+                self._serial,
+                self._modes,
+                select_camera_cb=self._on_focus_panel_camera_chosen,
+                set_roi_cb=self._set_active_focus_roi,
+            )
+            if AutoFocusController is not None
+            else None
+        )
+        if self._autofocus is not None:
+            self._focus_panel.autofocus_requested.connect(
+                self._on_autofocus_requested
+            )
+            self._focus_panel.autofocus_all_requested.connect(
+                self._on_autofocus_all_requested
+            )
+            self._focus_panel.autofocus_stop_requested.connect(self._autofocus.stop)
+            self._autofocus.status.connect(self._on_autofocus_status)
+            self._autofocus.finished.connect(self._on_autofocus_finished)
+            self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
         focus_host = QWidget()
         focus_layout = QVBoxLayout(focus_host)
         focus_layout.setContentsMargins(0, 0, 0, 0)
@@ -3034,6 +3059,65 @@ class MainWindow(QMainWindow):
     def _on_fine_demosaic_changed(self, _enabled: bool) -> None:
         self._sync_fine_demosaic_to_pipelines()
 
+    # ── autofocus (M4) ───────────────────────────────────────────────────
+
+    def _set_active_focus_roi(self, roi) -> None:
+        """Pin (or clear) the fixed focus ROI on the active pipeline."""
+        p = self._active_pipeline()
+        if p is not None:
+            try:
+                p.set_focus_roi(roi)
+            except Exception as exc:
+                self._log(f"set_focus_roi failed: {exc}")
+
+    def _force_focus_coarse(self) -> None:
+        """Autofocus consumes the coarse decimated tap, so ensure Coarse view."""
+        if self._modes.focus_submode() != FocusSubMode.COARSE:
+            self._modes.set_focus_submode(FocusSubMode.COARSE)
+            self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
+            self._sync_fine_focus_to_pipelines()
+
+    @Slot(bool)
+    def _on_autofocus_requested(self, assisted: bool) -> None:
+        if self._autofocus is None:
+            return
+        if not self._modes.is_focus_mode():
+            self._log("Autofocus: switch to M4 (Focus) mode first.")
+            return
+        if self._active_pipeline() is None:
+            self._log("Autofocus: select a camera to preview first.")
+            return
+        self._force_focus_coarse()
+        self._autofocus.start_single(assisted=assisted)
+
+    @Slot(bool)
+    def _on_autofocus_all_requested(self, assisted: bool) -> None:
+        if self._autofocus is None:
+            return
+        if not self._modes.is_focus_mode():
+            self._log("Autofocus: switch to M4 (Focus) mode first.")
+            return
+        cams = sorted(p.camera_number for p in self._pipelines)
+        if not cams:
+            self._log("Autofocus: no cameras online.")
+            return
+        self._force_focus_coarse()
+        self._autofocus.start_all(cams, assisted=assisted)
+
+    @Slot(str)
+    def _on_autofocus_status(self, text: str) -> None:
+        self._focus_panel.set_autofocus_status(text)
+        self._log(text)
+
+    @Slot(bool, dict)
+    def _on_autofocus_finished(self, ok: bool, report: dict) -> None:
+        self._log(f"autofocus finished: ok={ok} {report}")
+
+    @Slot(bool)
+    def _on_autofocus_run_state(self, running: bool) -> None:
+        self._focus_panel.set_autofocus_running(running)
+        self._focus_panel.set_controls_locked(running)
+
     def _active_pipeline(self) -> Optional[CameraPipeline]:
         """Return the pipeline whose preview radio is currently on, if any.
 
@@ -3160,6 +3244,11 @@ class MainWindow(QMainWindow):
                 f"(cam{pipeline.camera_number})"
             )
         self._focus_panel.receive_raw_frame(raw, ts_iso)
+        # Feed the autofocus engine the coarse decimated frame for the active
+        # camera (tracking + sharpness hill-climb run off this tap).
+        af = getattr(self, "_autofocus", None)
+        if af is not None and af.is_running():
+            af.feed_frame(raw)
 
     @Slot(QImage)
     def _on_preview_ready(self, qimg: QImage) -> None:
@@ -3496,6 +3585,11 @@ class MainWindow(QMainWindow):
         prev_mode = self._modes.mode
         self._modes.set_mode(mode)
         self._mode_status_label.setText(f"Current: {mode_display_label(mode)}")
+
+        # Leaving M4 aborts any in-progress autofocus run.
+        af = getattr(self, "_autofocus", None)
+        if mode != Mode.M4 and af is not None and af.is_running():
+            af.stop("left M4 mode")
 
         if mode == Mode.M4:
             self._modes.set_focus_submode(FocusSubMode.COARSE)

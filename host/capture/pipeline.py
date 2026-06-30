@@ -84,7 +84,9 @@ log = logging.getLogger(__name__)
 
 PREVIEW_MAX_EDGE = 1280
 PREVIEW_MIN_INTERVAL_S = 0.1  # cap preview emission to 10 Hz
-FOCUS_TAP_MIN_INTERVAL_S = 0.25  # cap raw-frame emission for focus to 4 Hz
+FOCUS_TAP_MIN_INTERVAL_S = 0.21  # cap focus tap to ~4.76 Hz (near sensor limit;
+# the M4 focus loop need not be human-usable, and a faster tap means more
+# autofocus measurements per run and less scene drift between focus steps).
 
 # M4 Fine sub-mode: virtual display size for TileGrid (150% zoom full-res tile).
 M4_FINE_DISPLAY_W = 1280
@@ -366,6 +368,43 @@ def m4_fine_tile_rgb_from_frame(
     return rgb, result, crop_u16, overview_rgb
 
 
+def m4_roi_tile_rgb_from_frame(
+    full_u16: np.ndarray,
+    roi: tuple[int, int, int, int],
+    *,
+    demosaic: bool = True,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """Crop a FIXED ROI (autofocus tracked patch), score it, and build RGB.
+
+    Mirrors :func:`m4_fine_tile_rgb_from_frame` but for a caller-supplied ROI
+    instead of the auto-picked winning tile. Returns
+    ``(rgb_u8_hw3, sharpness_score, uint16_crop)``.
+    """
+    from sharpness import score_tile_subsampled
+    from tile_geometry import Tile
+
+    fh, fw = full_u16.shape[:2]
+    x0, y0, x1, y1 = roi
+    x0 = max(0, min(int(x0), fw - 2))
+    y0 = max(0, min(int(y0), fh - 2))
+    x1 = max(x0 + 2, min(int(x1), fw))
+    y1 = max(y0 + 2, min(int(y1), fh))
+
+    score = float(score_tile_subsampled(full_u16, Tile(x0, y0, x1, y1)))
+    crop_u16 = full_u16[y0:y1, x0:x1].copy()
+    crop_u8 = (crop_u16 >> 6).astype(np.uint8)
+    if demosaic:
+        rgb = cv2.cvtColor(
+            crop_u8,
+            opencv_bayer_rgb_demosaic_code(
+                {"genicam_pixel_format": "BayerRG14"},
+            ),
+        )
+    else:
+        rgb = cv2.cvtColor(crop_u8, cv2.COLOR_GRAY2RGB)
+    return rgb, score, crop_u16
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -466,6 +505,11 @@ class AcquisitionThread(QThread):
         self._last_focus_tap_t = 0.0
         self._fine_focus = False  # M4 Fine sub-mode: full-res SHM + debayered tile
         self._fine_demosaic = True  # M4 Fine: False = raw Bayer gray (no demosaic)
+        # M4 autofocus: when set to (x0, y0, x1, y1) in full-res pixels, the
+        # Fine focus tap emits that FIXED ROI crop (so AF / the operator see the
+        # tracked patch) instead of the auto-picked winning tile. None = the
+        # default auto-pick behaviour.
+        self._focus_roi: Optional[tuple[int, int, int, int]] = None
         self._dropped_due_to_queue_full = 0
         self._dropped_writer_not_ready = 0
         # Diagnostic counter for the M4 focus-tap path. Bumped each
@@ -534,6 +578,25 @@ class AcquisitionThread(QThread):
     def set_fine_demosaic_enabled(self, enabled: bool) -> None:
         """M4 Fine only: when False, tile view is raw Bayer grayscale (no debayer)."""
         self._fine_demosaic = bool(enabled)
+
+    def set_focus_roi(
+        self, roi: Optional[tuple[int, int, int, int]]
+    ) -> None:
+        """M4 Fine only: pin the focus tap to a FIXED full-res ROI (autofocus).
+
+        Pass ``(x0, y0, x1, y1)`` in full-resolution sensor pixels to make the
+        Fine tap emit that exact crop every frame (so autofocus measures a
+        stable patch and the operator sees the tracked target), or ``None`` to
+        restore the default per-frame winning-tile auto-pick.
+        """
+        if roi is None:
+            self._focus_roi = None
+            return
+        x0, y0, x1, y1 = (int(v) for v in roi)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            self._focus_roi = None
+            return
+        self._focus_roi = (x0, y0, x1, y1)
 
     def set_armed(self, armed: bool) -> None:
         """Tell the run loop whether the IA is currently started/streaming.
@@ -884,20 +947,37 @@ class AcquisitionThread(QThread):
                             and self._pool is not None
                         ):
                             full_view = self._pool.slot_view(slot_for_fine)
-                            rgb, sharp_res, crop_u16, overview_rgb = (
-                                m4_fine_tile_rgb_from_frame(
+                            roi = self._focus_roi
+                            if roi is not None:
+                                rgb, score, crop_u16 = m4_roi_tile_rgb_from_frame(
                                     full_view,
+                                    roi,
                                     demosaic=self._fine_demosaic,
                                 )
-                            )
-                            meta = {
-                                "best_index": sharp_res.best_index,
-                                "best_score": sharp_res.best_score,
-                                "uint16_crop": crop_u16,
-                                "ts_iso": acquire_ts_iso,
-                                "overview_rgb": overview_rgb,
-                                "fine_demosaic": self._fine_demosaic,
-                            }
+                                meta = {
+                                    "best_index": -1,
+                                    "best_score": score,
+                                    "uint16_crop": crop_u16,
+                                    "ts_iso": acquire_ts_iso,
+                                    "overview_rgb": None,
+                                    "fine_demosaic": self._fine_demosaic,
+                                    "roi": roi,
+                                }
+                            else:
+                                rgb, sharp_res, crop_u16, overview_rgb = (
+                                    m4_fine_tile_rgb_from_frame(
+                                        full_view,
+                                        demosaic=self._fine_demosaic,
+                                    )
+                                )
+                                meta = {
+                                    "best_index": sharp_res.best_index,
+                                    "best_score": sharp_res.best_score,
+                                    "uint16_crop": crop_u16,
+                                    "ts_iso": acquire_ts_iso,
+                                    "overview_rgb": overview_rgb,
+                                    "fine_demosaic": self._fine_demosaic,
+                                }
                             self.raw_focus_tile_rgb.emit(rgb, meta)
                         elif not self._fine_focus:
                             self.raw_focus_frame.emit(small_u16, acquire_ts_iso)
@@ -2401,6 +2481,13 @@ class CameraPipeline:
     def set_fine_demosaic(self, enabled: bool) -> None:
         """M4 Fine display: enable OpenCV debayer on the tile (vs raw Bayer gray)."""
         self.acq.set_fine_demosaic_enabled(bool(enabled))
+
+    def set_focus_roi(
+        self, roi: Optional[tuple[int, int, int, int]]
+    ) -> None:
+        """M4 autofocus: pin the Fine focus tap to a fixed full-res ROI, or
+        ``None`` to restore the default winning-tile auto-pick."""
+        self.acq.set_focus_roi(roi)
 
     # -- focus capture submit -----------------------------------------------
 
