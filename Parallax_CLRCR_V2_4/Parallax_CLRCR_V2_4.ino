@@ -37,7 +37,10 @@ int accelerationLimit = 150000000; // pulses per sec^2
 int velocityLimitSlow = 1000; // pulses per sec
 int accelerationLimitSlow = 2000000; // pulses per sec^2
 
-int Positions = 13;  //Number of pictures in a sweep
+int Positions = 13;  //Number of pictures in a sweep (set to m5Positions while in mode 5)
+int basePositions = 13;  //Normal sweep positions (M0/M1/M2/M3)
+int m5Positions = 40;  //Mode 5 (ground test) positions per sweep, user-adjustable via $P<n>*
+int m5Index = 0;  //Current position index in the non-blocking mode-5 stepped sweep
 
 int inputRes = 6400;  //pulses per rev, as defined in the MSP
 
@@ -97,7 +100,7 @@ float l = 45.0;  //Motor arm length
 float L = 80.0;  //Mirror mount arm length
 float H = 157.4;  //Distance between motor shaft and mirror mount shaft
 float C = 165.3;  //Conrod length.
-float verticalAngles[20];
+float verticalAngles[64];  //Sized for the largest supported sweep (mode-5 ground test, up to 64 positions)
 
 // Convergence parameters for numerical calculation
 const float TOLERANCE = 0.0001;
@@ -239,6 +242,9 @@ void loop() {
     case 4:
       TakePicsInPlace();
       break;
+    case 5:
+      SweepStepM5();
+      break;
   }
 
     CheckMessages();
@@ -278,6 +284,22 @@ void CheckMessages() {
       } 
       if (incomingSerialMessage.equals("$M4*")){  //Mode 4, which is a focus adjustmet mode, allowing control of H-bridge driven focus motors. Locks servos in mid position and fires
         setMode(4);
+      }
+      if (incomingSerialMessage.equals("$M5*")){  //Mode 5, ground test: continuous stepped sweep with host autofocus running in the background (focus +/- serviced between frames)
+        setMode(5);
+      }
+      if (incomingSerialMessage.startsWith("$P")){  //Set mode-5 (ground test) positions per sweep, e.g. "$P40*"
+        int requested = incomingSerialMessage.substring(2).toInt();  //toInt stops at the trailing '*'
+        if (requested < 2) { requested = 2; }
+        if (requested > 64) { requested = 64; }  //clamp to verticalAngles[] size
+        m5Positions = requested;
+        Serial.print(" M5 positions:");
+        Serial.println(m5Positions);
+        if (mode==5) {  //apply live: recompute angles and restart the stepped sweep
+          Positions = m5Positions;
+          calculateMotorAngles();
+          m5Index = 0;
+        }
       }
       if (incomingSerialMessage.equals("$T*")){  //Mode 4, which is a focus adjustmet mode, allowing control of H-bridge driven focus motors. Locks servos in mid position and fires
         testClick();
@@ -320,7 +342,7 @@ void CheckMessages() {
     }
     if (incomingSerialMessage.startsWith("+")){  //Sends pulse command to currently selected focus motor in positive direction
       Serial.println(mode);
-      if (mode==4) {
+      if (mode==4 || mode==5) {
         focusIncCount = incomingSerialMessage.length();
         focusMotorPin.State(focusStrength);
         for (int i=0; i<focusIncCount; i++){
@@ -330,7 +352,7 @@ void CheckMessages() {
       }
     } 
     if (incomingSerialMessage.startsWith("-")){  //Sends pulse command to currently selected focus motor in negative direction
-      if (mode==4) {
+      if (mode==4 || mode==5) {
         focusIncCount = incomingSerialMessage.length();
         focusMotorPin.State(-focusStrength);
         for (int i=0; i<focusIncCount; i++){
@@ -339,8 +361,8 @@ void CheckMessages() {
         focusMotorPin.State(0);
       }
     }
-    if (incomingSerialMessage.startsWith(">")){  //Lengthens time between pics in mode 4
-      if (mode==4) {
+    if (incomingSerialMessage.startsWith(">")){  //Lengthens time between pics in mode 4/5
+      if (mode==4 || mode==5) {
         picsInPlaceDelay = picsInPlaceDelay +50;
         if (picsInPlaceDelay > 1500) {
           picsInPlaceDelay = 1500;
@@ -350,7 +372,7 @@ void CheckMessages() {
       }      
     }
     if (incomingSerialMessage.startsWith("<")){  //Shortens time between pics, down to the camera's max FPS (minTimeBetweenFrames)
-      if (mode==4) {
+      if (mode==4 || mode==5) {
         picsInPlaceDelay = picsInPlaceDelay -50;
         if (picsInPlaceDelay<minTimeBetweenFrames) {
           picsInPlaceDelay = minTimeBetweenFrames;
@@ -533,6 +555,39 @@ void Sweep(){
   Serial0.println("$Ready*");
 }
 
+void SweepStepM5(){
+  //Ground-test mode 5: a NON-BLOCKING stepped sweep. Each call moves the mirrors
+  //to exactly one position, settles, and fires one frame, then RETURNS so the
+  //main loop can run CheckMessages() and apply any host autofocus +/- pulses
+  //before the next move. This is what lets the focus algorithm run "in the
+  //background" while the mirrors traverse the FOV to simulate a moving scene.
+  //Positions == m5Positions here; m5Index walks 0..Positions-1 and wraps
+  //(continuous). In-position is verified by MoveAbsolutePosition (StepsComplete +
+  //HLFB), then mechDelayCurr gives the mirror time to settle.
+  if (m5Index == 0) {
+    sweepStartTime = millis();
+  }
+  int position0 = int(verticalAngles[m5Index]*6400/360);
+  int position1 = int(sweepAngleOblique*inputRes*m5Index/(360*(Positions-1))+startAngle1);
+  MoveAbsolutePosition(position0, position1);
+  delay(mechDelayCurr);
+  while ((millis()-lastFrameTime)<minTimeBetweenFrames){
+
+  }
+  digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
+  digitalWrite(eventPin, false);
+  lastFrameTime = millis();
+  delay (picDelayCurr);
+  digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
+  digitalWrite(eventPin, true);
+
+  m5Index++;
+  if (m5Index >= Positions) {
+    m5Index = 0;  //continuous sweep
+    calculateSweepTime();
+  }
+}
+
 void TakePicsInPlace(){
     //Taking pictures continuosly in mid position.
     //picsInPlaceDelay is the trigger-to-trigger period (ms), gated the same way
@@ -594,27 +649,43 @@ void setupMotorsSlow() {
     case 0: 
      mode = 0;
      Serial.println("Mode 0: Collection On, Nav point based");          
+     Positions = basePositions;
+     calculateMotorAngles();
      setupMotorsFast();
     break;
     case 1:
      mode = 1;
      Serial.println("Mode 1: Collection ON, continous");          
+     Positions = basePositions;
+     calculateMotorAngles();
      setupMotorsFast();
     break;
     case 2:
       mode = 2;
       Serial.println("Mode 2: Slow and Steady");
+      Positions = basePositions;
+      calculateMotorAngles();
       setupMotorsSlow();
     break;
     case 3:
       mode = 3;
       Serial.println("Mode 3: Collection ON Line by line");
+      Positions = basePositions;
+      calculateMotorAngles();
       setupMotorsFast();
     break;
     case 4:
      mode = 4;
      Serial.println("Mode 4: Focus adjustment");          
      setupMotorsFast();
+    break;
+    case 5:
+     mode = 5;
+     Serial.println("Mode 5: Ground test (stepped sweep + background autofocus)");
+     Positions = m5Positions;
+     calculateMotorAngles();
+     setupMotorsFast();
+     m5Index = 0;
     break;
   }
  }

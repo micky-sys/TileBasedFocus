@@ -651,8 +651,10 @@ try:  # pragma: no cover - exercised only inside the GUI app
             if self._engine.running:
                 self.status.emit("autofocus: already running")
                 return False
-            if self._modes is not None and not self._modes.is_focus_mode():
-                self.status.emit("autofocus: only available in M4 (Focus) mode")
+            if self._modes is not None and not self._modes.is_af_mode():
+                self.status.emit(
+                    "autofocus: only available in M4 (Focus) or M5 (Ground Test) mode"
+                )
                 return False
             if not getattr(self._serial, "connected", False):
                 self.status.emit("autofocus: PCB not connected")

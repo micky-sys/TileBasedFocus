@@ -531,6 +531,18 @@ class FocusPanel(QWidget):
         )
         row.addWidget(self._af_assisted_chk)
 
+        row.addSpacing(12)
+        row.addWidget(QLabel("M5 positions:"))
+        self._m5_positions_spin = QSpinBox()
+        self._m5_positions_spin.setRange(2, 64)
+        self._m5_positions_spin.setValue(40)
+        self._m5_positions_spin.setToolTip(
+            "Ground Test (M5): number of stepped-sweep positions per cycle. More "
+            "positions = the target crosses the FOV more gradually. Sends $P<n>*."
+        )
+        self._m5_positions_spin.editingFinished.connect(self._on_m5_positions_changed)
+        row.addWidget(self._m5_positions_spin)
+
         row.addStretch(1)
 
         self._af_status_label = QLabel("autofocus: idle")
@@ -549,6 +561,14 @@ class FocusPanel(QWidget):
 
     def _on_af_stop_clicked(self) -> None:
         self.autofocus_stop_requested.emit()
+
+    def _on_m5_positions_changed(self) -> None:
+        n = self._m5_positions_spin.value()
+        try:
+            self._serial.set_m5_positions(n)
+            self.diag_log.emit(f"M5 positions -> {n} ($P{n}*)")
+        except Exception as exc:
+            self.diag_log.emit(f"set M5 positions failed: {exc}")
 
     def set_autofocus_running(self, running: bool) -> None:
         """Lock start buttons / unlock Stop while an AF run is in progress."""

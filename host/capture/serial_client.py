@@ -71,7 +71,7 @@ class SerialClient(QObject):
             raise ValueError(f"mode {mode_num!r} out of range")
         self._ctrl.set_mode(mode_num)
         if update_local:
-            mapping = {0: Mode.M0, 1: Mode.M1, 3: Mode.M3, 4: Mode.M4}
+            mapping = {0: Mode.M0, 1: Mode.M1, 3: Mode.M3, 4: Mode.M4, 5: Mode.M5}
             self._modes.set_mode(mapping.get(mode_num, Mode.UNKNOWN))
 
     def select_camera(self, cam: int) -> None:
@@ -85,6 +85,10 @@ class SerialClient(QObject):
 
     def adjust_trigger_period(self, direction: str) -> None:
         self._ctrl.adjust_trigger_period(direction)
+
+    def set_m5_positions(self, positions: int) -> None:
+        """M5 ground test: set stepped-sweep positions per cycle ($P<n>*)."""
+        self._ctrl.set_m5_positions(positions)
 
     def start_line(self) -> None:
         """Send ``?`` (M3 manual-line START) to the PCB."""

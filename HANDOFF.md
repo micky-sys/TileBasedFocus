@@ -581,3 +581,60 @@ Encoders (planned) will allow closed-loop positioning, exact and repeatable
 return-to-best, and faster convergence. The engine is structured so a future
 `FocusAxis` abstraction (reporting real position instead of cumulative pulse counts)
 can replace the open-loop pulse bookkeeping without touching the search logic.
+
+## 15. Ground-test mode — M5 (2026-07-02)
+
+`$M5*` is an **on-hardware** ground-test mode: it moves the mirrors like the M0/M1
+sweep but drives autofocus **in the background** so the real AF loop can be exercised
+against a *physically* moving scene on the bench (stationary cameras, moving mirrors —
+see §14.7 for why the rig is a valid exerciser). It complements the hardware-free
+simulator loop in `tools/test_autofocus.py`; here the actual focus motor, relay mux,
+camera, and host AF engine all run together. **Preview-only — M5 writes no frames to
+disk** (a "save during M5" toggle can be added later).
+
+### 15.1 Why a new mode (non-blocking stepped sweep)
+
+The normal `Sweep()` is a single blocking `for` loop over all `Positions`, so serial
+(the AF `+`/`-` pulses) is only serviced *between whole sweeps* — useless for a
+background focus loop. M5 instead advances **one mirror position + one frame per
+`loop()` iteration** (`SweepStepM5()`), then returns so `CheckMessages()` can apply any
+pending AF pulses **before the next move**. The mirror sweep (servos) and the focus
+motor (H-bridge) are independent actuators, so there is no contention.
+
+### 15.2 Firmware (`Parallax_CLRCR_V2_4.ino`)
+
+- Globals: `basePositions = 13` (normal sweeps), `m5Positions = 40` (ground-test,
+  user-adjustable), `m5Index` (current step). `verticalAngles[]` enlarged `20 → 64`.
+- `SweepStepM5()`: computes `position0/position1` for `m5Index` exactly like `Sweep()`,
+  `MoveAbsolutePosition(...)` (blocks on `StepsComplete()` + `HLFB_ASSERTED` so the
+  mirror is *confirmed in place*), `delay(mechDelayCurr)` to settle, then the same
+  `minTimeBetweenFrames` cadence gate + trigger block. `m5Index++` and wraps to 0
+  (continuous), recomputing `calculateSweepTime()` each wrap.
+- `loop()` `case 5: SweepStepM5();`.
+- `setMode(5)`: `Positions = m5Positions; calculateMotorAngles(); setupMotorsFast(); m5Index = 0;`.
+  The sweep cases 0/1/2/3 now set `Positions = basePositions; calculateMotorAngles();`
+  so **leaving M5 restores the 13-position sweep**.
+- `+`/`-`/`>`/`<` are gated on `mode==4 || mode==5`. New `$P<n>*` sets `m5Positions`
+  (clamped `[2,64]`); if already in M5 it recomputes angles and restarts the step index.
+  `>`/`<` in M5 also tune `mechDelayCurr`/cadence for per-frame settle.
+
+### 15.3 Host
+
+- `mode_controller.Mode.M5` ("Ground Test" button); `is_af_mode()` returns
+  `mode in (M4, M5)` and now gates AF start, the raw-focus frame feed, focus-tap
+  enable, the focus `_view_stack` page, coarse-forcing, and camera-select. M5 is **not**
+  in `_RECORDING_MODES`. The AF engine is unchanged — the M5 sweep is just the
+  moving-scene case its tracker/leading-edge logic already handles.
+- `serial_client.send_mode`/`app._on_mode_clicked` map 5↔`Mode.M5`; a `Mode 5:` USB
+  banner also syncs the host UI. `SerialClient.set_m5_positions(n)` →
+  `serial_comm` → `$P<n>*`.
+- `FocusPanel` adds an **M5 positions** spinbox (default 40, range 2–64) that sends
+  `$P<n>*` on edit; the existing Auto-focus buttons work in M5.
+
+### 15.4 Bench validation checklist
+
+1. `$M5*` steps through ~40 positions continuously (watch mirror motion + `Swp`/frame logs).
+2. AF `+`/`-` land **between** frames (watch `PicDelay`/focus logs while a run is active).
+3. `$P<n>*` changes the number of positions live; leaving M5 restores 13-position sweeps.
+4. Host offscreen import-check of `capture.app`; `tools/test_autofocus.py` still passes
+   (engine unchanged).

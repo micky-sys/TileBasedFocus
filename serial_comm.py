@@ -123,6 +123,17 @@ class FocusController:
             raise ValueError("direction must be '>' or '<'")
         self._send(direction + "\n")
 
+    def set_m5_positions(self, positions: int) -> None:
+        """M5 (ground test): set the number of stepped-sweep positions per cycle.
+
+        Sends ``$P<n>*``; the PCB clamps to [2, 64] and (if already in M5)
+        recomputes the mirror angles and restarts the stepped sweep.
+        """
+        n = int(positions)
+        if n < 2 or n > 64:
+            raise ValueError("positions must be in [2, 64]")
+        self._send(f"$P{n}*\n")
+
     def start_line(self) -> None:
         """M3-only: send ``?\\n`` to mark the START of a manual line.
 

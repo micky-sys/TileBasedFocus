@@ -29,6 +29,7 @@ class Mode(Enum):
     M1 = "M1"
     M3 = "M3"
     M4 = "M4"
+    M5 = "M5"
 
 
 # Operator-facing mode button labels (PCB commands remain $M0* / $M1* / …).
@@ -37,6 +38,7 @@ MODE_BUTTON_LABELS: dict[Mode, str] = {
     Mode.M1: "Continuous",
     Mode.M3: "CollectionON",
     Mode.M4: "Focus",
+    Mode.M5: "Ground Test",
 }
 
 # Fixed button widths so longer labels do not reflow the mode row.
@@ -45,6 +47,7 @@ MODE_BUTTON_WIDTH_FULL: dict[Mode, int] = {
     Mode.M1: 76,
     Mode.M3: 92,
     Mode.M4: 52,
+    Mode.M5: 92,
 }
 
 MODE_BUTTON_WIDTH_COMPACT: dict[Mode, int] = {
@@ -52,6 +55,7 @@ MODE_BUTTON_WIDTH_COMPACT: dict[Mode, int] = {
     Mode.M1: 62,
     Mode.M3: 78,
     Mode.M4: 42,
+    Mode.M5: 78,
 }
 
 
@@ -122,6 +126,16 @@ class ModeController:
     def is_focus_mode(self) -> bool:
         with self._lock:
             return self._mode == Mode.M4
+
+    def is_af_mode(self) -> bool:
+        """True in any mode where autofocus + the focus preview run.
+
+        M4 (focus, mirrors homed) and M5 (ground test, mirrors sweeping) both
+        preview frames and drive the H-bridge focus motor via ``+``/``-``; the
+        autofocus engine treats the M5 sweep as just another moving scene.
+        """
+        with self._lock:
+            return self._mode in (Mode.M4, Mode.M5)
 
     def focus_submode(self) -> FocusSubMode:
         with self._lock:

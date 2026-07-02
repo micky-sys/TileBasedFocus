@@ -1802,6 +1802,11 @@ class MainWindow(QMainWindow):
                 Mode.M4,
                 "Focus — tile sharpness analysis; no sweep writes.",
             ),
+            (
+                Mode.M5,
+                "Ground Test — stepped mirror sweep with autofocus running "
+                "in the background; preview only (no writes).",
+            ),
         ):
             label = MODE_BUTTON_LABELS[mode]
             btn = QPushButton(label)
@@ -2342,7 +2347,7 @@ class MainWindow(QMainWindow):
 
     def _on_mode_clicked(self, mode: Mode) -> None:
         # Map Mode.Mn -> int for the protocol command.
-        n = {Mode.M0: 0, Mode.M1: 1, Mode.M3: 3, Mode.M4: 4}[mode]
+        n = {Mode.M0: 0, Mode.M1: 1, Mode.M3: 3, Mode.M4: 4, Mode.M5: 5}[mode]
 
         if self._pending_mode_apply is not None or self._pending_mode_timer is not None:
             self._log("cancelled pending deferred mode apply (new mode choice)")
@@ -2468,14 +2473,21 @@ class MainWindow(QMainWindow):
         # those fire during PCB boot and would fight UNKNOWN / deferred applies.)
         if not self._mode_ui_ready:
             return
-        if not line.startswith("Mode 4:"):
+        banner_mode = None
+        if line.startswith("Mode 4:"):
+            banner_mode = Mode.M4
+        elif line.startswith("Mode 5:"):
+            banner_mode = Mode.M5
+        if banner_mode is None:
             return
-        if self._modes.mode == Mode.M4:
+        if self._modes.mode == banner_mode:
             return
-        self._log("PCB entered focus mode (USB banner); syncing host M4 UI")
+        self._log(
+            f"PCB entered {banner_mode.name} (USB banner); syncing host UI"
+        )
         self._clear_deferred_mode_schedule()
-        self._apply_mode_state_after_uart(Mode.M4)
-        self._sync_mode_buttons_ui(Mode.M4)
+        self._apply_mode_state_after_uart(banner_mode)
+        self._sync_mode_buttons_ui(banner_mode)
 
     @Slot(bool)
     def _on_serial_connection_changed(self, connected: bool) -> None:
@@ -2912,7 +2924,7 @@ class MainWindow(QMainWindow):
         # running and processing frames; they just don't emit preview
         # QImages or raw_focus_frame signals so the GUI thread stays
         # quiet.
-        in_focus = self._modes.is_focus_mode()
+        in_focus = self._modes.is_af_mode()
         for p in self._pipelines:
             is_active = (p.camera_number == camera_number)
             p.set_preview(is_active)
@@ -3081,8 +3093,8 @@ class MainWindow(QMainWindow):
     def _on_autofocus_requested(self, assisted: bool) -> None:
         if self._autofocus is None:
             return
-        if not self._modes.is_focus_mode():
-            self._log("Autofocus: switch to M4 (Focus) mode first.")
+        if not self._modes.is_af_mode():
+            self._log("Autofocus: switch to M4 (Focus) or M5 (Ground Test) mode first.")
             return
         if self._active_pipeline() is None:
             self._log("Autofocus: select a camera to preview first.")
@@ -3094,8 +3106,8 @@ class MainWindow(QMainWindow):
     def _on_autofocus_all_requested(self, assisted: bool) -> None:
         if self._autofocus is None:
             return
-        if not self._modes.is_focus_mode():
-            self._log("Autofocus: switch to M4 (Focus) mode first.")
+        if not self._modes.is_af_mode():
+            self._log("Autofocus: switch to M4 (Focus) or M5 (Ground Test) mode first.")
             return
         cams = sorted(p.camera_number for p in self._pipelines)
         if not cams:
@@ -3213,11 +3225,11 @@ class MainWindow(QMainWindow):
         # Diagnostic: surface why frames may or may not be reaching the
         # focus panel from M4. Cheap (1-line bumps + occasional log);
         # gated on focus mode so it doesn't spam in M0/M1.
-        if not self._modes.is_focus_mode():
+        if not self._modes.is_af_mode():
             self._raw_focus_drops_not_in_m4 += 1
             if self._raw_focus_drops_not_in_m4 % 32 == 1:
                 self._log(
-                    "raw_focus_frame received while not in M4 "
+                    "raw_focus_frame received while not in M4/M5 "
                     f"(count={self._raw_focus_drops_not_in_m4}); ignored"
                 )
             return
@@ -3586,12 +3598,13 @@ class MainWindow(QMainWindow):
         self._modes.set_mode(mode)
         self._mode_status_label.setText(f"Current: {mode_display_label(mode)}")
 
-        # Leaving M4 aborts any in-progress autofocus run.
+        # Any mode transition (the PCB re-homes on setMode) aborts an
+        # in-progress autofocus run.
         af = getattr(self, "_autofocus", None)
-        if mode != Mode.M4 and af is not None and af.is_running():
-            af.stop("left M4 mode")
+        if af is not None and af.is_running():
+            af.stop("mode changed")
 
-        if mode == Mode.M4:
+        if mode in (Mode.M4, Mode.M5):
             self._modes.set_focus_submode(FocusSubMode.COARSE)
             self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
 
@@ -3623,7 +3636,7 @@ class MainWindow(QMainWindow):
             # common "M1 -> M0 -> quit" workflow that never hits this branch.
             self._log_gps_correlator_stats()
 
-        in_focus = (mode == Mode.M4)
+        in_focus = mode in (Mode.M4, Mode.M5)
         if in_focus and self._active_pipeline() is None and self._pipelines:
             target = self._pipelines[0].camera_number
             for row in self._rows:
@@ -3639,7 +3652,7 @@ class MainWindow(QMainWindow):
             preview_on = bool(row and row.preview_radio.isChecked())
             p.set_focus_tap(in_focus and preview_on)
 
-        self._view_stack.setCurrentIndex(1 if mode == Mode.M4 else 0)
+        self._view_stack.setCurrentIndex(1 if in_focus else 0)
         self._apply_m4_layout(in_focus)
         self._sync_preview_sensor_fields()
         self._update_focus_panel_target()
@@ -3648,10 +3661,10 @@ class MainWindow(QMainWindow):
             active.camera_number if active is not None else None
         )
 
-        if mode == Mode.M4:
+        if in_focus:
             self._sync_fine_focus_to_pipelines()
 
-        if mode == Mode.M4 and self._serial.connected:
+        if in_focus and self._serial.connected:
             if active is not None:
                 try:
                     pcb_slot = self._pcb_focus_slot_for_pipeline(active)
