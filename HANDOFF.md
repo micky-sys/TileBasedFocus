@@ -482,11 +482,15 @@ scorer (`sharpness.find_best_tile` / `score_tile_subsampled`) and `tile_geometry
   close, and AF fine-tunes from there (default). A **full-auto** bracket search is
   also available.
 - The focus loop need **not be human-usable**, so the M4 cadence is pushed toward the
-  camera's **~210 ms (~4.76 Hz)** trigger limit (faster convergence + smaller
-  per-step scene shift). NOTE: firmware floors `picsInPlaceDelay` at **250 ms**;
-  reaching ~210 ms requires lowering that floor in `Parallax_CLRCR_V2_4`. Until then
-  the host clamps to 250 ms. Host `FOCUS_TAP_MIN_INTERVAL_S` was lowered 0.25→0.21 so
-  the focus tap isn't the bottleneck.
+  camera's **~209 ms (~4.8 FPS)** trigger limit (faster convergence + smaller per-step
+  scene shift). The old **250 ms** figure was **not** a hardware floor — it was an
+  arbitrary `if (picsInPlaceDelay<250)` clamp in `Parallax_CLRCR_V2_4`. The firmware now
+  (a) treats `picsInPlaceDelay` as the **trigger-to-trigger period**, gated on
+  `lastFrameTime` exactly like the sweep path (so the trigger pulse `picDelayCurr` is
+  absorbed *within* the period instead of added on top of a trailing delay), and (b)
+  floors the `<` command at **`minTimeBetweenFrames` (209 ms)** — the camera's real
+  ceiling — so sending `<` drives M4 straight to max FPS. Host `FOCUS_TAP_MIN_INTERVAL_S`
+  was lowered 0.25→0.21 (~4.76 Hz) to match, so the focus tap isn't the bottleneck.
 
 ### 14.2 Approach
 

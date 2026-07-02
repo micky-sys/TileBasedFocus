@@ -62,11 +62,14 @@ If not in mode 4, `+` / `-` lines are ignored for motion (no pulse).
 
 ## Time between triggered frames in mode 4
 
-In mode 4, `TakePicsInPlace()` uses global **`picsInPlaceDelay`** (milliseconds) between cycles.
+In mode 4, `TakePicsInPlace()` uses global **`picsInPlaceDelay`** (milliseconds) as the
+**trigger-to-trigger period**. It is gated the same way as the sweep (a busy-wait on
+`lastFrameTime`), so the trigger pulse (`picDelayCurr`) is absorbed *within* the period
+rather than added on top.
 
 - **Initial value** in sketch: **250** ms (`picsInPlaceDelay = 250` at startup). Entering mode 4 does **not** reset this; if you previously used mode 6/7, it may still be 1000 ms until you adjust it.
 - **`>` + newline** (in mode 4): increase by **50** ms, capped at **1500** ms (firmware), not 1000 ms.
-- **`<` + newline** (in mode 4): decrease by **50** ms, floored at **250** ms.
+- **`<` + newline** (in mode 4): decrease by **50** ms, floored at **`minTimeBetweenFrames`** (**209** ms ≈ the camera's ~4.8 FPS ceiling). This floor was previously an arbitrary **250** ms clamp; it is now tied to the real sensor limit so M4 autofocus can run at max FPS.
 
 Firmware prints `PicDelay:<value>` on `Serial` after `>`/`<`.
 
@@ -103,7 +106,7 @@ $S2*\n          → medium strength
 +\n             → one + nudge (flight: use single + per line)
 -\n             → one − nudge (flight: use single − per line)
 >\n             → +50 ms inter-frame delay (max 1500 in FW)
-<\n             → −50 ms inter-frame delay (min 250)
+<\n             → −50 ms inter-frame delay (min 209 = camera max FPS)
 ```
 
 (Bench only: multiple `+` or `-` on one line lengthens the pulse; not used in flight.)

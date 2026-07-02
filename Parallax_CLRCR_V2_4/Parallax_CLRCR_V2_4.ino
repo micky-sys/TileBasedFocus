@@ -349,11 +349,11 @@ void CheckMessages() {
         Serial.println(picsInPlaceDelay);
       }      
     }
-    if (incomingSerialMessage.startsWith("<")){  //Shortens time between pics, to a minimum of 250 millisec
+    if (incomingSerialMessage.startsWith("<")){  //Shortens time between pics, down to the camera's max FPS (minTimeBetweenFrames)
       if (mode==4) {
         picsInPlaceDelay = picsInPlaceDelay -50;
-        if (picsInPlaceDelay<250) {
-          picsInPlaceDelay = 250;
+        if (picsInPlaceDelay<minTimeBetweenFrames) {
+          picsInPlaceDelay = minTimeBetweenFrames;
         }
         Serial.print(" PicDelay:");
         Serial.println(picsInPlaceDelay);
@@ -534,12 +534,19 @@ void Sweep(){
 }
 
 void TakePicsInPlace(){
-    //Taking pictures continuosly in mid position
+    //Taking pictures continuosly in mid position.
+    //picsInPlaceDelay is the trigger-to-trigger period (ms), gated the same way
+    //as the sweep so M4 can run right up to the camera's max FPS
+    //(minTimeBetweenFrames) for autofocus, instead of adding a fixed trailing
+    //delay on top of the trigger pulse.
+    while ((millis()-lastFrameTime)<picsInPlaceDelay){
+
+    }
     digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
+    lastFrameTime = millis();
     delay (picDelayCurr);
     digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
     MoveAbsolutePosition(0, 0);
-    delay(picsInPlaceDelay);
 }
 
 void testClick(){
