@@ -638,3 +638,51 @@ motor (H-bridge) are independent actuators, so there is no contention.
 3. `$P<n>*` changes the number of positions live; leaving M5 restores 13-position sweeps.
 4. Host offscreen import-check of `capture.app`; `tools/test_autofocus.py` still passes
    (engine unchanged).
+
+## 16. Session log — M5 ground-test mode (2026-07-02)
+
+This session implemented the **M5 ground-test mode** end-to-end (firmware + host +
+docs). Full technical detail is in §15; this is the chronological summary and status.
+
+### 16.1 What was done
+
+- **Firmware (`Parallax_CLRCR_V2_4.ino`)** — added the non-blocking stepped sweep
+  `SweepStepM5()` (one mirror position + one frame per `loop()` iteration, continuous
+  wrap), enlarged `verticalAngles[] 20→64`, added `basePositions`/`m5Positions`/
+  `m5Index`, `loop()` `case 5`, `setMode(5)` (and made sweep modes 0/1/2/3 restore
+  `basePositions`), the `$M5*` handler, `$P<n>*` positions parser (clamp `[2,64]`), and
+  gated `+`/`-`/`>`/`<` on `mode==4 || mode==5`.
+- **Host** — `Mode.M5` ("Ground Test") in `mode_controller` with `is_af_mode()`
+  (= M4|M5) driving every AF gate; `serial_comm`/`serial_client.set_m5_positions()` →
+  `$P<n>*`; `app` mode button + mapping + `Mode 5:` USB-banner sync + AF gating via
+  `is_af_mode()`; `FocusPanel` **M5 positions** spinbox (default 40, range 2–64);
+  `autofocus._guard()` allows M4 or M5 (engine unchanged). M5 is **preview-only**
+  (not in `_RECORDING_MODES`).
+- **Docs** — `docs/clearcore_serial_protocol.md` (`$M5*`, `$P<n>*`, `+`/`-`/`>`/`<`
+  now also mode 5) and this HANDOFF §15/§16.
+
+### 16.2 Validation performed (software only)
+
+- All edited host modules byte-compile; `capture.app` imports cleanly (offscreen Qt).
+- `tools/test_autofocus.py` — **9/9 pass** (AF engine untouched).
+- Firmware was **reviewed by eye only** — no Arduino toolchain on this machine, so it
+  has **not been compiled**.
+
+### 16.3 Current status / next actions
+
+- Code is **complete and committed** (first M5 commit `0a56497`; see git log for the
+  session-summary commit that also lands this §16).
+- **Blocking before any window/bench test:** open the sketch in the Arduino IDE /
+  arduino-cli, **Verify** (to catch anything the eyeball review missed) and **Upload**
+  to the ClearCore.
+- Then run the §15.4 bench checklist.
+- **Open decision:** exposure/gain are auto-locked in M4 but currently left *enabled*
+  in M5. AF assumes fixed exposure, so either avoid touching them during a run or ask
+  to have them locked in M5 too (small change).
+
+### 16.4 Git note (unchanged from §13)
+
+Commit via `git.exe commit` (not `git commit`) from `cmd`: the harness appends a
+`Co-authored-by: … <…>` trailer whose `<` breaks PowerShell parsing. `git.exe` avoids
+the injected trailer. Stage only intended files — the working tree has pre-existing
+untracked junk (`Training pictures/`, `RefDesign/`, etc.) that must not be committed.
