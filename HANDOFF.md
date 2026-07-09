@@ -1,6 +1,11 @@
 # Iron 661 Capture — Handoff Notes
 
-_Last updated: 2026-06-30 — project is now under Git (§13); Iron661Capture,
+_Last updated: 2026-07-09 — first **autofocus ground-test session** (§18): ran the
+hardware-free simulator path (§14.7 layer 1); new `tools/af_ground_test.py` metrics
+sweep reports **54/54 runs converged** — the software baseline for the real rig.
+ClearCore reflashed 2026-07-09 (unblocks on-hardware M5); exposure/gain left unlocked
+in M5 by operator choice (§16.3 decision closed). Previous: 2026-06-30 — project is
+now under Git (§13); Iron661Capture,
 Parallax Export Studio, shared source, build specs, docs, ClearCore sketch, and the
 KAYA runtime dependency copy are intended to be committed so the apps can be run
 from the repository going forward. Previous: 2026-06-29 — GPS correlator
@@ -686,3 +691,152 @@ Commit via `git.exe commit` (not `git commit`) from `cmd`: the harness appends a
 `Co-authored-by: … <…>` trailer whose `<` breaks PowerShell parsing. `git.exe` avoids
 the injected trailer. Stage only intended files — the working tree has pre-existing
 untracked junk (`Training pictures/`, `RefDesign/`, etc.) that must not be committed.
+
+## 17. Orthophoto screen bench rig — OrthoSim (2026-07-05)
+
+A second, higher-flexibility ground-test rig: a large screen (driven by a second
+PC running the new **OrthoSim** app) shows a scrolling high-resolution orthophoto
+in front of the stationary Iron661 camera to simulate flight. It complements the
+M5 mirror sweep (§15) and the hardware-free simulator (§14.7) — here the real
+camera, focus motor, relay mux and host AF loop all run against realistic,
+*calibrated* moving imagery.
+
+### 17.1 Components
+
+- **Display app** (`tools/orthosim_gui.py` + `tools/orthosim_core.py`): full-screen
+  PySide6 app (GPU-accelerated `QOpenGLWidget` viewport) that tiles and scrolls the
+  ortho, renders four ArUco corner fiducials, and renders a high-contrast optical
+  ground-truth **bar**. Writes a `*.groundtruth.csv` cross-check log.
+- **Shared codec** (`orthosim_codec.py`, repo root): the optical bar wire format —
+  112 cells = 16 sync + 88 payload + 8 CRC, encoding absolute `distance_mm`,
+  `tick`, `velocity_mmps`, and flags (seam/paused/calibration). CRC-8 rejects
+  smeared reads. Imported by both the display app and the capture decoder so they
+  cannot drift.
+- **Capture decoder** (`host/capture/orthosim_decode.py`): detects the fiducials,
+  homography-rectifies the imaged screen to display coordinates, samples the bar,
+  decodes it, and (via `SpeedDistanceTracker`) derives **measured** speed/distance
+  to compare against the simulated (CSV) values. `rectify_screen()` also yields a
+  bezel-free screen crop. `cv2.aruco` is imported guarded (headless-safe).
+- **AF masking** (`tile_geometry.py` + `host/capture/autofocus.py`): new
+  `TileGrid(region="interior", interior_inset=…, exclude_edge=…, edge_band=…)`
+  keeps focus tiles off the screen bezel/office (challenge 1) and off the optical
+  strip band (challenge 2). Enabled per-run via `AutoFocusConfig.restrict_interior`
+  (default **off**, so normal M4/M5 flight behaviour is unchanged).
+
+### 17.2 Calibration model (cm/px)
+
+With `ortho_gsd_cm` (cm per ortho pixel, KNOWN), `zoom` Z (screen-px per ortho-px)
+and `M` (camera-px per screen-px, from the fiducials):
+
+- screen GSD = `ortho_gsd_cm / Z` (always displayable),
+- simulated camera GSD = `ortho_gsd_cm / (Z · M)` (= "flight height"),
+- scroll speed (screen-px/s) = `ground_speed_mps · 100 / ortho_gsd_cm · Z`,
+- distance integrates `ground_speed_mps` over wall-clock time.
+
+`zoom` maps to simulated height, the Up/Down keys map to simulated ground speed.
+The **C** calibration overlay draws a checkerboard + scale bar (labelled in mm if
+`--panel-pitch` is given) to measure/verify M.
+
+### 17.3 Running it
+
+Display PC (from source):
+
+```
+py -3 tools/orthosim_gui.py PATH\ortho.tif --gsd 5.0
+py -3 tools/orthosim_gui.py ortho.png --gsd 4 --panel-pitch 0.181 --M 1.0 --dir up
+py -3 tools/orthosim_gui.py ortho.png --gsd 5 --windowed     # bring-up
+```
+
+Controls: Up/Down speed, +/- (or PageUp/Down) zoom, Space pause, H HUD, C
+calibration, R reset distance, S save config, Esc/Q quit.
+
+Package (never build onto Google Drive — see §4):
+
+```
+$r = Join-Path $env:LOCALAPPDATA 'OrthoSimBuild'
+py -3 -m PyInstaller --noconfirm --clean --distpath "$r\dist" --workpath "$r\build" tools\OrthoSim.spec
+robocopy "$r\dist\OrthoSim" "C:\Parallax Apps\OrthoSim" /MIR
+```
+
+Decode a saved camera image offline:
+
+```
+py -3 -m capture.orthosim_decode SHOT.png --screen-w 3840 --screen-h 2160
+```
+
+### 17.4 The three challenges (how they're handled)
+
+1. **Static bezel/office** → ArUco homography crop (`rectify_screen`) + AF
+   `region="interior"` inset. Physically: fill the FOV with the screen, matte
+   surround, dark room.
+2. **Moving optical strip** → it lives in a known reserved band; AF excludes that
+   band via `exclude_edge`; the decoder samples it via the homography, so it is
+   used for measurement but kept out of imagery/AF.
+3. **Screen pixel structure / moire** → the display is the resolution bottleneck
+   (13400 camera px vs ~3840 panel px oversamples the grid). Mitigate: highest-PPI
+   panel, light diffuser/anti-glare film, max brightness (avoid PWM flicker vs the
+   ~250 µs exposure), exposure ≥ one refresh period if banding. The optical bar is
+   deliberately coarse/high-contrast so moire does not defeat the decoder. For a
+   true full-sensor sharpness test, a physically translating printed target is the
+   higher-fidelity complement.
+
+### 17.5 Status / validation (software only)
+
+- New tests `tools/test_orthosim.py` — **13/13 pass** (codec round-trip + CRC/sync
+  rejection, calibration math, config JSON, `TileGrid` interior exclusion, and the
+  full decode pipeline both fronto-parallel and perspective-warped).
+- `tools/test_autofocus.py` still **9/9** (interior masking is opt-in).
+- `capture.app` and `capture.orthosim_decode` import cleanly (offscreen Qt).
+- Not yet exercised against the real camera/screen; `--M` must be calibrated from
+  the fiducials on the actual bench geometry. All cameras are treated as nadir for
+  now (flat scroll); oblique perspective pre-warp is a later option.
+
+## 18. Autofocus ground testing — simulator baseline (2026-07-09)
+
+First autofocus ground-test session (§14). The operator chose the **hardware-free
+simulator path** (§14.7 layer 1) for this session — no rig, no camera; the focus
+loop closes entirely in software.
+
+- **Firmware:** operator confirmed the ClearCore was **(re)flashed 2026-07-09**
+  before the session. This closes the §16.3 "M5 sketch never compiled/uploaded"
+  blocker for future on-hardware M5 / OrthoSim tests.
+- **Open decision resolved (§16.3):** exposure/gain stay **unlocked in M5**. The
+  operator will not touch them during a run, so **no host change was made** — the
+  M5-lock idea is dropped, not deferred.
+
+### 18.1 New harness — `tools/af_ground_test.py`
+
+Complements `tools/test_autofocus.py` (a binary pass/fail regression gate) with a
+**metrics sweep** — the numbers a bench run would produce, so there is a software
+baseline to compare the real rig against:
+
+- Runs the AF engine across the three mirror-rig motion profiles
+  (`translate` / `oscillate` / `circle`-with-sky) × assisted/full-auto × a spread of
+  starting defocus offsets and scene seeds.
+- Reports **accuracy** (pulses off true best focus), **repeatability** (landing-
+  position std), **convergence** (frames + commanded pulses), and **sharpening**
+  (start→final blur sigma).
+- Reuses the existing `FocusSceneSimulator` and the already-tested `run_autofocus`
+  driver; **no new dependencies**. `--quick` for a fast single-seed pass. It
+  **asserts** every scenario converges (non-zero exit on failure), so it doubles as
+  a CI-style gate. Convergence tolerance = 6 pulses (1 pulse = 10 ms open-loop
+  drive; no encoder, so a few pulses residual is expected — §14.2/§14.8).
+
+### 18.2 Results (2026-07-09) — 54/54 converged
+
+- `tools/test_autofocus.py`: **9/9 pass**.
+- `tools/af_ground_test.py` full sweep: **54/54 runs converged within 6 pulses.**
+  - **Assisted** (the default in-flight workflow — operator coarse-focuses first):
+    **0.00 pulse error, 0.00 spread** on all three profiles — lands dead-on.
+  - **Full-auto:** ~1.33 avg / 2.0 max pulse error, <1 pulse spread; blur sigma
+    **5.1 → 0.7** (genuinely sharpened every run).
+  - **Convergence** ~18–29 frames (~a few seconds at the ~4.8 FPS M5 cadence). The
+    `circle` profile takes a few extra frames, confirming the sky-sector
+    **pause/resume** (§14.6) skips low-texture frames instead of chasing them.
+
+### 18.3 Next
+
+- On-hardware **M5 bench run (§15.4 checklist)** is now unblocked (firmware flashed
+  today). Keep exposure/gain fixed manually during runs (per §18 decision).
+- Re-run `tools/af_ground_test.py` after any AF-engine change to keep the baseline
+  honest.
