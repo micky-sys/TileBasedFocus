@@ -782,7 +782,11 @@ class AcquisitionThread(QThread):
                 frame_perf_ns = time.perf_counter_ns()
                 acquire_ts_iso = _iso_now()
                 in_recording_mode = self._modes.is_recording_mode()
-                in_focus_mode = self._modes.is_focus_mode()
+                # M4 (focus) AND M5 (ground test) both feed the focus preview /
+                # AF engine via the raw-focus tap, so gate emission on is_af_mode.
+                # (The focus-crop *disk* writer stays is_focus_mode/M4-only below
+                # -- M5 is preview-only.)
+                in_focus_mode = self._modes.is_af_mode()
 
                 writer_ready, block_reason = self._writer_ready_for_submit()
                 will_write = in_recording_mode and writer_ready

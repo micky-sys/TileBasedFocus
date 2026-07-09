@@ -840,3 +840,31 @@ baseline to compare the real rig against:
   today). Keep exposure/gain fixed manually during runs (per §18 decision).
 - Re-run `tools/af_ground_test.py` after any AF-engine change to keep the baseline
   honest.
+
+## 19. M5 focus-tap bug fix — first on-hardware M5 run (2026-07-09)
+
+**Symptom.** First live M5 (Ground Test) run: mirrors stepped through the sweep but
+**no frames appeared** in the focus preview / AF engine. M0/M1 streamed fine.
+
+**Root cause.** The M5 work (§15/§16) added `ModeController.is_af_mode()` (= M4 **or**
+M5) and switched the *app-side* focus gates to it, but the **acquisition thread's
+focus-tap emission** in `host/capture/pipeline.py` was left on `is_focus_mode()`
+(**M4-only**). So in M5 the app enabled the tap and showed the focus page, the PCB
+triggered, and frames reached the backend — but the pipeline's `in_focus_mode` gate
+was `False`, so `want_focus_tap` never fired and no `raw_focus_frame` was ever emitted.
+The firmware `SweepStepM5()` trigger block was fine all along (byte-identical to
+`Sweep()`); this was purely host-side.
+
+**Fix.** `pipeline.py` (~line 785) now gates `in_focus_mode` on `is_af_mode()` (M4|M5).
+The focus-crop **disk-writer** gates (`pipeline.py` ~1878/2513) are intentionally left
+`is_focus_mode()` (M4-only) — M5 is preview-only (§15.1). The app-side M4-only gates
+for exposure/gain lock and fine-focus are also correct as-is (exposure stays *unlocked*
+in M5 per §18; M5 forces coarse per §15.3). One-line functional change; no reflash.
+
+**Verified on hardware (2026-07-09).** After relaunch, entering M5 logged
+`raw_focus_frame -> focus panel #1 … #16` and `focus-tap emit #N (coarse)` with **no
+`no frame in 5s` warnings**; `Swp# 22` shows a full 40-position M5 wrap while streaming.
+
+**Still open.** Camera 3 (`2439007`) failed to enumerate on every launch this session
+(only 2/3 cameras) — persistent, not the transient §6 hiccup; needs a physical
+CXP/power check on that camera.
