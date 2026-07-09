@@ -70,9 +70,18 @@ class TileGrid:
     edge_band:
         Band depth as a fraction of the perpendicular frame dimension when
         ``region="edge"`` (e.g. 0.25 = the leading 25 % of the frame).
+    interior_inset:
+        For ``region="interior"``: fraction to inset from every side, to keep
+        tiles off the frame border (e.g. a screen bezel imaged on a bench rig).
+        0.12 = drop the outer 12 % on each side.
+    exclude_edge:
+        For ``region="interior"``: an optional edge (``top``/``bottom``/``left``/
+        ``right``) whose band is *excluded* from the interior region -- used to
+        keep the optical ground-truth strip out of the analysed area.
     """
 
     VALID_EDGES = ("top", "bottom", "left", "right")
+    VALID_REGIONS = ("circle", "edge", "interior")
 
     def __init__(
         self,
@@ -86,6 +95,8 @@ class TileGrid:
         region: str = "circle",
         lead_edge: str = "top",
         edge_band: float = 0.25,
+        interior_inset: float = 0.12,
+        exclude_edge: str | None = None,
     ) -> None:
         self.frame_w = frame_width
         self.frame_h = frame_height
@@ -102,9 +113,11 @@ class TileGrid:
         self.circle_cy = frame_height / 2
 
         self._overlap = overlap
-        self.region = region if region in ("circle", "edge") else "circle"
+        self.region = region if region in self.VALID_REGIONS else "circle"
         self.lead_edge = lead_edge if lead_edge in self.VALID_EDGES else "top"
         self.edge_band = float(edge_band)
+        self.interior_inset = float(interior_inset)
+        self.exclude_edge = exclude_edge if exclude_edge in self.VALID_EDGES else None
         self.tiles: list[Tile] = self._build_grid()
 
     # ------------------------------------------------------------------
@@ -112,6 +125,8 @@ class TileGrid:
     def _build_grid(self) -> list[Tile]:
         if self.region == "edge":
             return self._build_grid_edge()
+        if self.region == "interior":
+            return self._build_grid_interior()
         return self._build_grid_circle()
 
     def _build_grid_circle(self) -> list[Tile]:
@@ -176,6 +191,53 @@ class TileGrid:
             y_positions = [by0]
         if not x_positions:
             x_positions = [bx0]
+
+        tiles: list[Tile] = []
+        for y in y_positions:
+            for x in x_positions:
+                x0 = x & ~1
+                y0 = y & ~1
+                x1 = x0 + self.tile_w
+                y1 = y0 + self.tile_h
+                if x0 >= 0 and y0 >= 0 and x1 <= self.frame_w and y1 <= self.frame_h:
+                    tiles.append(Tile(x0, y0, x1, y1))
+        return tiles
+
+    def _build_grid_interior(self) -> list[Tile]:
+        """Lay tiles across an inset interior rectangle, optionally excluding a
+        band on one edge.
+
+        Used by the orthophoto screen bench rig: ``interior_inset`` drops the
+        screen bezel/office border (challenge 1) and ``exclude_edge`` removes the
+        optical ground-truth strip band (challenge 2), so autofocus scores only
+        the moving ortho content.
+        """
+        inset = min(0.49, max(0.0, self.interior_inset))
+        ix0 = int(round(self.frame_w * inset))
+        iy0 = int(round(self.frame_h * inset))
+        ix1 = self.frame_w - ix0
+        iy1 = self.frame_h - iy0
+
+        if self.exclude_edge is not None:
+            band_x = int(round(self.frame_w * self.edge_band))
+            band_y = int(round(self.frame_h * self.edge_band))
+            if self.exclude_edge == "top":
+                iy0 = max(iy0, band_y)
+            elif self.exclude_edge == "bottom":
+                iy1 = min(iy1, self.frame_h - band_y)
+            elif self.exclude_edge == "left":
+                ix0 = max(ix0, band_x)
+            elif self.exclude_edge == "right":
+                ix1 = min(ix1, self.frame_w - band_x)
+
+        step_x = max(1, int(self.tile_w * (1 - self._overlap)))
+        step_y = max(1, int(self.tile_h * (1 - self._overlap)))
+        x_positions = list(range(ix0, max(ix0 + 1, ix1 - self.tile_w + 1), step_x))
+        y_positions = list(range(iy0, max(iy0 + 1, iy1 - self.tile_h + 1), step_y))
+        if not x_positions:
+            x_positions = [ix0]
+        if not y_positions:
+            y_positions = [iy0]
 
         tiles: list[Tile] = []
         for y in y_positions:

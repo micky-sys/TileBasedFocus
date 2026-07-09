@@ -89,6 +89,13 @@ class AutoFocusConfig:
     edge_band: float = 0.25
     tiles_per_frame: float = 5.0  # TileGrid zoom -> tile ~ frame/this
 
+    # Bench rig (orthophoto screen): restrict tiles to an inset interior,
+    # excluding the screen bezel and the optical ground-truth strip band.
+    # Off by default so normal M4/M5 flight behaviour is unchanged.
+    restrict_interior: bool = False
+    interior_inset: float = 0.12
+    exclude_edge: Optional[str] = None  # top/bottom/left/right = strip location
+
     # Tracking
     min_track_response: float = 0.05  # phaseCorrelate response floor
 
@@ -172,7 +179,21 @@ def select_leading_edge_roi(
     """Pick a high-texture tile on the leading-edge band (or central circle if
     ``lead_edge`` is None). Returns ``((x0,y0,x1,y1), score)``."""
     fh, fw = frame.shape[:2]
-    if lead_edge is None:
+    if cfg.restrict_interior:
+        # Bench rig: keep tiles inside the screen interior, off the bezel and
+        # off the optical strip band, regardless of motion direction.
+        grid = TileGrid(
+            frame_width=fw,
+            frame_height=fh,
+            display_width=fw,
+            display_height=fh,
+            zoom=cfg.tiles_per_frame,
+            region="interior",
+            interior_inset=cfg.interior_inset,
+            exclude_edge=cfg.exclude_edge,
+            edge_band=cfg.edge_band,
+        )
+    elif lead_edge is None:
         grid = TileGrid(
             frame_width=fw,
             frame_height=fh,
