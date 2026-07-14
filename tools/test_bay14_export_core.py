@@ -44,6 +44,7 @@ from bay14_export_core import (  # noqa: E402
     apply_fliplr_to_frame,
     build_standard_extratags,
     encode_tiff_rgb16,
+    resize_to_width,
     write_tiff_bayer_u16,
 )
 
@@ -628,6 +629,44 @@ def test_apply_exif_gps_real_exiftool_round_trip() -> None:
         assert "GPSLatitudeRef" in out, out
         assert "GPSLongitudeRef" in out, out
         assert "GPSAltitude" in out, out
+
+
+def test_resize_to_width_preserves_aspect_and_never_upscales() -> None:
+    """``resize_to_width`` (the low-res "_S" export helper) downsamples to
+    the target width keeping aspect ratio, passes through on None, and
+    never upscales a frame that is already narrower.
+    """
+    # 3-channel RGB frame, 100 wide x 40 tall -> 50 wide keeps 2.5:1.
+    rgb = np.zeros((40, 100, 3), dtype=np.uint16)
+    out = resize_to_width(rgb, 50)
+    assert out.shape == (20, 50, 3), out.shape
+
+    # Single-plane Bayer frame stays single-plane.
+    bayer = np.zeros((40, 100), dtype=np.uint16)
+    assert resize_to_width(bayer, 25).shape == (10, 25)
+
+    # None -> untouched original object (full-res path).
+    assert resize_to_width(rgb, None) is rgb
+    # Target >= current width -> no upsciale, same object back.
+    assert resize_to_width(rgb, 100) is rgb
+    assert resize_to_width(rgb, 200) is rgb
+    # Non-positive width is ignored rather than crashing cv2.resize.
+    assert resize_to_width(rgb, 0) is rgb
+
+
+def test_encode_tiff_rgb16_resize_width_shrinks_output() -> None:
+    """Regression for the Parallax Export Studio low-res crash: the
+    encoders MUST accept ``resize_width`` and emit a smaller TIFF.
+    """
+    bayer = (np.arange(64 * 64, dtype=np.uint16) % 4096).reshape(64, 64)
+    meta = {"bayer_pattern": "RG", "bit_depth": 14, "container": "bay14line_v1"}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "small.tif"
+        encode_tiff_rgb16(path, bayer, meta, resize_width=16)
+        with tifffile.TiffFile(str(path)) as tf:
+            shape = tf.pages[0].shape
+    assert shape[1] == 16, shape  # width honoured
+    assert shape[0] == 16, shape  # square input -> square output
 
 
 def main() -> int:

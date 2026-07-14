@@ -438,6 +438,23 @@ def iter_line_frames(
                 yield merged_meta, arr
 
 
+def resize_to_width(arr: np.ndarray, resize_width: Optional[int]) -> np.ndarray:
+    """Downscale *arr* to *resize_width* px wide, preserving aspect ratio.
+
+    No-op when *resize_width* is None, non-positive, or not smaller than
+    the current width (we never upscale). Uses ``INTER_AREA``, the correct
+    interpolation for downsampling. Handles both single-plane (HxW) and
+    multi-channel (HxWxC) arrays.
+    """
+    if resize_width is None:
+        return arr
+    h, w = arr.shape[:2]
+    if resize_width < 1 or resize_width >= w:
+        return arr
+    new_h = max(1, round(h * resize_width / w))
+    return cv2.resize(arr, (resize_width, new_h), interpolation=cv2.INTER_AREA)
+
+
 def write_tiff_bayer_u16(
     out_path: Path,
     arr: np.ndarray,
@@ -445,6 +462,7 @@ def write_tiff_bayer_u16(
     *,
     scale_14_to_16: bool,
     flip_lr: bool = False,
+    resize_width: Optional[int] = None,
 ) -> None:
     """Write single-channel uint16 Bayer TIFF with embedded JSON metadata.
 
@@ -482,6 +500,11 @@ def write_tiff_bayer_u16(
         arr_w = np.ascontiguousarray(arr)
     if flip_lr:
         arr_w, meta_out = apply_fliplr_to_frame(arr_w, meta_out)
+    # ponytail: downscaling the raw Bayer mosaic blends adjacent
+    # colour sites, so the low-res copy is a preview, not a re-mosaicable
+    # capture. Upgrade path if fidelity matters: demosaic -> resize ->
+    # re-mosaic. Fine for the "_S" preview folder this feeds.
+    arr_w = resize_to_width(arr_w, resize_width)
     description = json.dumps(meta_out, separators=(",", ":"))
 
     fix = _gps_fix_from_meta(meta_out)
@@ -515,6 +538,7 @@ def encode_tiff_rgb16(
     merged_meta: dict[str, Any],
     *,
     flip_lr: bool = False,
+    resize_width: Optional[int] = None,
 ) -> None:
     """Demosaic Bayer RG → RGB uint16 TIFF (classic, NOT BigTIFF); applies 14→16 shift first.
 
@@ -553,6 +577,7 @@ def encode_tiff_rgb16(
         # see the audit trail.
         rgb = np.ascontiguousarray(rgb[:, ::-1, :])
         meta_out["flipped_lr"] = True
+    rgb = resize_to_width(rgb, resize_width)
     description = json.dumps(meta_out, separators=(",", ":"))
 
     fix = _gps_fix_from_meta(merged_meta)
@@ -585,6 +610,7 @@ def encode_jpeg(
     *,
     quality: int,
     flip_lr: bool = False,
+    resize_width: Optional[int] = None,
 ) -> None:
     """Lossy JPEG from demosaiced RGB; quality 1–100 (OpenCV scale).
 
@@ -603,6 +629,7 @@ def encode_jpeg(
     bgr8 = cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
     if flip_lr:
         bgr8 = np.ascontiguousarray(bgr8[:, ::-1, :])
+    bgr8 = resize_to_width(bgr8, resize_width)
     ok, buf = cv2.imencode(
         ".jpg",
         bgr8,
