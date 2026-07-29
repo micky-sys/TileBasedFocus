@@ -12,6 +12,7 @@ Protocol (115200 baud, newline-terminated):
   ! + \\n          -> M3 only: mark END of a manual line
 """
 
+import queue
 import threading
 import logging
 from typing import Callable, Optional
@@ -23,7 +24,7 @@ log = logging.getLogger(__name__)
 
 BAUD_RATE = 115200
 VALID_CAMERAS = (1, 2, 3)
-VALID_STRENGTHS = (1, 2, 3)
+VALID_STRENGTHS = (0, 1, 2, 3)  # 0 = extra-fine ($S0*), for autofocus (V2_4+ firmware)
 
 # PCB ``$Cn*`` in focus mode: logical ClearCore camera slot by Iron661 serial
 # (fixed rig wiring). UI cam1/cam2/cam3 slots may reorder; UART must send the
@@ -43,6 +44,15 @@ class FocusController:
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
         self._on_response: Optional[Callable[[str], None]] = None
+        # TX is queued to a background thread so a blocked/full serial write can
+        # NEVER stall the caller (the GUI thread issues moves from the AF settle
+        # loop; a wedged PCB used to jam ``write()`` for seconds, backing up 8 MB
+        # focus frames until the box crashed). Bounded + drop-on-full: if the PCB
+        # genuinely isn't draining, dropping commands is correct (AF re-issues and
+        # self-corrects) -- far better than hanging the UI.
+        self._tx_q: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=256)
+        self._tx_thread: Optional[threading.Thread] = None
+        self._tx_dropped = 0
 
     # ── Port enumeration ──────────────────────────────────────────────
 
@@ -70,15 +80,33 @@ class FocusController:
     def connect(self, port: str, on_response: Optional[Callable[[str], None]] = None) -> None:
         if self.connected:
             self.disconnect()
-        self._ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+        # write_timeout bounds the background TX thread's write() so a stalled
+        # PCB can't hang it forever; a timeout just drops that one command.
+        self._ser = serial.Serial(port, BAUD_RATE, timeout=0.1, write_timeout=1.0)
         self._on_response = on_response
         self._running = True
+        self._tx_dropped = 0
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
+        self._tx_thread = threading.Thread(target=self._tx_loop, daemon=True)
+        self._tx_thread.start()
         log.info("Connected to %s", port)
 
     def disconnect(self) -> None:
         self._running = False
+        if self._tx_thread is not None:
+            try:
+                self._tx_q.put_nowait(None)  # wake the TX thread so it exits promptly
+            except queue.Full:
+                pass
+            self._tx_thread.join(timeout=2)
+            self._tx_thread = None
+        # Drop any commands still queued so a reconnect starts clean.
+        try:
+            while True:
+                self._tx_q.get_nowait()
+        except queue.Empty:
+            pass
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=2)
             self._reader_thread = None
@@ -90,11 +118,45 @@ class FocusController:
     # ── Commands ──────────────────────────────────────────────────────
 
     def _send(self, data: str) -> None:
+        """Enqueue a command for the background TX thread. Non-blocking: returns
+        immediately so a slow/wedged PCB can never stall the caller (the GUI)."""
         if not self.connected:
             log.warning("Not connected — command ignored: %r", data)
             return
-        self._ser.write(data.encode("ascii"))
-        log.debug("TX: %r", data)
+        try:
+            self._tx_q.put_nowait(data)
+        except queue.Full:
+            self._tx_dropped += 1
+            if self._tx_dropped % 32 == 1:
+                log.warning(
+                    "serial TX queue full (PCB not draining?); dropped %d cmd(s)",
+                    self._tx_dropped,
+                )
+
+    def _tx_loop(self) -> None:
+        """Drain the TX queue on a background thread. FIFO preserves command
+        order (focus-pulse bursts stay sequential). A write_timeout just skips
+        one command rather than hanging."""
+        while self._running:
+            try:
+                data = self._tx_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if data is None:  # disconnect sentinel
+                break
+            ser = self._ser
+            if ser is None or not ser.is_open:
+                continue
+            try:
+                ser.write(data.encode("ascii"))
+                log.debug("TX: %r", data)
+            except serial.SerialTimeoutException:
+                # ponytail: partial write possible on timeout; AF settle-verify
+                # re-issues the move so a mangled pulse burst self-corrects.
+                log.warning("serial write timed out (PCB stalled?): %r", data)
+            except Exception:
+                if self._running:
+                    log.exception("Serial write error")
 
     def set_mode(self, mode: int) -> None:
         self._send(f"$M{mode}*\n")
@@ -111,7 +173,9 @@ class FocusController:
 
     def focus_step(self, direction: str, count: int = 1) -> None:
         """Send an H-bridge pulse. *direction* is '+' or '-'.
-        *count* controls pulse duration (number of 10 ms increments on the PCB).
+        *count* controls pulse duration (number of PCB time-increments; the
+        increment is set by the last strength command -- 3 ms after ``$S0``,
+        10 ms after ``$S1``-``$S3``).
         """
         if direction not in ("+", "-"):
             raise ValueError("direction must be '+' or '-'")
@@ -133,6 +197,19 @@ class FocusController:
         if n < 2 or n > 64:
             raise ValueError("positions must be in [2, 64]")
         self._send(f"$P{n}*\n")
+
+    def set_m5_sweep_angle(self, degrees: float) -> None:
+        """M5 (ground test): set the total mirror sweep angle in degrees.
+
+        Sends ``$W<n>*``; the PCB clamps to [1, 60] and (if already in M5)
+        recomputes the mirror angles and restarts the stepped sweep. A narrow
+        angle + many positions gives a small per-step angle so consecutive frames
+        overlap and the host patch-tracker can follow the panning scene.
+        """
+        deg = float(degrees)
+        if deg < 1 or deg > 60:
+            raise ValueError("sweep angle must be in [1, 60] degrees")
+        self._send(f"$W{deg:g}*\n")
 
     def start_line(self) -> None:
         """M3-only: send ``?\\n`` to mark the START of a manual line.

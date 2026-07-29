@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -64,6 +65,10 @@ class OrthoSimConfig:
     fiducial_px: int = 140             # ArUco marker side length (screen px)
     fiducial_margin_px: int = 24
     aruco_dict: str = "DICT_4X4_50"
+
+    # Ground-distance scale (human-readable ruler along the scroll axis)
+    scale_enabled: bool = False        # toggled live with 'G'
+    scale_target_px: int = 200         # desired tick spacing (screen px)
 
     # HUD / logging
     hud_enabled: bool = True
@@ -133,6 +138,56 @@ def simulated_height_hint_m(
     if pixel_m <= 0:
         return None
     return gsd_m * focal_m / pixel_m
+
+
+# ── Ground-distance scale (human-readable ruler) ─────────────────────────────
+def nice_interval_m(target_px: float, px_per_m: float) -> float:
+    """Smallest 1/2/5 x 10^n metre interval whose on-screen spacing is >=
+    *target_px*, so the ruler ticks land on round ground distances."""
+    if px_per_m <= 0 or target_px <= 0:
+        return 1.0
+    raw = target_px / px_per_m  # metres needed to span target_px on screen
+    exp = math.floor(math.log10(raw))
+    base = 10.0 ** exp
+    for m in (1.0, 2.0, 5.0):
+        if base * m >= raw:
+            return base * m
+    return base * 10.0
+
+
+def scale_ticks(
+    distance_m: float,
+    px_per_m: float,
+    axis_len_px: float,
+    target_px: float,
+    content_from_far: bool,
+) -> List[Tuple[float, float]]:
+    """Ground-distance ruler ticks locked to the scrolling imagery.
+
+    Returns ``(ground_distance_m, screen_pos_px)`` for every round-distance tick
+    currently on screen along the scroll axis. ``distance_m`` is the cumulative
+    simulated distance (newest ground, at the leading edge). ``content_from_far``
+    is True when new content enters at the far edge (scroll "up"/"left") so the
+    newest distance sits at ``axis_len_px``; False (scroll "down"/"right") puts
+    it at 0. Both give tick spacing ``interval * px_per_m`` and shift by
+    ``px_per_m * d(distance)`` per frame, i.e. exactly the imagery velocity.
+    """
+    if px_per_m <= 0 or axis_len_px <= 0:
+        return []
+    interval = nice_interval_m(target_px, px_per_m)
+    span_m = axis_len_px / px_per_m
+    d = max(0.0, math.ceil((distance_m - span_m) / interval) * interval)
+    d_hi = math.floor(distance_m / interval) * interval
+    out: List[Tuple[float, float]] = []
+    while d <= d_hi + 1e-6:
+        pos = (
+            axis_len_px - (distance_m - d) * px_per_m
+            if content_from_far
+            else (distance_m - d) * px_per_m
+        )
+        out.append((d, pos))
+        d += interval
+    return out
 
 
 # ── Ground-truth CSV logger ──────────────────────────────────────────────────

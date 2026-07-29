@@ -17,6 +17,7 @@ from PySide6.QtCore import QObject, Signal
 
 from serial_comm import FocusController  # repo root; see sys.path bootstrap in app.py
 
+from .focus_axis import EncoderTracker
 from .mode_controller import Mode, ModeController
 
 
@@ -30,6 +31,22 @@ class SerialClient(QObject):
         super().__init__()
         self._ctrl = FocusController()
         self._modes = mode_controller
+        # Accumulates the AMT203S ``$ENC=`` stream into an unwrapped motor count.
+        # Fed on the reader thread (see _on_line) so EncoderAxis can read a fresh
+        # position even while an AF step runs synchronously on the GUI thread.
+        self._encoder = EncoderTracker()
+
+    # ── encoder (AMT203S motor-shaft absolute position) ──────────────────
+
+    @property
+    def encoder_position(self) -> float:
+        """Latest unwrapped motor-shaft count (0 until the first ``$ENC``)."""
+        return float(self._encoder.position)
+
+    @property
+    def encoder_present(self) -> bool:
+        """True once a valid (non-sentinel) ``$ENC`` reading has arrived."""
+        return self._encoder.present
 
     # ── port enumeration ────────────────────────────────────────────────
 
@@ -90,6 +107,10 @@ class SerialClient(QObject):
         """M5 ground test: set stepped-sweep positions per cycle ($P<n>*)."""
         self._ctrl.set_m5_positions(positions)
 
+    def set_m5_sweep_angle(self, degrees: float) -> None:
+        """M5 ground test: set total mirror sweep angle in degrees ($W<n>*)."""
+        self._ctrl.set_m5_sweep_angle(degrees)
+
     def start_line(self) -> None:
         """Send ``?`` (M3 manual-line START) to the PCB."""
         self._ctrl.start_line()
@@ -111,6 +132,9 @@ class SerialClient(QObject):
     # ── internal ────────────────────────────────────────────────────────
 
     def _on_line(self, line: str) -> None:
-        # Runs on the pyserial reader thread. Qt.AutoConnection makes this
-        # a queued emit because the sender (self) lives on the GUI thread.
+        # Runs on the pyserial reader thread. Fold any $ENC reading in HERE (not in
+        # the queued GUI slot) so the motor position stays current even while a
+        # blocking AF step monopolises the GUI event loop. Qt.AutoConnection makes
+        # the emit a queued hand-off to the GUI thread for logging/UI.
+        self._encoder.update_line(line)
         self.line_received.emit(line)

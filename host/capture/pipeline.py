@@ -120,12 +120,63 @@ M4_FOCUS_OVERVIEW_DECIM = 8
 #
 #   24 slots * ~244 MB ~= 5.9 GB / camera, ~17.7 GB across all three.
 #
-# Memory check on this 64 GB host: with 17-19 GB system committed
-# and 45 GB available (per Task Manager), 18 GB shm leaves ~27 GB
-# headroom -- comfortably away from the commit limit that produced
-# the earlier MEMORY_MANAGEMENT BSOD when we tried 12 GB on a host
-# with a small page file.
-SHM_POOL_SLOTS = 24
+# Memory: the 24-slot sizing suits the 64 GB *operational* host, where 17.7 GB
+# of DMA-pinned pool is comfortable. But the same 17.7 GB on a 32 GB *bench*
+# box is ~55% of RAM and pushes the system commit toward its limit -- which
+# coincided with two MEMORY_MANAGEMENT (0x1A) BSODs during focus testing. So
+# scale the slot count to physical RAM instead of hard-coding it: this keeps
+# 24 slots on the 64 GB operational machine (no recording-depth regression)
+# while dropping to 8 (~5.9 GB) on the 32 GB bench box. Slots must fit in
+# *physical* RAM (DMA buffers can't be paged out), so we scale on total
+# physical memory, not the commit limit.
+
+
+def _physical_ram_gb() -> float:
+    """Best-effort total physical RAM in GB (0.0 if it can't be determined)."""
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MEMSTAT(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMSTAT()
+            stat.dwLength = ctypes.sizeof(_MEMSTAT)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return 0.0
+            return stat.ullTotalPhys / (1024 ** 3)
+        import os as _os
+
+        return (
+            _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+        ) / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _pool_slots_for_ram(default_slots: int = 24, min_slots: int = 8) -> int:
+    """Scale the full-res pool to physical RAM: ~0.5 slots/GB, clamped to
+    [min_slots, default_slots]. Gives 24 @ 64 GB (operational, unchanged) and
+    8 @ 32 GB (bench). Falls back to default_slots if RAM can't be read."""
+    ram_gb = _physical_ram_gb()
+    if ram_gb <= 0.0:
+        return default_slots
+    return max(min_slots, min(default_slots, int(0.5 * ram_gb - 8)))
+
+
+SHM_POOL_SLOTS = _pool_slots_for_ram()
 FOCUS_WRITE_QUEUE_MAX = 4  # focus crops are small; back-pressure is fine
 
 # Per-camera SHM ring of compressed-payload slots, sitting between the
@@ -332,13 +383,15 @@ def m4_fine_tile_rgb_from_frame(
     display_h: int = M4_FINE_DISPLAY_H,
     zoom: float = M4_FINE_ZOOM,
     demosaic: bool = True,
-) -> tuple[np.ndarray, Any, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, Any, np.ndarray, np.ndarray, tuple[int, int, int, int]]:
     """Best tile in the centre circle (1/5 area); optional Bayer demosaic.
 
     When ``demosaic`` is False, the returned "RGB" image duplicates an 8-bit
     grayscale view of the raw Bayer crop (no colour reconstruction).
 
-    Returns ``(rgb_u8_hw3, sharpness_result, uint16_tile_crop, overview_rgb_u8_hw3)``.
+    Returns ``(rgb_u8_hw3, sharpness_result, uint16_tile_crop, overview_rgb_u8_hw3,
+    tile_bbox)`` where ``tile_bbox`` is the auto-picked tile's ``(x0,y0,x1,y1)`` in
+    full-res pixels -- the host pins it via ``set_focus_roi`` to lock the tile.
     """
     from sharpness import find_best_tile
     from tile_geometry import TileGrid
@@ -365,7 +418,7 @@ def m4_fine_tile_rgb_from_frame(
     else:
         rgb = cv2.cvtColor(crop_u8, cv2.COLOR_GRAY2RGB)
     overview_rgb = _m4_focus_overview_rgb(full_u16, grid, result.best_index)
-    return rgb, result, crop_u16, overview_rgb
+    return rgb, result, crop_u16, overview_rgb, (best.x0, best.y0, best.x1, best.y1)
 
 
 def m4_roi_tile_rgb_from_frame(
@@ -425,6 +478,9 @@ class AcquisitionThread(QThread):
     preview_ready = Signal(QImage)
     raw_focus_frame = Signal(object, str)  # (np.ndarray uint16, ISO timestamp)
     raw_focus_tile_rgb = Signal(object, object)  # (rgb uint8 HxWx3, meta dict)
+    # Full-res uint16 crop of the pinned focus ROI, emitted alongside the coarse
+    # tap during autofocus so AF can score focus on real high frequencies.
+    raw_focus_roi_u16 = Signal(object, str)  # (np.ndarray uint16 crop, ISO timestamp)
     fetch_timeout_count = Signal(int)
     # Cumulative count of sweep frames AcquisitionThread had to drop
     # rather than submit to the writer subprocess. Reasons include
@@ -517,6 +573,21 @@ class AcquisitionThread(QThread):
         # cadence so the smoke log shows whether frames are actually
         # leaving AcquisitionThread for the focus panel.
         self._focus_tap_emit_count = 0
+        self._focus_roi_crops_shipped = 0  # diag: full-res AF crops emitted
+        # Backpressure for the acq->GUI focus-frame hop. ``raw_focus_frame``
+        # ships a FRESH ~8 MB ``small_u16`` copy as a QUEUED cross-thread event,
+        # which Qt's event loop never bounds: when the GUI thread falls behind
+        # (heavy per-frame AF work, or a blocking serial write stalling it for
+        # seconds) those 8 MB payloads pile up unconsumed -> ~40 MB/s leak that
+        # crawled the frame rate and then crashed the box. This flag conflates
+        # the stream to AT MOST ONE in-flight frame: we skip the emit while the
+        # GUI hasn't picked up the previous one (the dropped copy is just a local
+        # -> GC'd), so a stalled GUI can never balloon the queue. The GUI slot
+        # clears it (``note_focus_frame_consumed``) as it starts handling a frame.
+        # Bool assignment is atomic under the GIL, so no lock is needed; the worst
+        # case is dropping/keeping one extra frame, which is invisible at preview.
+        self._focus_frame_inflight = False
+        self._focus_frames_conflated = 0  # diag: frames dropped by conflation
         # State-transition logging for "why we couldn't write": a
         # missing project name + a busy trigger would otherwise emit
         # ~40 lines/sec into the log, freezing the GUI's QPlainTextEdit.
@@ -570,6 +641,15 @@ class AcquisitionThread(QThread):
     def set_focus_tap_enabled(self, enabled: bool) -> None:
         """Opt in to ``raw_focus_frame`` emission while in M4."""
         self._focus_tap_enabled = bool(enabled)
+
+    def note_focus_frame_consumed(self) -> None:
+        """Called from the GUI thread when it picks up a ``raw_focus_frame``.
+        Releases the conflation latch so the acq thread may emit the next one.
+        Clearing at the START of the GUI handler (not the end) lets the acq
+        thread stage the next frame while this one is still being processed --
+        at most ~1 extra frame in flight -- which keeps the preview live without
+        letting the 8 MB payloads accumulate."""
+        self._focus_frame_inflight = False
 
     def set_fine_focus_enabled(self, enabled: bool) -> None:
         """M4 only: when True, focus tap reads full-res from pool and emits RGB."""
@@ -894,11 +974,14 @@ class AcquisitionThread(QThread):
                                 self.label, slot_idx, exc,
                             )
                     else:
+                        # Hold the full-res slot for a focus-tap read when
+                        # either Fine preview is on OR (coarse) autofocus has
+                        # pinned an ROI it wants scored at full resolution.
                         defer_release = (
                             in_focus_mode
                             and self._focus_tap_enabled
-                            and self._fine_focus
                             and want_focus_tap
+                            and (self._fine_focus or self._focus_roi is not None)
                         )
                         if defer_release:
                             slot_for_fine = int(full_u16)
@@ -966,9 +1049,10 @@ class AcquisitionThread(QThread):
                                     "overview_rgb": None,
                                     "fine_demosaic": self._fine_demosaic,
                                     "roi": roi,
+                                    "tile_roi": roi,
                                 }
                             else:
-                                rgb, sharp_res, crop_u16, overview_rgb = (
+                                rgb, sharp_res, crop_u16, overview_rgb, tile_bbox = (
                                     m4_fine_tile_rgb_from_frame(
                                         full_view,
                                         demosaic=self._fine_demosaic,
@@ -981,10 +1065,42 @@ class AcquisitionThread(QThread):
                                     "ts_iso": acquire_ts_iso,
                                     "overview_rgb": overview_rgb,
                                     "fine_demosaic": self._fine_demosaic,
+                                    "tile_roi": tile_bbox,
                                 }
                             self.raw_focus_tile_rgb.emit(rgb, meta)
                         elif not self._fine_focus:
-                            self.raw_focus_frame.emit(small_u16, acquire_ts_iso)
+                            # Coarse autofocus: if a winning-tile ROI is pinned
+                            # and we held the full-res slot, ship a full-res crop
+                            # of that tile so AF scores focus on real high
+                            # frequencies (the decimated preview aliases them
+                            # away). The engine tracks/selects on the small
+                            # frame; it just scores on this crop.
+                            roi = self._focus_roi
+                            if (
+                                roi is not None
+                                and slot_for_fine is not None
+                                and self._pool is not None
+                            ):
+                                fv = self._pool.slot_view(slot_for_fine)
+                                fh2, fw2 = fv.shape[:2]
+                                x0, y0, x1, y1 = roi
+                                x0 = max(0, min(int(x0), fw2 - 2))
+                                y0 = max(0, min(int(y0), fh2 - 2))
+                                x1 = max(x0 + 2, min(int(x1), fw2))
+                                y1 = max(y0 + 2, min(int(y1), fh2))
+                                crop = np.ascontiguousarray(
+                                    fv[y0:y1, x0:x1]
+                                ).copy()
+                                self.raw_focus_roi_u16.emit(crop, acquire_ts_iso)
+                                self._focus_roi_crops_shipped += 1
+                            # Conflate: only emit if the GUI has consumed the
+                            # previous 8 MB frame. Otherwise drop this one so the
+                            # queued-event backlog can't grow unbounded (the crash).
+                            if self._focus_frame_inflight:
+                                self._focus_frames_conflated += 1
+                            else:
+                                self._focus_frame_inflight = True
+                                self.raw_focus_frame.emit(small_u16, acquire_ts_iso)
                         self._focus_tap_emit_count += 1
                         if self._focus_tap_emit_count == 1 or (
                             self._focus_tap_emit_count % 16 == 0
@@ -994,7 +1110,10 @@ class AcquisitionThread(QThread):
                             ) else "coarse"
                             self.log_line.emit(
                                 f"{self.label}: focus-tap emit "
-                                f"#{self._focus_tap_emit_count} ({path})"
+                                f"#{self._focus_tap_emit_count} ({path}, "
+                                f"roi_crops={self._focus_roi_crops_shipped}, "
+                                f"emit={'slot' if is_valid_slot else ('pooldrop' if is_real_pool_drop else 'noemit')}, "
+                                f"roi={'set' if self._focus_roi is not None else 'none'})"
                             )
                     except Exception as exc:
                         log.warning(

@@ -25,6 +25,25 @@
 #define HB1Select IO3  //H-bridge selection pin 1, for focus mechanisms
 #define HB2Select IO2 //H-bridge selection pin 2
 #define focusMotorPin ConnectorIO5  //H-bridge output for focus motor
+#define encoderPort ConnectorCOM1  //AMT203S absolute encoder (SPI master) on the focus-motor shaft. COM-0 is the RS232 collection link; COM-1 was free.
+
+// AMT20-series (AMT203S) SPI protocol -- see the Same Sky AMT20 datasheet. 12-bit
+// absolute (0..4095), SPI mode 0, data rate <= 1 MHz, and the CS line MUST be
+// released after EVERY byte. Command: send rd_pos, clock nop bytes while the
+// encoder replies with the 0xA5 wait byte, then it echoes rd_pos and the next two
+// bytes are MSB (low 4 bits valid) + LSB of the position.
+const uint8_t ENC_NOP = 0x00;      // no-op / wait byte
+const uint8_t ENC_RD_POS = 0x10;   // read-position command (also its echo)
+const int ENC_SPI_HZ = 500000;     // 500 kHz -- comfortably under the 1 MHz max
+const int ENC_ECHO_TRIES = 20;     // max nop reads waiting for the rd_pos echo
+// Encoder USB report cadence, gated by mode: the closed-loop AF (M4/M5) needs a
+// fresh shaft position every ~100 ms, but streaming that fast in the operational
+// modes (M0/M1/...) just floods the host log and USB link for no benefit. So poll
+// fast only in the focus modes and merely "every once in a while" elsewhere (a
+// liveness heartbeat -- enough for the host to know the encoder is alive).
+const uint32_t encoderReportFastMs = 100;   // M4/M5: closed-loop AF position feed
+const uint32_t encoderReportSlowMs = 2000;  // other modes: liveness only
+uint32_t lastEncoderReport = 0;
 
 
 /*
@@ -45,12 +64,23 @@ int m5Index = 0;  //Current position index in the non-blocking mode-5 stepped sw
 int inputRes = 6400;  //pulses per rev, as defined in the MSP
 
 float sweepAngleVertical = 60; //SUPPOSED TO BE 60! Total sweep angle, from side to side, for vertical mirror mount - Important note: this is not the motor angle (alpha), this is the angle of the mount itself (theta)
+float m5SweepAngle = 10; //Mode-5 (ground test) total sweep angle (deg), user-adjustable via $W<n>*. Kept separate from sweepAngleVertical so leaving M5 restores the 60 deg flight sweep. A narrow angle + many $P positions = small per-step angle so frames overlap and the host patch-tracker can follow.
 float sweepAngleOblique = 50;  //Total sweep angle, from side to side, for oblique camera motor
 float startAngle1 = -sweepAngleOblique*inputRes/2/360;
 
 bool M0Exists = false;
 bool M1Exists = false;
 bool SweepNeedsToStart = false;
+
+// Safe-abort: if a motor keeps faulting through repeated enable-cycle clears
+// (e.g. the oblique drive faults on every move of a fast sweep), bail out of
+// the sweep instead of re-homing/re-faulting forever (which looks like the
+// motor "going bonkers"). ponytail: maxMoveFaults is a heuristic (~5 faulted
+// moves ≈ 1.5-2 s at the observed ~300 ms/fault); raise it if a genuinely
+// marginal-but-recoverable axis trips it, or fix the drive fault at the source.
+int consecutiveMoveFaults = 0;
+const int maxMoveFaults = 5;
+bool sweepAborted = false;  // set by abortToSafeMode() so an in-progress sweep unwinds at once
 
 bool SerialMessageComplete = false;
 String SerialMessage;
@@ -76,12 +106,47 @@ int picsInPlaceDelay = 250;
 int i = 0;
 
 int focusTimeIncrement = 10;
+int str0 = 7000;   // extra-fine focus step: duty 7000 (~22%) AT a 3 ms pulse -- the
+                   // shortest move that reliably turns the shaft on this rig (below
+                   // this it only buzzes). $S0* selects this duty AND drops
+                   // focusTimeIncrement to 3; $S1*-$S3* restore the 10 ms increment.
 int str1 = 7000;
 int str2 = 10000;
 int str3 = 14000; 
 int focusStrength = str3;  
 int focusIncCount = 0;
 int ackNumber = 0;
+
+// Non-blocking DISCRETE focus-pulse train. A '+'/'-' command of length N is
+// executed as N SEPARATE pulses -- H-bridge ON for focusTimeIncrement ms, then
+// OFF for focusPulseGapMs ms -- NOT one continuous N*inc drive.
+//
+// Why discrete: a continuous burst let the motor ACCELERATE to several rev/s,
+// which (a) made "encoder counts per pulse" nonlinear (a burst covered far more
+// than N x the single-pulse step) and (b) spun the shaft PAST half a revolution
+// between the 10 Hz $ENC samples, so the host's 12-bit absolute-encoder unwrap
+// aliased and silently dropped whole revolutions (the count "barely moved" while
+// the lens swept through focus). Pulsing discretely lets the shaft coast to rest
+// in each gap, so every pulse is ~one calibrated increment and the encoder can
+// never alias. serviceFocusPulse() sequences the train from loop() without
+// blocking, so the camera trigger keeps firing on schedule.
+//
+// Bursts QUEUE (they do NOT replace each other): the host sends multi-leg moves
+// as back-to-back commands (e.g. park_upward = a '-' dive immediately followed by
+// a '+' seat). A "latest-command-wins" handler silently drops the first leg -- the
+// dive never happened and the motor only did the seat (drove the WRONG way into
+// the end stop). A small FIFO plays each burst to completion in order instead.
+const int FOCUS_Q_LEN = 8;            // pending-burst ring buffer depth
+int focusQDir[FOCUS_Q_LEN];           // +1 / -1 per queued burst
+int focusQCount[FOCUS_Q_LEN];         // pulse count per queued burst
+int focusQHead = 0;                   // index of the next burst to play
+int focusQTail = 0;                   // index of the next free slot (head==tail => empty)
+enum FocusPhase { FP_IDLE, FP_ON, FP_GAP };
+FocusPhase focusPhase = FP_IDLE;      // where the current burst is in its ON/GAP cycle
+int focusPulseDir = 0;                // +1 / -1 drive direction of the burst in progress
+int focusPulsesRemaining = 0;         // pulses left AFTER the current one in this burst
+uint32_t focusPhaseEndTime = 0;       // millis() deadline for the current ON or GAP phase
+const uint32_t focusPulseGapMs = 12;  // OFF time between pulses -- lets the shaft settle so each pulse is ~one increment (tune up if the motor still coasts across pulses)
 
 int serial0input;
 
@@ -171,6 +236,15 @@ void setup() {
         continue;
     }
 
+    // AMT203S absolute encoder on COM-1 as an SPI master (mode 0 per the AMT20
+    // datasheet: idle-low clock, sample on the leading edge).
+    // ponytail: mode 0 is what the datasheet specifies; if the bench read comes
+    // back as garbage/stuck, flip the phase to TRAIL_SAMPLE (mode 1) -- that pair
+    // is the only clocking knob to try, and I can't verify it without the hardware.
+    encoderPort.Mode(Connector::SPI);
+    encoderPort.Speed(ENC_SPI_HZ);
+    encoderPort.SpiClock(SerialDriver::SCK_LOW, SerialDriver::LEAD_SAMPLE);
+    encoderPort.PortOpen();
 
     calculateMotorAngles ();
 
@@ -247,13 +321,71 @@ void loop() {
       break;
   }
 
+    serviceFocusPulse();
+
     CheckMessages();
+
+    reportEncoder();
 
 }
 
  void SweepOnTrig(){
     SweepNeedsToStart=true;
  }
+
+// Enqueue a discrete N-pulse burst in direction dir (+1/-1). serviceFocusPulse()
+// plays it (and any already queued ahead of it) to completion, in order. Dropped
+// if the queue is full -- the host paces itself via settle-and-verify, so that
+// only happens under a runaway command stream.
+void startFocusBurst(int dir, int count){
+  if (count <= 0) return;
+  int next = (focusQTail + 1) % FOCUS_Q_LEN;
+  if (next == focusQHead) return;   // queue full: drop
+  focusQDir[focusQTail] = dir;
+  focusQCount[focusQTail] = count;
+  focusQTail = next;
+}
+
+// Advance the non-blocking discrete focus-pulse FIFO: when idle, dequeue the next
+// burst; within a burst, alternate ON (focusTimeIncrement ms) and GAP
+// (focusPulseGapMs ms) for each pulse; a trailing GAP separates back-to-back
+// bursts. Force-stops and flushes if the mode leaves M4/M5. Cheap enough to also
+// call inside the trigger busy-waits so pulses sequence promptly instead of
+// waiting for the next loop(). Wrap-safe deadline compare via signed subtraction.
+void serviceFocusPulse(){
+  if (mode != 4 && mode != 5){                  // left focus mode: stop and flush the queue
+    focusMotorPin.State(0);
+    focusPhase = FP_IDLE;
+    focusPulsesRemaining = 0;
+    focusQHead = focusQTail = 0;
+    return;
+  }
+  if (focusPhase == FP_IDLE){
+    if (focusQHead == focusQTail) return;       // nothing queued
+    focusPulseDir = focusQDir[focusQHead];      // dequeue the next burst
+    focusPulsesRemaining = focusQCount[focusQHead] - 1;   // this first pulse fires now
+    focusQHead = (focusQHead + 1) % FOCUS_Q_LEN;
+    focusMotorPin.State(focusPulseDir > 0 ? focusStrength : -focusStrength);
+    focusPhase = FP_ON;
+    focusPhaseEndTime = millis() + (uint32_t)focusTimeIncrement;
+    return;
+  }
+  if ((int32_t)(millis() - focusPhaseEndTime) < 0) return;  // current phase still running
+  if (focusPhase == FP_ON){
+    focusMotorPin.State(0);                                 // pulse done -> OFF gap
+    focusPhase = FP_GAP;
+    focusPhaseEndTime = millis() + focusPulseGapMs;
+  } else {                                                  // GAP done
+    if (focusPulsesRemaining > 0){
+      focusPulsesRemaining--;
+      focusMotorPin.State(focusPulseDir > 0 ? focusStrength : -focusStrength);
+      focusPhase = FP_ON;
+      focusPhaseEndTime = millis() + (uint32_t)focusTimeIncrement;
+    } else {
+      focusPhase = FP_IDLE;   // burst complete (incl. trailing gap) -> next call pulls the next
+    }
+  }
+}
 
 void CheckMessages() {
   //Check if there's an incoming message, if so read it  
@@ -301,20 +433,56 @@ void CheckMessages() {
           m5Index = 0;
         }
       }
+      if (incomingSerialMessage.startsWith("$W")){  //Set the mode-5 ground-test sweep angle (deg), e.g. "$W6*". A narrow sweep + many $P positions = small per-step angle so consecutive frames overlap and the host patch-tracker can follow (a wide 60 deg sweep jumps ~1.5 deg/frame and tracking fails). Leaving M5 restores the 60 deg flight sweep.
+        float requested = incomingSerialMessage.substring(2).toFloat();  //toFloat stops at the trailing '*'
+        if (requested < 1) { requested = 1; }
+        if (requested > 60) { requested = 60; }
+        m5SweepAngle = requested;
+        Serial.print(" M5 sweep angle (deg):");
+        Serial.println(m5SweepAngle);
+        if (mode==5) {  //apply live: recompute angles and restart the stepped sweep
+          calculateMotorAngles();
+          m5Index = 0;
+        }
+      }
       if (incomingSerialMessage.equals("$T*")){  //Mode 4, which is a focus adjustmet mode, allowing control of H-bridge driven focus motors. Locks servos in mid position and fires
         testClick();
+      }
+      if (incomingSerialMessage.startsWith("$FT")){  //Focus pulse time-increment in ms per '+'/'-' char, e.g. "$FT1*". Default 10 (normal AF). The backlash test drops it to 1 so it can scan sub-10ms open times to find the minimum move; it restores 10 afterwards. Clamped [1,100].
+        int reqInc = incomingSerialMessage.substring(3).toInt();  //toInt stops at the trailing '*'
+        if (reqInc < 1) { reqInc = 1; }
+        if (reqInc > 100) { reqInc = 100; }
+        focusTimeIncrement = reqInc;
+        Serial.print("Focus time increment ");
+        Serial.println(focusTimeIncrement);
+      }
+      if (incomingSerialMessage.startsWith("$SV")){  //Variable focus duty for the backlash/min-duty test, e.g. "$SV1200*". Lets the host drive GENTLER than str0 (below stiction) and ramp up to find the minimum duty that actually turns the shaft. Clamped to [0, str3].
+        int requested = incomingSerialMessage.substring(3).toInt();  //toInt stops at the trailing '*'
+        if (requested < 0) { requested = 0; }
+        if (requested > str3) { requested = str3; }  //never exceed the coarsest fixed level
+        focusStrength = requested;
+        Serial.print("Focus duty ");
+        Serial.println(focusStrength);
+      }
+      else if (incomingSerialMessage.equals("$S0*")){  //Extra-fine focus step: duty str0 (7000) at a 3 ms pulse -- the shortest reliable move.
+        Serial.println("Focus strength 0");
+        focusStrength = str0;
+        focusTimeIncrement = 3;  //fine step is a 3 ms pulse
       }
       if (incomingSerialMessage.equals("$S1*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
         Serial.println("Focus strength 1");
         focusStrength = str1;
+        focusTimeIncrement = 10;  //coarser steps use the normal 10 ms increment
       }  
       if (incomingSerialMessage.equals("$S2*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
         Serial.println("Focus strength 2");
         focusStrength = str2;
+        focusTimeIncrement = 10;
       }      
       if (incomingSerialMessage.equals("$S3*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
         Serial.println("Focus strength 3");
         focusStrength = str3;
+        focusTimeIncrement = 10;
       }
       if (incomingSerialMessage.equals("$C1*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
         Serial.println("Camera 1 set");
@@ -343,22 +511,13 @@ void CheckMessages() {
     if (incomingSerialMessage.startsWith("+")){  //Sends pulse command to currently selected focus motor in positive direction
       Serial.println(mode);
       if (mode==4 || mode==5) {
-        focusIncCount = incomingSerialMessage.length();
-        focusMotorPin.State(focusStrength);
-        for (int i=0; i<focusIncCount; i++){
-          delay(focusTimeIncrement);
-        }
-        focusMotorPin.State(0);
+        // N chars => N discrete pulses (on/gap), sequenced by serviceFocusPulse().
+        startFocusBurst(+1, incomingSerialMessage.length());
       }
     } 
     if (incomingSerialMessage.startsWith("-")){  //Sends pulse command to currently selected focus motor in negative direction
       if (mode==4 || mode==5) {
-        focusIncCount = incomingSerialMessage.length();
-        focusMotorPin.State(-focusStrength);
-        for (int i=0; i<focusIncCount; i++){
-          delay(focusTimeIncrement);
-        }
-        focusMotorPin.State(0);
+        startFocusBurst(-1, incomingSerialMessage.length());
       }
     }
     if (incomingSerialMessage.startsWith(">")){  //Lengthens time between pics in mode 4/5
@@ -472,6 +631,52 @@ void checkSerial0Message () {
   }
 }
 
+// One SPI byte to the AMT203S, releasing CS afterwards -- the AMT20 datasheet
+// requires the CS line be released after EVERY byte, not just per transaction.
+uint8_t encoderTransfer(uint8_t sendByte) {
+  encoderPort.SpiSsMode(SerialDriver::LINE_ON);   // assert CS (active low)
+  uint8_t data = encoderPort.SpiTransferData(sendByte);
+  encoderPort.SpiSsMode(SerialDriver::LINE_OFF);  // release CS
+  delayMicroseconds(10);                          // datasheet inter-byte guard
+  return data;
+}
+
+// Read the 12-bit absolute position (0..4095) from the AMT203S focus-shaft
+// encoder. Returns -1 if the encoder never echoes rd_pos within the retry budget
+// (e.g. not connected, wiring/level-shift fault) so a bad read is distinguishable
+// from a real 0 position.
+int readEncoderPosition() {
+  uint8_t data = encoderTransfer(ENC_RD_POS);
+  int tries = 0;
+  while (data != ENC_RD_POS && tries++ < ENC_ECHO_TRIES) {
+    data = encoderTransfer(ENC_NOP);  // encoder returns 0xA5 while it is busy
+  }
+  if (data != ENC_RD_POS) {
+    return -1;  // no acknowledgement -> read failed
+  }
+  int pos = (encoderTransfer(ENC_NOP) & 0x0F) << 8;  // MSB: only low 4 bits valid
+  pos |= encoderTransfer(ENC_NOP);                    // LSB
+  return pos;
+}
+
+// Poll the focus-shaft encoder and stream its absolute position to the host over
+// USB at a fixed cadence. Tagged "$ENC=<pos>*" so the capture app can parse it
+// without confusing it with the human-readable ack/debug lines; pos = -1 on a
+// failed read. Cadence is mode-gated (see encoderReportFast/SlowMs): fast in the
+// focus modes M4/M5 where AF consumes it, slow elsewhere so it doesn't spam the
+// log. (The blocking sweep modes also only run loop() between sweeps.)
+void reportEncoder() {
+  uint32_t interval = (mode == 4 || mode == 5) ? encoderReportFastMs : encoderReportSlowMs;
+  if (millis() - lastEncoderReport < interval) {
+    return;
+  }
+  lastEncoderReport = millis();
+  int pos = readEncoderPosition();
+  Serial.print("$ENC=");
+  Serial.print(pos);
+  Serial.println("*");
+}
+
 void EnableAndHome () { 
   //Cycle enable. This is defined in MSP to trigger a homing sequence
   motor0.EnableRequest(false);
@@ -489,16 +694,36 @@ void EnableAndHome () {
     {
       continue;
     }
+    Serial.print("  home wait "); Serial.print(millis() - startTime); Serial.println(" ms");
     //See which motor has homed, if at all
-    if (motor0.HlfbState() == MotorDriver::HLFB_ASSERTED){ 
+    bool m0Homed = (motor0.HlfbState() == MotorDriver::HLFB_ASSERTED);
+    bool m1Homed = (motor1.HlfbState() == MotorDriver::HLFB_ASSERTED);
+    if (m0Homed){
       M0Exists=true;
       Serial.println("M0 homing success");
     }
-    if (motor1.HlfbState() == MotorDriver::HLFB_ASSERTED){
+    if (m1Homed){
       M1Exists=true;
       Serial.println("M1 homing success");
     }
-    if ((motor0.HlfbState() != MotorDriver::HLFB_ASSERTED) && (motor1.HlfbState() != MotorDriver::HLFB_ASSERTED)) {
+    // A motor that did NOT assert HLFB within the timeout has FAILED to home.
+    // Leaving it enabled lets the ClearPath keep running its homing move -- the
+    // oblique "hunting endlessly / going bonkers". Disable it so the drive
+    // aborts the homing motion and holds still. (Disabling an absent motor is a
+    // harmless no-op.) If exactly ONE motor homed, the other is a real
+    // connected-but-faulted drive, so also flag the host.
+    if (!m0Homed) {
+      motor0.EnableRequest(false);
+      Serial.println("M0 homing FAILED - motor disabled to stop homing motion");
+    }
+    if (!m1Homed) {
+      motor1.EnableRequest(false);
+      Serial.println("M1 homing FAILED - motor disabled to stop homing motion");
+    }
+    if (m0Homed != m1Homed) {
+      Serial0.println("$Fault*");
+    }
+    if (!m0Homed && !m1Homed) {
       Serial.println("Motor homing failure");
     }
     if (M0Exists || M1Exists) {
@@ -516,6 +741,9 @@ void EnableAndHome () {
       Serial0.println("$Ready*");
       return;
     }
+    motor0.EnableRequest(false);  // homing failed within timeout -> stop the homing motion
+    Serial.println("M0 homing FAILED - motor disabled to stop homing motion");
+    Serial0.println("$Fault*");
   }
   
   if (M1Exists && !M0Exists) {  //This happens if it's known only oblique motor is connected
@@ -528,6 +756,9 @@ void EnableAndHome () {
       Serial0.println("$Ready*");
       return;
     }
+    motor1.EnableRequest(false);  // homing failed within timeout -> stop the homing motion
+    Serial.println("M1 homing FAILED - motor disabled to stop homing motion");
+    Serial0.println("$Fault*");
   }
 }
 
@@ -538,6 +769,7 @@ void Sweep(){
     int position0 = int(verticalAngles[i]*6400/360);
     int position1 = int(sweepAngleOblique*inputRes*i/(360*(Positions-1))+startAngle1);
     MoveAbsolutePosition(position0, position1);
+    if (sweepAborted) { sweepAborted = false; return; }  // safe-abort: stop this sweep now
     delay(mechDelayCurr);
     while ((millis()-lastFrameTime)<minTimeBetweenFrames){
 
@@ -570,9 +802,10 @@ void SweepStepM5(){
   int position0 = int(verticalAngles[m5Index]*6400/360);
   int position1 = int(sweepAngleOblique*inputRes*m5Index/(360*(Positions-1))+startAngle1);
   MoveAbsolutePosition(position0, position1);
+  if (sweepAborted) { sweepAborted = false; return; }  // safe-abort: stop this stepped sweep now
   delay(mechDelayCurr);
   while ((millis()-lastFrameTime)<minTimeBetweenFrames){
-
+    serviceFocusPulse();  // stop a finished focus pulse without waiting for next loop()
   }
   digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
   digitalWrite(eventPin, false);
@@ -595,7 +828,7 @@ void TakePicsInPlace(){
     //(minTimeBetweenFrames) for autofocus, instead of adding a fixed trailing
     //delay on top of the trigger pulse.
     while ((millis()-lastFrameTime)<picsInPlaceDelay){
-
+      serviceFocusPulse();  // stop a finished focus pulse without waiting for next loop()
     }
     digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
     lastFrameTime = millis();
@@ -692,8 +925,9 @@ void setupMotorsSlow() {
 
  void calculateMotorAngles () {
   Serial.println("calculating angles");
+  float span = (mode==5) ? m5SweepAngle : sweepAngleVertical;  //M5 ground test uses its own narrow, tunable sweep; flight sweeps keep the full 60 deg
   for (i=0; i<Positions; i++){
-    theta_deg = (sweepAngleVertical/2)-i*sweepAngleVertical/(Positions-1);
+    theta_deg = (span/2)-i*span/(Positions-1);
     theta = theta_deg * DEG_TO_RAD;
     // Initial guess (radians)
     alpha = 2*theta;
@@ -785,13 +1019,35 @@ bool MoveAbsolutePosition(int position0, int position1) {
 		}
 		Serial.println("Motion may not have completed as expected. Proceed with caution.");
 		Serial.println();
+		consecutiveMoveFaults++;
+		if (consecutiveMoveFaults >= maxMoveFaults) {
+			abortToSafeMode();
+		}
 		return false;
     } else {
+		consecutiveMoveFaults = 0;
 		//Serial.println("Move Done");
 		return true;
 	}
 
 
+}
+
+void abortToSafeMode() {
+  // A motor kept faulting through repeated enable-cycle clears. Rather than
+  // loop forever re-homing and re-faulting (the "bonkers" oblique behaviour),
+  // disable both motors, drop to mode 0 (which does not sweep on its own), and
+  // report it so the host/operator can investigate the drive or power-cycle.
+  // sweepAborted unwinds any sweep currently in progress (see Sweep/SweepStepM5).
+  Serial.println("SAFE ABORT: motor kept faulting; disabling motors, returning to mode 0.");
+  Serial0.println("$Fault*");
+  motor0.EnableRequest(false);
+  motor1.EnableRequest(false);
+  mode = 0;
+  i = 0;
+  SweepNeedsToStart = false;
+  sweepAborted = true;
+  consecutiveMoveFaults = 0;
 }
 
 void calculateSweepTime() {

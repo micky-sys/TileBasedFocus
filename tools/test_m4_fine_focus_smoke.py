@@ -37,13 +37,14 @@ def test_fine_tile_rgb_shape_and_targets_centre() -> None:
     patch = raw[y0 : y0 + th, x0 : x0 + tw]
     patch[::8, ::8] = 16000
 
-    rgb, result, crop_u16, overview_rgb = m4_fine_tile_rgb_from_frame(
+    rgb, result, crop_u16, overview_rgb, tile_bbox = m4_fine_tile_rgb_from_frame(
         raw,
         display_w=M4_FINE_DISPLAY_W,
         display_h=M4_FINE_DISPLAY_H,
         zoom=M4_FINE_ZOOM,
     )
 
+    assert len(tile_bbox) == 4 and tile_bbox[2] > tile_bbox[0]
     assert rgb.dtype == np.uint8 and rgb.ndim == 3 and rgb.shape[2] == 3
     assert overview_rgb.dtype == np.uint8 and overview_rgb.ndim == 3
     assert overview_rgb.shape[2] == 3
@@ -80,7 +81,7 @@ def test_fine_tile_no_demosaic_gray_rgb() -> None:
     x0 = (fw // 2 - tw // 2) & ~1
     raw[y0 : y0 + th, x0 : x0 + tw][::8, ::8] = 16000
 
-    rgb, _result, crop_u16, _ov = m4_fine_tile_rgb_from_frame(
+    rgb, _result, crop_u16, _ov, _bbox = m4_fine_tile_rgb_from_frame(
         raw,
         display_w=M4_FINE_DISPLAY_W,
         display_h=M4_FINE_DISPLAY_H,

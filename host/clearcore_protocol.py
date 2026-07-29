@@ -13,6 +13,7 @@ CMD_FOCUS_MODE = "$M4*"
 CMD_CAMERA_1 = "$C1*"
 CMD_CAMERA_2 = "$C2*"
 CMD_CAMERA_3 = "$C3*"
+CMD_STRENGTH_EXTRAFINE = "$S0*"  # focusStrength 3500 (V2_4+ firmware; autofocus)
 CMD_STRENGTH_COARSE = "$S1*"  # focusStrength 7000 in firmware
 CMD_STRENGTH_MEDIUM = "$S2*"  # 10000
 CMD_STRENGTH_FINE = "$S3*"  # 14000
@@ -40,8 +41,9 @@ def select_camera(index: int) -> bytes:
 
 
 def set_strength(level: int) -> bytes:
-    if level not in (1, 2, 3):
-        raise ValueError("strength level must be 1, 2, or 3")
+    # 0 = extra-fine (autofocus; needs V2_4+ firmware with the $S0* handler).
+    if level not in (0, 1, 2, 3):
+        raise ValueError("strength level must be 0, 1, 2, or 3")
     return line(f"$S{level}*")
 
 

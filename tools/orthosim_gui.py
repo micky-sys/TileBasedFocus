@@ -64,6 +64,7 @@ import orthosim_codec as codec  # noqa: E402
 from orthosim_core import (  # noqa: E402
     GroundTruthLogger,
     OrthoSimConfig,
+    scale_ticks,
     scroll_speed_screen_px_s,
     screen_gsd_cm,
     simulated_gsd_cm,
@@ -85,6 +86,11 @@ def build_date() -> str:
         return "unknown"
 
 
+def _fmt_dist(m: float) -> str:
+    """Compact ground-distance label: metres below 1 km, else km."""
+    return f"{m/1000.0:g} km" if m >= 1000.0 else f"{m:g} m"
+
+
 # ── Orthophoto tiling ────────────────────────────────────────────────────────
 class OrthoTile:
     __slots__ = ("x0", "y0", "w", "h", "pix")
@@ -100,8 +106,8 @@ class OrthoTile:
 class OrthoImage:
     """Load a (possibly very large) orthophoto and split into GPU-safe tiles."""
 
-    def __init__(self, path: Path) -> None:
-        img = self._load_rgb(path)
+    def __init__(self, path: Path, reduce: int = 1) -> None:
+        img = self._load_rgb(path, reduce)
         self.height, self.width = img.shape[:2]
         self.tiles: List[OrthoTile] = []
         for y0 in range(0, self.height, _TILE_MAX):
@@ -113,10 +119,22 @@ class OrthoImage:
                 qimg = QImage(sub.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
                 self.tiles.append(OrthoTile(x0, y0, w, h, QPixmap.fromImage(qimg)))
 
-    @staticmethod
-    def _load_rgb(path: Path) -> np.ndarray:
+    # 1/N-resolution decode flags: gigapixel orthos are far bigger than any
+    # screen, so decoding at 1/2..1/8 loads in seconds and uses a fraction of
+    # the RAM. Calibration stays exact as long as the caller scales the GSD by
+    # the same N (see main()).
+    _REDUCE_FLAG = {
+        1: cv2.IMREAD_COLOR,
+        2: cv2.IMREAD_REDUCED_COLOR_2,
+        4: cv2.IMREAD_REDUCED_COLOR_4,
+        8: cv2.IMREAD_REDUCED_COLOR_8,
+    }
+
+    @classmethod
+    def _load_rgb(cls, path: Path, reduce: int = 1) -> np.ndarray:
         # Prefer OpenCV (handles big TIFF/PNG/JPG); fall back to QImage.
-        arr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        flag = cls._REDUCE_FLAG.get(reduce, cv2.IMREAD_COLOR)
+        arr = cv2.imread(str(path), flag)
         if arr is not None:
             return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
         qimg = QImage(str(path))
@@ -178,6 +196,7 @@ class OrthoView(QOpenGLWidget):
         self._paused = False
         self._hud = bool(cfg.hud_enabled)
         self._calibration = False
+        self._scale = bool(getattr(cfg, "scale_enabled", False))
         self._seam_visible = False
 
         self._aruco = make_aruco_pixmaps(cfg.aruco_dict, cfg.fiducial_px)
@@ -250,6 +269,8 @@ class OrthoView(QOpenGLWidget):
         self._draw_ortho(p)
         if self._calibration:
             self._draw_calibration(p)
+        if self._scale:
+            self._draw_scale(p)
         self._draw_fiducials(p)
         self._draw_bar(p)
         if self._hud:
@@ -360,13 +381,21 @@ class OrthoView(QOpenGLWidget):
         vw = self.width()
         bh = self.cfg.bar_height_px
         margin = self.cfg.bar_margin_px
-        top = 0 if self.cfg.bar_edge == "top" else self.height() - bh
-        # keep the bar clear of the top fiducials if both are on top
-        if self.cfg.bar_edge == "top":
-            top = self.cfg.fiducial_px + self.cfg.fiducial_margin_px + 12
-        x0 = margin
-        x1 = vw - margin
+        s = self.cfg.fiducial_px
+        fm = self.cfg.fiducial_margin_px
+        # Share the fiducial row: sit the bar on the SAME line as the corner
+        # markers, in the gap between them, vertically centred on the marker
+        # band. Horizontally it clears each corner marker plus its 6 px quiet
+        # zone and a side margin, so neither occludes the other. This reclaims
+        # the ~fiducial-height stack the bar used to add below the markers.
+        band_top = fm if self.cfg.bar_edge == "top" else self.height() - fm - s
+        top = band_top + max(0, (s - bh) // 2)
+        clear = fm + s + 6 + margin
+        x0 = clear
+        x1 = vw - clear
         band_w = x1 - x0
+        if band_w <= 0:
+            return
         # background + quiet zones (mid gray band, black frame)
         p.fillRect(QRectF(x0 - 12, top - 6, band_w + 24, bh + 12), QColor(128, 128, 128))
         cell_w = band_w / n
@@ -387,7 +416,7 @@ class OrthoView(QOpenGLWidget):
                 f"sim camera GSD: {c_gsd:.4f} cm/cam-px (M={self.cfg.magnification:g})"
                 if c_gsd > 0 else "sim camera GSD: set --M from fiducial calibration"
             ),
-            "Up/Down speed  +/- zoom  Space pause  H hud  C calib  R reset  S save  Esc quit",
+            "Up/Down speed  +/- zoom  Space pause  H hud  C calib  G scale  R reset  S save  Esc quit",
         ]
         p.setFont(QFont("Consolas", 12))
         fm = p.fontMetrics()
@@ -428,6 +457,50 @@ class OrthoView(QOpenGLWidget):
             label = f"{bar_px:.0f} screen px (set --panel-pitch to label in mm)"
         p.drawText(int(ox), int(by + 34), label)
 
+    def _draw_scale(self, p: QPainter) -> None:
+        """Human-readable ground-distance ruler along the scroll axis.
+
+        Ticks land on round ground distances and scroll locked to the imagery,
+        so from the Iron661 image you can read cumulative distance / speed and
+        measure camera-px per known ground distance (i.e. the *effective* GSD,
+        which already includes screen distance + crop). High-contrast so the
+        camera can resolve it even from a cropped view. Toggle with 'G'.
+        """
+        z = self._zoom
+        gsd = self.cfg.ortho_gsd_cm
+        if z <= 0 or gsd <= 0:
+            return
+        px_per_m = (100.0 / gsd) * z
+        vertical = self._is_vertical()
+        axis_len = self.height() if vertical else self.width()
+        content_from_far = self.cfg.scroll_dir in ("up", "left")
+        ticks = scale_ticks(
+            self._distance_m, px_per_m, axis_len,
+            float(self.cfg.scale_target_px), content_from_far,
+        )
+        if not ticks:
+            return
+        thick = 48
+        p.setFont(QFont("Consolas", 11))
+        ink = QColor(255, 255, 0)
+        if vertical:
+            p.fillRect(QRectF(0, 0, thick, self.height()), QColor(0, 0, 0, 170))
+            for dist_m, c in ticks:
+                if not (-2 <= c <= axis_len + 2):
+                    continue
+                p.fillRect(QRectF(0, c - 1, 30, 2), ink)
+                p.setPen(ink)
+                p.drawText(6, int(c) - 4, _fmt_dist(dist_m))
+        else:
+            by = self.height() - thick
+            p.fillRect(QRectF(0, by, self.width(), thick), QColor(0, 0, 0, 170))
+            for dist_m, c in ticks:
+                if not (-2 <= c <= axis_len + 2):
+                    continue
+                p.fillRect(QRectF(c - 1, by, 2, 30), ink)
+                p.setPen(ink)
+                p.drawText(int(c) + 4, by + 44, _fmt_dist(dist_m))
+
     # ── input ────────────────────────────────────────────────────────────
     def keyPressEvent(self, e: QKeyEvent) -> None:  # noqa: N802
         k = e.key()
@@ -447,6 +520,8 @@ class OrthoView(QOpenGLWidget):
             self._hud = not self._hud
         elif k == Qt.Key.Key_C:
             self._calibration = not self._calibration
+        elif k == Qt.Key.Key_G:
+            self._scale = not self._scale
         elif k == Qt.Key.Key_R:
             self._scroll = 0.0
             self._distance_m = 0.0
@@ -500,6 +575,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--log", type=str, default=None,
                     help="ground-truth CSV output path (default: next to ortho)")
     ap.add_argument("--no-log", action="store_true", help="disable CSV ground-truth log")
+    ap.add_argument("--scale", action="store_true",
+                    help="start with the ground-distance ruler on (toggle: G)")
+    ap.add_argument("--reduce", type=int, choices=[1, 2, 4, 8], default=1,
+                    help="decode the ortho at 1/N resolution (much faster / less "
+                         "RAM for gigapixel files); GSD is scaled by N so "
+                         "calibration is unchanged")
     ap.add_argument("--windowed", action="store_true", help="windowed (not full-screen)")
     return ap.parse_args(argv)
 
@@ -523,11 +604,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.zoom = args.zoom
     if args.scroll_dir is not None:
         cfg.scroll_dir = args.scroll_dir
+    if args.scale:
+        cfg.scale_enabled = True
+    if args.reduce > 1:
+        # 1/N decode -> each ortho pixel now covers N x the ground; scale GSD to
+        # match so distance/scale/HUD stay correct.
+        cfg.ortho_gsd_cm *= args.reduce
 
     app = QApplication(sys.argv)
 
     ortho_path = Path(args.ortho)
-    ortho = OrthoImage(ortho_path)
+    print(f"[OrthoSim] loading {ortho_path} (reduce=1/{args.reduce}) ...", flush=True)
+    ortho = OrthoImage(ortho_path, reduce=args.reduce)
+    print(f"[OrthoSim] loaded {ortho.width}x{ortho.height} px "
+          f"({len(ortho.tiles)} tiles)", flush=True)
 
     logger: Optional[GroundTruthLogger] = None
     if not args.no_log and cfg.csv_log_hz > 0:
@@ -538,11 +628,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     win = OrthoSimWindow(ortho, cfg, logger)
     if args.windowed:
-        win.resize(1280, 800)
+        # Fit the window inside the available screen and pin it to the top-left.
+        # A fixed 1280x800 on a smaller/virtual display (e.g. an 800x800 remote
+        # session) overflows and lands mostly off-screen, so it looks like
+        # nothing launched even though paintGL is happy.
+        scr = app.primaryScreen().availableGeometry()
+        win.resize(min(1280, scr.width()), min(800, scr.height()))
+        win.move(scr.x(), scr.y())
         win.show()
+        win.raise_()
+        win.activateWindow()
     else:
         win.showFullScreen()
         win.setCursor(Qt.CursorShape.BlankCursor)
+    print(f"[OrthoSim] window shown, geometry={win.geometry().getRect()}, "
+          f"visible={win.isVisible()}", flush=True)
 
     try:
         rc = app.exec()

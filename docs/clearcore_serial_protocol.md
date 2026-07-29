@@ -36,13 +36,20 @@ Source sketch: [Parallax_CLRCR_V2_2_copy_20260405110355.ino](../Parallax_CLRCR_V
 
 ## Focus step strength (H-bridge drive level)
 
-| Command | `focusStrength` (firmware) |
-|--------|----------------------------|
-| `$S1*` + newline | `str1` = **7000** |
-| `$S2*` + newline | `str2` = **10000** |
-| `$S3*` + newline | `str3` = **14000** |
+Each strength command sets **both** the H-bridge duty (`focusStrength`) **and** the
+pulse time increment (`focusTimeIncrement`, ms per `+`/`-` char):
 
-Firmware prints e.g. `Focus strength 1` on `Serial` when these are received. Map these to coarse / medium / fine in the host UI as you prefer.
+| Command | `focusStrength` (duty) | `focusTimeIncrement` |
+|--------|------------------------|----------------------|
+| `$S0*` + newline | `str0` = **7000** | **3** ms |
+| `$S1*` + newline | `str1` = **7000** | **10** ms |
+| `$S2*` + newline | `str2` = **10000** | **10** ms |
+| `$S3*` + newline | `str3` = **14000** | **10** ms |
+
+`$S0*` is the **extra-fine** step: duty 7000 at a **3 ms** pulse — the shortest move
+that reliably turns the shaft on this rig (below it the motor only buzzes). Selecting
+`$S1*`–`$S3*` restores the normal **10 ms** increment. Firmware prints e.g.
+`Focus strength 0` on `Serial` when these are received.
 
 ## Focus nudge (modes 4 and 5)
 
@@ -51,12 +58,19 @@ Lines that **start with** `+` or `-` (after optional `$…` handling — see bel
 - **`+`…** — positive H-bridge pulse on the **currently selected** camera’s focus motor.
 - **`-`…** — negative pulse.
 
-Pulse duration is `focusIncCount * focusTimeIncrement` ms, where:
+A line of **N** `+` (or `-`) characters fires **N discrete pulses**: each pulse drives
+the H-bridge ON for `focusTimeIncrement` ms, then OFF for a fixed **~12 ms gap**, repeated
+N times. Sequenced non-blocking by `serviceFocusPulse()` so the trigger keeps firing.
 
-- `focusIncCount` = **length of the whole line string** (number of characters before `\n`).
-- `focusTimeIncrement` = **10** ms.
+- `focusTimeIncrement` = ON time per pulse, set by the last strength command (**3** ms after `$S0*`, **10** ms after `$S1*`–`$S3*`); also settable directly via **`$FT<n>*`** (clamp `[1,100]`).
+- The OFF gap lets the shaft coast to rest between pulses, so each pulse is ~**one calibrated increment** (≈24 encoder counts at `$S0*`).
 
-So a single `+\n` is one `+` → length 1 → **10 ms** per pulse. The firmware also allows multiple characters on one line (e.g. `+++\n` → **30 ms** in one command); that was useful for **bench testing**, but **in flight the host should send only a single `+` or `-` per line** (one nudge per key press / action). Same idea for `-`.
+So after `$S0*`, `+\n` is one 3 ms pulse; `++++\n` is **four** 3 ms pulses (~4×24 counts),
+NOT one continuous 12 ms drive. This matters because a continuous burst let the motor
+accelerate to several rev/s, which made counts/pulse nonlinear **and** spun the shaft past
+half a revolution between the 10 Hz `$ENC` samples — aliasing the host's absolute-encoder
+unwrap so it dropped whole revolutions. Discrete pulses keep counts/pulse linear and the
+encoder trackable, so the autofocus host can safely send a multi-char move as one line.
 
 If not in mode 4 **or mode 5**, `+` / `-` lines are ignored for motion (no pulse). Mode 5
 (ground test) accepts the same focus nudges so host autofocus can run while the mirrors
@@ -107,10 +121,10 @@ Use these for logging; do not rely on a rigid binary ACK unless you tighten the 
 $M4*\n          → focus adjustment mode (after stop + re-home in current firmware)
 $C1*\n          → camera 1
 $S2*\n          → medium strength
-+\n             → one + nudge (flight: use single + per line)
--\n             → one − nudge (flight: use single − per line)
++\n             → one + pulse (N chars → N discrete pulses, 3/10 ms on + ~12 ms gap each)
+-\n             → one − pulse
 >\n             → +50 ms inter-frame delay (max 1500 in FW)
 <\n             → −50 ms inter-frame delay (min 209 = camera max FPS)
 ```
 
-(Bench only: multiple `+` or `-` on one line lengthens the pulse; not used in flight.)
+(Multiple `+` or `-` on one line = that many discrete pulses; the autofocus host uses this to move a known number of increments in one command.)

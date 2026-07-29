@@ -34,7 +34,7 @@ from typing import Optional
 import serial_comm
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtGui import QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -59,10 +59,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .autofocus import AutoFocusController
+from .autofocus import AutoFocusController, FineFocusTracker
+from .autofocus import focus_measure_full_res as af_full_res_measure
+from .autofocus_v2 import AutoFocusConfigV2
+from .kyfg_backend import KyfgCamera
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
 from .file_naming import sanitize_project_name
+from .focus_csv_log import FocusCsvLogger
 from .focus_panel import FocusPanel, _crop_pixmap_center
 from .gps_correlator import GpsCorrelator
 from .gps_receiver import GpsReceiver
@@ -582,6 +586,29 @@ class _PipelineWarmupWorker(QThread):
 # ---------------------------------------------------------------------------
 
 
+def _is_pcb_pulse_noise(line: str) -> bool:
+    """True for the PCB's routine motor-pulse chatter (``ack: +++``/``ack: ---``
+    and the bare mode-echo digit it prints after each pulse).
+
+    Autofocus dithers the lens continuously, so the PCB echoes an ack per pulse
+    command -- tens of lines/second during an M5 run. Logging each one appends to
+    the GUI widget AND does a synchronous write to the session-log file (which lives
+    on the Google-Drive-backed workspace), on the GUI thread, so the flood stalled
+    the UI to a freeze. These lines carry no diagnostic value the ``af-servo`` /
+    ``af-raw`` logs don't already have, so they are dropped from the human log.
+    Control lines (``Swp#``, ``Mode 5:``, ``ack: $M5*``, homing banners, etc.) are
+    NOT matched and still log + drive mode sync."""
+    s = line.strip()
+    if s.startswith("$ENC="):  # encoder position stream: the tracker consumes it on
+        return True            # the reader thread; logging every reading just spams
+    if s.isdigit():  # bare mode-echo (e.g. "5") printed after servicing a pulse
+        return True
+    if s.startswith("ack:"):
+        cmd = s[4:].split(";", 1)[0].strip()  # acked command chars before "; A#..."
+        return cmd != "" and all(c in "+-" for c in cmd)  # only +/- pulse acks
+    return False
+
+
 class MainWindow(QMainWindow):
     """Top-level window: mode bar, project header, camera rows, preview, log."""
 
@@ -653,6 +680,12 @@ class MainWindow(QMainWindow):
         self._raw_focus_drops_not_in_m4 = 0
         self._raw_focus_drops_wrong_cam = 0
         self._raw_focus_forwarded = 0
+        self._fine_tracker = FineFocusTracker()
+        # Latest Fine tile bbox the acquisition auto-picked (updated per frame), and
+        # the ROI pinned by "Lock tile" (freezes that tile; the focus-telemetry
+        # scatter/CSV score that tile as the operator creeps focus).
+        self._last_fine_tile_roi: Optional[tuple[int, int, int, int]] = None
+        self._locked_fine_roi: Optional[tuple[int, int, int, int]] = None
 
         self._pending_mode_apply: Optional[Mode] = None
         self._pending_mode_timer: Optional[QTimer] = None
@@ -1548,7 +1581,15 @@ class MainWindow(QMainWindow):
         for box in non_critical_boxes:
             box.setVisible(not in_m4)
 
-        self._log_box.setVisible(not in_m4 and self._log_visible)
+        show_log = not in_m4 and self._log_visible
+        self._log_box.setVisible(show_log)
+        if show_log and self._below_cam_splitter.sizes()[0] <= 0:
+            # Leaving M4 with the log toggled on: the splitter is still collapsed to
+            # [0, total] from when the log was hidden, so just un-hiding the box leaves
+            # it a thin sliver. Restore its saved width.
+            self._below_cam_splitter.setSizes(
+                self._below_cam_split_saved or [400, 880]
+            )
         if hasattr(self, "_log_toggle_btn"):
             self._log_toggle_btn.setVisible(not in_m4)
             self._log_toggle_btn.blockSignals(True)
@@ -2077,6 +2118,8 @@ class MainWindow(QMainWindow):
         self._focus_panel.focus_submode_changed.connect(
             self._on_focus_submode_changed
         )
+        self._focus_panel.fine_lock_changed.connect(self._on_fine_lock_changed)
+        self._focus_panel.csv_log_toggled.connect(self._on_csv_log_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2087,12 +2130,75 @@ class MainWindow(QMainWindow):
         # Autofocus controller (M4). Drives the relay-selected focus motor via
         # the serial client; gated to M4 + connected PCB. ``AutoFocusController``
         # is None only if PySide6 is unavailable (never in the GUI).
+        # Latest full-res crop of the AF winning tile (pushed by the active
+        # pipeline during a run) so autofocus can score focus at full resolution.
+        self._af_fullres_crop = None
+        self._af_fullres_seq = 0    # bumped on every fresh full-res crop
+        self._af_scored_seq = -1    # seq of the crop last handed to the engine
+        self._af_fresh_ct = 0       # diag: scores that used a fresh full-res crop
+        self._af_stale_ct = 0       # diag: scores that fell back (no fresh crop)
+        self._af_full_res_cams: set[int] = set()
+        # Manual-backlash focus telemetry: per-frame (encoder, locked-tile score)
+        # feeding the bottom-left scatter and, while toggled on, a CSV log.
+        self._focus_frame_ct = 0
+        self._focus_csv = None       # FocusCsvLogger while "Log CSV" is ticked
+        # Calibrated on-rig (HANDOFF 23.6): str0 moves ~24 encoder counts per 3 ms
+        # pulse and the motor->lens gear lash is ~1290 counts. Feed both to the v2
+        # sweep-and-hold engine so the EncoderAxis lands in real motor units instead
+        # of the 1.0 counts/pulse + 3-pulse placeholders it defaults to. Units below
+        # are pulse-equivalent (1 unit = |counts_per_pulse| counts). The SIGN encodes
+        # polarity. Measured clean on-rig (discrete-pulse firmware, non-aliased
+        # $ENC): a run commanded DOWN to the sweep floor (target=-120) drove the
+        # encoder UP (+37..+1128) into the end stop -- i.e. a '-' pulse raises the
+        # count, so a '+' pulse LOWERS it, so counts_per_pulse is NEGATIVE. With
+        # -24, ``position = (raw-origin)/cpp`` increases on a '+' drive as move_to /
+        # park_upward assume; the earlier +24 inverted that and made every "move
+        # down" run away upward into the stop ("how is this in focus?").
+        # reverify=0 => land and hold (atmospheric lens is static for hours); the
+        # trigger runs it one-shot (see _on_autofocus_requested).
+        af_counts_per_pulse = -24.0
+        af_lash_counts = 1290.0
+        # Dive-then-climb search: the operator hand-focuses to NEAR focus, then AF
+        # dives a fixed amount BELOW it fast (str3, 4 bursts), climbs back up in fine
+        # str0 steps sampling (encoder, score) once a frame, stops when the score has
+        # peaked-and-fallen, and parks UPWARD onto the peak (lash seated from below).
+        # No absolute-position servo -- fixed open-loop steps that just read the
+        # encoder -- so the ~10 Hz encoder lag can't make it oscillate (HANDOFF 23.7).
+        af_cfg = AutoFocusConfigV2(
+            strength=0,             # str0: the finest calibrated climb step (3 ms pulse)
+            dive_strength=3,        # str3: fast dive below focus
+            dive_bursts=4,          # 4 individual str3 pulses down (encoder re-checked between)
+            dive_burst_pulses=1,    # ONE str3 pulse per burst -> the dive is 4 str3 pulses total
+            dive_min_drop_pulses=3, # just confirm the 4-pulse dive actually moved down
+            climb_step_pulses=2,    # str0 pulses/frame on the way up (fine)
+            climb_settle_frames=3,  # DEBUG: take 3 frames/step, score the settled last one (kills motion lag)
+            encoder_counts_per_pulse=af_counts_per_pulse,
+            # 1.7x margin over the measured ~1290-count lash: park_upward only lands the
+            # lens on focus when its down-then-up excursion EXCEEDS the true dead-band.
+            # Overshooting the lash is free (costs a little park time); undershooting
+            # leaves the lens stuck where the climb overshot -> parks soft (ratio 0.28).
+            backlash_pulses=int(round(1.7 * af_lash_counts / abs(af_counts_per_pulse))),
+            reverify_interval_s=0.0,
+            # Do NOT slam the trigger cadence to minimum: that legacy dither-servo
+            # trick starves the AMT203S SPI read (encoder returned $ENC=-1 / froze at
+            # 0 through the whole dive on-rig), and this engine paces itself + relies
+            # on the encoder every frame anyway.
+            drive_cadence_to_min=False,
+            # DEBUG: pause at every phase boundary and wait for SPACE. Lets us confirm
+            # where the motor actually lands between phases (e.g. does the post-climb
+            # descend fling it to end-of-travel?). Set False for normal one-shot AF.
+            step_gate=False,
+        )
         self._autofocus = (
             AutoFocusController(
                 self._serial,
                 self._modes,
                 select_camera_cb=self._on_focus_panel_camera_chosen,
                 set_roi_cb=self._set_active_focus_roi,
+                full_res_score_cb=self._af_full_res_score,
+                config=af_cfg,
+                encoder_read=lambda: self._serial.encoder_position,
+                encoder_present=lambda: self._serial.encoder_present,
             )
             if AutoFocusController is not None
             else None
@@ -2105,9 +2211,19 @@ class MainWindow(QMainWindow):
                 self._on_autofocus_all_requested
             )
             self._focus_panel.autofocus_stop_requested.connect(self._autofocus.stop)
+            self._focus_panel.autofocus_algorithm_changed.connect(
+                self._autofocus.set_algorithm
+            )
             self._autofocus.status.connect(self._on_autofocus_status)
             self._autofocus.finished.connect(self._on_autofocus_finished)
             self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
+            self._autofocus.sample.connect(self._on_af_sample)
+            # DEBUG step-gate: SPACE releases the AF engine's per-phase pause so the
+            # operator can inspect encoder/image between phases (app-wide so it fires
+            # regardless of which widget has focus).
+            self._af_step_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+            self._af_step_shortcut.setContext(Qt.ApplicationShortcut)
+            self._af_step_shortcut.activated.connect(self._autofocus.step)
         focus_host = QWidget()
         focus_layout = QVBoxLayout(focus_host)
         focus_layout.setContentsMargins(0, 0, 0, 0)
@@ -2203,6 +2319,7 @@ class MainWindow(QMainWindow):
 
     def _build_log(self) -> QWidget:
         box = QGroupBox("Log")
+        box.setMinimumWidth(300)  # never let the splitter squeeze it to a sliver
         layout = QVBoxLayout(box)
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(2)
@@ -2240,6 +2357,7 @@ class MainWindow(QMainWindow):
         # automatically, the same way ``preview_ready`` already works.
         pipeline.acq.raw_focus_frame.connect(self._on_raw_focus_frame_slot)
         pipeline.acq.raw_focus_tile_rgb.connect(self._on_raw_focus_tile_rgb_slot)
+        pipeline.acq.raw_focus_roi_u16.connect(self._on_raw_focus_roi_u16_slot)
         pipeline.acq.failed.connect(self._on_pipeline_failed_slot)
         pipeline.acq.log_line.connect(self._log)
         # AcquisitionThread now owns the drop counter (the writer is a
@@ -2462,7 +2580,11 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_serial_line(self, line: str) -> None:
-        self._log(f"PCB< {line}")
+        # Drop the per-pulse motor ack flood (see _is_pcb_pulse_noise): logging it
+        # per line synchronously writes the Google-Drive session log on the GUI
+        # thread and froze the UI during M5 autofocus. Control lines still log below.
+        if not _is_pcb_pulse_noise(line):
+            self._log(f"PCB< {line}")
         if self._pending_end_line and line.lstrip().startswith("Swp#"):
             self._finalize_end_line()
             return
@@ -2957,6 +3079,7 @@ class MainWindow(QMainWindow):
                 )
             except Exception as exc:
                 self._log(f"select_camera failed: {exc}")
+        self._fine_tracker.reset()
         self._sync_fine_focus_to_pipelines()
         self._sync_preview_sensor_fields()
 
@@ -3041,22 +3164,90 @@ class MainWindow(QMainWindow):
         self._sync_preview_sensor_fields()
 
     def _sync_fine_focus_to_pipelines(self) -> None:
-        """Enable full-res + Fine tap only on the active preview camera in M4."""
+        """Enable full-res Fine tap on the active preview camera in M4/M5."""
         sub = self._modes.focus_submode()
         active = self._active_pipeline()
         an = active.camera_number if active is not None else None
         want = (
-            self._modes.is_focus_mode()
+            self._modes.is_af_mode()
             and sub == FocusSubMode.FINE
             and an is not None
         )
         for p in self._pipelines:
             p.set_fine_focus(want and p.camera_number == an)
 
+    def _reset_fine_tracker(self) -> None:
+        self._fine_tracker.reset()
+        p = self._active_pipeline()
+        if p is not None:
+            try:
+                p.set_focus_roi(None)
+            except Exception as exc:
+                self._log(f"set_focus_roi(clear) failed: {exc}")
+
+    def _update_fine_leading_edge(self, pipeline: CameraPipeline, coarse_raw) -> None:
+        """Track a leading-edge tile on coarse frames; pin Fine tap to full-res ROI."""
+        roi_coarse = self._fine_tracker.update(coarse_raw)
+        scale = KyfgCamera.SUBSAMPLE_FACTOR
+        try:
+            if roi_coarse is None:
+                pipeline.set_focus_roi(None)
+            else:
+                pipeline.set_focus_roi(
+                    tuple(int(v * scale) for v in roi_coarse)
+                )
+        except Exception as exc:
+            self._log(f"set_focus_roi failed: {exc}")
+
     def _on_focus_submode_changed(self, sub: FocusSubMode) -> None:
         self._modes.set_focus_submode(sub)
+        # Coarse<->Fine is a different scene/score scale, so the old score-vs-encoder
+        # trace no longer belongs to what we're looking at: dump it and start anew.
+        self._focus_panel.focus_scatter_clear()
+        if sub == FocusSubMode.COARSE:
+            self._reset_fine_tracker()
+            # A pinned tile belongs to the Fine scene we just left; drop it so a
+            # stale ROI isn't scored against the coarse view.
+            self._locked_fine_roi = None
+            self._last_fine_tile_roi = None
+            self._focus_panel.reset_lock_tile()
+        else:
+            self._fine_tracker.reset()
         self._sync_fine_focus_to_pipelines()
         self._sync_fine_demosaic_to_pipelines()
+
+    @Slot(bool)
+    def _on_fine_lock_changed(self, locked: bool) -> None:
+        """Freeze/unfreeze the Fine tile (Lock tile checkbox).
+
+        In Fine view the acquisition auto-picks a new best tile every frame, which
+        hops on sensor noise. Locking pins the current tile's ROI on the pipeline so
+        the acquisition crops that exact patch (``m4_roi_tile_rgb_from_frame``); the
+        focus-telemetry scatter/CSV then score that patch as the operator creeps
+        focus. Unlocking returns to auto-pick."""
+        active = self._active_pipeline()
+        if active is None:
+            self._log("Lock tile: no active camera.")
+            return
+        if locked:
+            roi = self._last_fine_tile_roi
+            if roi is None:
+                self._log("Lock tile: no Fine tile yet -- switch to Fine view first.")
+                return
+            self._locked_fine_roi = roi
+            try:
+                active.set_focus_roi(roi)
+            except Exception as exc:
+                self._log(f"Lock tile: set_focus_roi failed: {exc}")
+                return
+            self._log(f"Lock tile: ON (pinned {roi}).")
+        else:
+            self._locked_fine_roi = None
+            try:
+                active.set_focus_roi(None)
+            except Exception as exc:
+                self._log(f"Lock tile: clear failed: {exc}")
+            self._log("Lock tile: OFF (auto-pick).")
 
     def _sync_fine_demosaic_to_pipelines(self) -> None:
         """Apply focus-panel Debayer checkbox to every acquisition thread."""
@@ -3074,23 +3265,203 @@ class MainWindow(QMainWindow):
     # ── autofocus (M4) ───────────────────────────────────────────────────
 
     def _set_active_focus_roi(self, roi) -> None:
-        """Pin (or clear) the fixed focus ROI on the active pipeline."""
+        """Show the autofocus winning-tile ROI as an overlay on the coarse
+        preview (AF runs in Coarse view, so the tile isn't otherwise visible),
+        and pin it (scaled to full-res coords) on the active pipeline so it ships
+        a full-res crop of that tile for AF to score focus on."""
+        try:
+            self._focus_panel.set_af_roi_overlay(roi)
+        except Exception as exc:
+            self._log(f"set_af_roi_overlay failed: {exc}")
         p = self._active_pipeline()
-        if p is not None:
+        if p is None:
+            return
+        try:
+            if roi is None:
+                p.set_focus_roi(None)
+            else:
+                self._af_enable_full_res(True)
+                scale = KyfgCamera.SUBSAMPLE_FACTOR
+                p.set_focus_roi(tuple(int(v * scale) for v in roi))
+        except Exception as exc:
+            self._log(f"AF set_focus_roi failed: {exc}")
+
+    def _af_enable_full_res(self, enable: bool) -> None:
+        """Turn full-res emission on (active camera) / off (all AF cameras).
+
+        AF runs in Coarse view, where full-res emission is normally off; it must
+        be on for the pipeline to ship the full-res winning-tile crop. Tracked
+        per camera so "Auto-focus all" cleans up whichever cameras it touched."""
+        if enable:
+            p = self._active_pipeline()
+            if p is not None:
+                # Force emission ON every time, NOT just when the cam isn't already
+                # tracked: switching Fine->Coarse (which _force_focus_coarse does at AF
+                # start) calls set_fine_focus(False) -> set_full_res_emission(False),
+                # turning it OFF underneath us. The old `not in _af_full_res_cams` skip
+                # then left emission off for the whole run, so AF scored the weak
+                # decimated preview instead of the full-res crop and walked a good manual
+                # focus into blur (fresh=1/1004 in the log). set_full_res_emission is
+                # idempotent, so re-asserting it is cheap and correct.
+                try:
+                    p.set_full_res_emission(True)
+                    self._af_full_res_cams.add(p.camera_number)
+                except Exception as exc:
+                    self._log(f"AF full-res on failed: {exc}")
+            return
+        for p in self._pipelines:
+            if p.camera_number in self._af_full_res_cams:
+                try:
+                    p.set_full_res_emission(False)
+                    p.set_focus_roi(None)
+                except Exception as exc:
+                    self._log(f"AF full-res off failed: {exc}")
+        self._af_full_res_cams.clear()
+        self._af_fullres_crop = None
+        self._af_scored_seq = -1
+
+    def _on_raw_focus_roi_u16_slot(self, crop, ts_iso: str) -> None:
+        """Buffer the latest full-res winning-tile crop for AF full-res scoring.
+        Runs on the GUI thread (queued), same thread as ``feed_frame``, so the
+        buffer needs no lock.
+
+        The crop is *usually* emitted 1:1 with the coarse focus-tap frame the
+        engine scores, but the full-res emission path can stall mid-run (seen
+        live as a frozen constant AF score while the preview kept updating, so
+        AF gave up at pos 0). We tag each crop with a sequence number so
+        :meth:`_af_full_res_score` can tell a fresh crop from a stale one."""
+        self._af_fullres_crop = crop
+        self._af_fullres_seq += 1
+        # Feed the Zoom-tile view the same full-res crop AF scores, so its green
+        # plane is shown at true resolution (not the 4x preview decimated again).
+        try:
+            self._focus_panel.set_af_fullres_crop(crop)
+        except Exception:
+            pass
+        self._maybe_save_af_crop(crop, ts_iso)
+
+    def _maybe_save_af_crop(self, crop, ts_iso: str) -> None:
+        """Debug aid: while an AF run is in progress AND 'Save focus view' is
+        checked, dump every winning-tile crop through the normal focus-capture
+        writer, so the whole hunt can be reviewed frame-by-frame afterwards (e.g.
+        'AF reached a good picture then moved away'). M4/focus-mode only, since that
+        is what ``submit_focus_capture`` gates on.
+
+        We save the GREEN sub-grid (crop[0::2, 1::2]) -- exactly the mosaic-free
+        pixels ``focus_measure_full_res`` scores -- not the raw Bayer crop. The raw
+        crop shows an RGGB 'checkerboard' in a viewer that makes focus impossible to
+        eyeball; the green sub-grid is what AF actually optimises, so the saved
+        image matches the score."""
+        if self._autofocus is None or not self._autofocus.is_running():
+            return
+        if not self._focus_panel.is_save_focus_enabled():
+            return
+        if crop is None or getattr(crop, "ndim", 0) != 2:
+            return
+        pipe = self._active_pipeline()
+        if pipe is None:
+            return
+        green = crop[0::2, 1::2].copy()  # mosaic-free green plane the metric scores
+        try:
+            when = _dt.datetime.fromisoformat(ts_iso)
+        except Exception:
+            when = None
+        pipe.submit_focus_capture(green, when=when)
+
+    def _af_full_res_score(self, _roi) -> Optional[float]:
+        """Full-res focus score for the AF winning tile: Laplacian variance of
+        the latest full-res crop pushed by the pipeline. Returns None when no
+        FRESH crop is available -- either none yet, or the emission path stalled
+        and the buffer is stale -- so the engine falls back to the always-fresh
+        decimated tap (which the sim tests prove converges) instead of scoring a
+        frozen crop and stalling at pos 0."""
+        crop = self._af_fullres_crop
+        if crop is None or self._af_fullres_seq == self._af_scored_seq:
+            self._af_stale_ct += 1
+            return None
+        self._af_scored_seq = self._af_fullres_seq
+        self._af_fresh_ct += 1
+        return af_full_res_measure(crop)
+
+    @Slot(bool)
+    def _on_csv_log_toggled(self, on: bool) -> None:
+        """Open/close the focus-telemetry CSV logger from the 'Log CSV' toggle."""
+        if on:
+            if self._focus_csv is not None:
+                return
+            self._focus_frame_ct = 0
+            self._focus_csv = FocusCsvLogger()
+            if self._focus_csv.path:
+                self._log(f"Focus CSV: logging to {self._focus_csv.path}")
+            else:
+                self._log("Focus CSV: could not open a log file (see stderr).")
+        else:
+            csv = self._focus_csv
+            self._focus_csv = None
+            if csv is not None:
+                csv.close()
+                self._log("Focus CSV: stopped.")
+
+    def _encoder_now(self) -> Optional[int]:
+        """Current motor-shaft encoder count, or None if no encoder is streaming."""
+        if self._serial is None or not getattr(self._serial, "encoder_present", False):
+            return None
+        try:
+            return int(self._serial.encoder_position)
+        except Exception:
+            return None
+
+    def _on_af_sample(self, pulses: int, score: float, fine: bool = False) -> None:
+        """One settled AF measurement -> both overlay graphs. The telemetry graph
+        (bottom-right) plots the read-back ENCODER COUNT (falling back to commanded
+        pulses only when no encoder streams); the score-vs-encoder scatter
+        (top-right) gets the same point so it stays live during an AF run, not just
+        during the manual creep workflow."""
+        enc = self._encoder_now()
+        x = enc if enc is not None else int(pulses)
+        self._focus_panel.af_graph_add_sample(x, float(score), bool(fine))
+        if enc is not None:
+            self._focus_panel.focus_scatter_add_point(enc, float(score))
+
+    def _emit_focus_telemetry(
+        self, score, ts_iso: Optional[str] = None, *, to_csv: bool = True
+    ) -> None:
+        """Per-frame focus telemetry: push (encoder, score) to the score-vs-encoder
+        scatter, and -- only when ``to_csv`` and CSV logging is on -- write a row.
+        The scatter is fed every call so it stays live; ``to_csv`` is False when no
+        fixed patch is locked, since the backlash CSV needs the score to track ONE
+        patch (the forward/back hysteresis IS the backlash)."""
+        if score is None:
+            return
+        enc = self._encoder_now()
+        if enc is None:
+            return  # no encoder -> the X axis is meaningless; skip
+        try:
+            self._focus_panel.focus_scatter_add_point(enc, float(score))
+        except Exception as exc:
+            self._log(f"Focus telemetry: scatter update failed: {exc}")
+        if not to_csv:
+            return
+        csv = self._focus_csv
+        if csv is not None:
+            self._focus_frame_ct += 1
+            if ts_iso is None:
+                ts_iso = _dt.datetime.now().isoformat(timespec="milliseconds")
             try:
-                p.set_focus_roi(roi)
+                csv.write_row(ts_iso, self._focus_frame_ct, enc, float(score))
             except Exception as exc:
-                self._log(f"set_focus_roi failed: {exc}")
+                self._log(f"Focus CSV: write failed: {exc}")
 
     def _force_focus_coarse(self) -> None:
         """Autofocus consumes the coarse decimated tap, so ensure Coarse view."""
         if self._modes.focus_submode() != FocusSubMode.COARSE:
             self._modes.set_focus_submode(FocusSubMode.COARSE)
             self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
+            self._reset_fine_tracker()
             self._sync_fine_focus_to_pipelines()
 
-    @Slot(bool)
-    def _on_autofocus_requested(self, assisted: bool) -> None:
+    @Slot()
+    def _on_autofocus_requested(self) -> None:
         if self._autofocus is None:
             return
         if not self._modes.is_af_mode():
@@ -3099,11 +3470,29 @@ class MainWindow(QMainWindow):
         if self._active_pipeline() is None:
             self._log("Autofocus: select a camera to preview first.")
             return
+        # Grab the tile Fine was showing BEFORE _force_focus_coarse() resets the tracker:
+        # the operator locked it while sharp, so AF should focus THAT (building/gantry)
+        # rather than re-pick on the blurry frame (which favours coarse bushes).
+        seed_roi = (self._fine_tracker.roi
+                    if self._modes.focus_submode() == FocusSubMode.FINE else None)
         self._force_focus_coarse()
-        self._autofocus.start_single(assisted=assisted)
+        hint = self._focus_panel.af_lead_hint()  # None|top|bottom|left|right|static
+        self._autofocus.config.full_frame_target = (hint == "static")
+        lead = None if hint in (None, "static") else hint
+        # M4 is the FLIGHT focus mode (moving scene); M5 is a BENCH simulation of flight
+        # (moving mirrors). The sweep-and-hold (v2) engine sweeps against the moving
+        # scene -- stitching per-object segments via the two-object handover into one
+        # score-vs-encoder curve -- then parks on the peak and STOPS (one-shot): the
+        # atmospheric lens it corrects is static for hours, so there is nothing to keep
+        # servoing; the operator re-triggers if focus drifts. The legacy dither servo
+        # has no such landing, so it stays continuous (picks its fast/slow profile from
+        # detected scene motion). Choose by the active algorithm, not the mode label.
+        one_shot = self._autofocus.algorithm == "sweep_and_hold"
+        self._autofocus.start_single(lead_edge_hint=lead, continuous=not one_shot,
+                                     seed_roi=seed_roi)
 
-    @Slot(bool)
-    def _on_autofocus_all_requested(self, assisted: bool) -> None:
+    @Slot()
+    def _on_autofocus_all_requested(self) -> None:
         if self._autofocus is None:
             return
         if not self._modes.is_af_mode():
@@ -3114,7 +3503,13 @@ class MainWindow(QMainWindow):
             self._log("Autofocus: no cameras online.")
             return
         self._force_focus_coarse()
-        self._autofocus.start_all(cams, assisted=assisted)
+        hint = self._focus_panel.af_lead_hint()  # None|top|bottom|left|right|static
+        self._autofocus.config.full_frame_target = (hint == "static")
+        lead = None if hint in (None, "static") else hint
+        # Profile follows detected motion inside the engine (see _on_autofocus_requested);
+        # both M4 (flight) and M5 (bench flight-sim) use the same tracking servo.
+        # Focus each camera once (servo runs until it first locks, then advances).
+        self._autofocus.start_all(cams, lead_edge_hint=lead)
 
     @Slot(str)
     def _on_autofocus_status(self, text: str) -> None:
@@ -3124,11 +3519,24 @@ class MainWindow(QMainWindow):
     @Slot(bool, dict)
     def _on_autofocus_finished(self, ok: bool, report: dict) -> None:
         self._log(f"autofocus finished: ok={ok} {report}")
+        self._log(
+            f"af full-res usage: fresh={self._af_fresh_ct} "
+            f"stale/fallback={self._af_stale_ct}"
+        )
+        self._af_fresh_ct = 0
+        self._af_stale_ct = 0
 
     @Slot(bool)
     def _on_autofocus_run_state(self, running: bool) -> None:
         self._focus_panel.set_autofocus_running(running)
         self._focus_panel.set_controls_locked(running)
+        if running:
+            self._focus_panel.af_graph_clear()  # fresh trace per run
+            self._focus_panel.focus_scatter_clear()  # score-vs-encoder starts anew per AF run
+        if not running:
+            # Run finished (or aborted): drop back to preview-only emission and
+            # clear the pinned ROI / stale full-res crop.
+            self._af_enable_full_res(False)
 
     def _active_pipeline(self) -> Optional[CameraPipeline]:
         """Return the pipeline whose preview radio is currently on, if any.
@@ -3172,6 +3580,11 @@ class MainWindow(QMainWindow):
         ``CameraPipeline`` the tap came from.
         """
         acq = self.sender()
+        # Release the conflation latch immediately so the acq thread can stage
+        # the NEXT frame while we process this one (bounds the 8 MB frame backlog
+        # to ~1 in flight -- the fix for the M4 memory-blowup crash).
+        if acq is not None and hasattr(acq, "note_focus_frame_consumed"):
+            acq.note_focus_frame_consumed()
         pipeline = next(
             (p for p in self._pipelines if p.acq is acq),
             None,
@@ -3199,14 +3612,25 @@ class MainWindow(QMainWindow):
         rgb,
         meta: dict,
     ) -> None:
-        if not self._modes.is_focus_mode():
+        if not self._modes.is_af_mode():
             return
         active = self._active_pipeline()
         if active is None or active.camera_number != pipeline.camera_number:
             return
         if self._modes.focus_submode() != FocusSubMode.FINE:
             return
+        # Remember the tile the operator sees so "Lock tile" can pin exactly it
+        # (the acquisition auto-picks a new best tile each frame otherwise).
+        self._last_fine_tile_roi = meta.get("tile_roi")
         self._focus_panel.receive_fine_tile_rgb(rgb, meta)
+        # Score-vs-encoder scatter is ALWAYS live in Fine (per-frame best tile),
+        # so it populates without a locked tile. CSV logging stays gated on a lock:
+        # the backlash log needs the score to track ONE fixed patch (not the
+        # per-frame auto-pick) so the forward/back hysteresis IS the backlash.
+        self._emit_focus_telemetry(
+            meta.get("best_score"),
+            to_csv=self._locked_fine_roi is not None,
+        )
 
     @Slot(str)
     def _on_pipeline_failed_slot(self, msg: str) -> None:
@@ -3233,9 +3657,6 @@ class MainWindow(QMainWindow):
                     f"(count={self._raw_focus_drops_not_in_m4}); ignored"
                 )
             return
-        if self._modes.focus_submode() == FocusSubMode.FINE:
-            # Fine uses ``raw_focus_tile_rgb``; ignore concurrent coarse tap.
-            return
         active = self._active_pipeline()
         if active is None or active.camera_number != pipeline.camera_number:
             self._raw_focus_drops_wrong_cam += 1
@@ -3246,6 +3667,9 @@ class MainWindow(QMainWindow):
                     f"active={act} (mismatch, count="
                     f"{self._raw_focus_drops_wrong_cam}); ignored"
                 )
+            return
+        if self._modes.focus_submode() == FocusSubMode.FINE:
+            self._update_fine_leading_edge(active, raw)
             return
         self._raw_focus_forwarded += 1
         if self._raw_focus_forwarded == 1 or (
@@ -3259,8 +3683,14 @@ class MainWindow(QMainWindow):
         # Feed the autofocus engine the coarse decimated frame for the active
         # camera (tracking + sharpness hill-climb run off this tap).
         af = getattr(self, "_autofocus", None)
-        if af is not None and af.is_running():
+        af_running = af is not None and af.is_running()
+        if af_running:
             af.feed_frame(raw)
+        else:
+            # Manual-backlash telemetry in Coarse view: score the pinned full-res
+            # crop (present only when a locked ROI persists into Coarse). Skipped
+            # during an AF run so we don't consume the crop the engine scores off.
+            self._emit_focus_telemetry(self._af_full_res_score(None), ts_iso)
 
     @Slot(QImage)
     def _on_preview_ready(self, qimg: QImage) -> None:
@@ -3465,6 +3895,17 @@ class MainWindow(QMainWindow):
             )
             if row is not None:
                 row.update_sweep(p.sweep.peek_position())
+        self._refresh_encoder_readout()
+
+    def _refresh_encoder_readout(self) -> None:
+        """Push the live encoder count to the M4/M5 focus panel (200 ms tick)."""
+        if self._serial is None or not getattr(self._serial, "connected", False):
+            text = "enc: --"
+        elif not self._serial.encoder_present:
+            text = "enc: absent"
+        else:
+            text = f"enc: {int(self._serial.encoder_position)}"
+        self._focus_panel.set_encoder_text(text)
 
     # ── Log + close ─────────────────────────────────────────────────────
 
@@ -3607,6 +4048,9 @@ class MainWindow(QMainWindow):
         if mode in (Mode.M4, Mode.M5):
             self._modes.set_focus_submode(FocusSubMode.COARSE)
             self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
+            self._reset_fine_tracker()
+        else:
+            self._reset_fine_tracker()
 
         for p in self._pipelines:
             p.sweep.reset()
@@ -3772,6 +4216,13 @@ class MainWindow(QMainWindow):
         try:
             if self._gps_receiver.connected:
                 self._gps_receiver.disconnect_port()
+        except Exception:
+            pass
+        # Close the focus-telemetry CSV if it's still open (Log CSV left on).
+        try:
+            if self._focus_csv is not None:
+                self._focus_csv.close()
+                self._focus_csv = None
         except Exception:
             pass
         # Flush + footer the human-readable session log last so it

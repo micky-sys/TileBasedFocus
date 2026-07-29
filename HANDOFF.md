@@ -1,6 +1,72 @@
 # Iron 661 Capture — Handoff Notes
 
-_Last updated: 2026-07-09 — first **autofocus ground-test session** (§18): ran the
+> **CRITICAL — M4 vs M5 (do not get this backwards):**
+> - **M4 is the FLIGHT focus mode** — the real, deployed autofocus. Its scene is
+>   **moving** (the aircraft flies over ground). On the **bench** it is exercised with a
+>   **static** scene only because we can't fly; that static bench case is a degenerate
+>   test, NOT what M4 is for.
+> - **M5 is a BENCH simulation of flight** — it moves the mirrors to fake the scene
+>   changing, so the flight tracking behaviour can be validated on the bench without
+>   flying. M5 is a proxy for M4-in-flight.
+> - **Consequence:** both M4 and M5 run the SAME flight AF algorithm (continuous
+>   tracking servo). The fast/slow servo profile must follow **detected scene motion**,
+>   never the mode label — keying "M4 = static" is WRONG (M4 in flight is moving).
+
+_Last updated: 2026-07-27 — **manual backlash telemetry (scrapped the automatic test)**:
+the automatic on-rig backlash probe was removed after it kept mis-measuring lash (per-frame
+sharpness noise + a 30 ms exposure faked an early "lens responded", giving implausible ~19-count
+readings). Deleted `host/capture/focus_probe.py` + `tools/test_backlash_measure.py` and stripped
+all backlash-test code from `app.py`/`focus_panel.py`/`focus_axis.py` + the `$SV`/`$FT` host
+wrappers (`serial_comm.py`, `serial_client.py`); the shared AF/Lock-tile/full-res-crop infra
+stays. Replaced it with a **manual workflow**: firmware `$S0*` now means the shortest reliable
+move — **duty 7000 at a 3 ms pulse** (str0=7000, and `$S0*` also sets `focusTimeIncrement=3`;
+`$S1*`–`$S3*` restore 10 ms) — so the operator locks a Fine tile, creeps focus with the Up/Down
+hotkeys, and reads the backlash straight off an **always-on bottom-left scatter** of focus score
+(Y) vs encoder count (X): the forward/back arms' horizontal gap IS the lash. A **"Log CSV"**
+toggle writes `timestamp, frame, encoder, focus_score` per locked-tile frame to a
+`Iron661_focus_<stamp>.csv` in the **Session logs** folder (`host/capture/focus_csv_log.py`).
+Per-frame telemetry is emitted from both focus-frame handlers via `MainWindow._emit_focus_telemetry`
+(Fine: `meta["best_score"]` when a tile is locked; Coarse: the pinned full-res crop score when AF
+isn't running). New check `tools/test_focus_csv_log.py` (3/3). **Requires a ClearCore reflash**
+for the new `$S0`/`focusTimeIncrement` behaviour. Previous: 2026-07-22 — **non-blocking focus pulses (timers, not delays) + AF servo/tile
+overhaul for M4-flight & M5-bench** (§24): the ClearCore now fires focus-motor pulses off a
+`millis()` timer serviced in `loop()` and inside the sweep busy-waits, so a `+`/`-` pulse no
+longer **blocks** the trigger cadence — this is what made the camera frame rate collapse (2.9 Hz
+vs the 4.8 Hz cap) and starved M5 during capture. Host AF was reworked to a **continuous dither
+servo** with motion-adaptive fast/slow profiles, coarse sweep-to-max escalation, a servo leash,
+a snap-back anchor, strong-peak lock and RProp adaptive step; tile ranking is now
+saturation-aware (scores unclipped detail only); and AF now **seeds its target from the Fine
+preview's held ROI** so it focuses the building/gantry you were looking at instead of re-picking
+bushes on a blurry frame. Timing instrumentation (`af-time` lag/`frame_dt`) and a selection-frame
+dump were added. `tools/test_autofocus.py` **27/27**. Previous: 2026-07-19 — **focus-encoder decision: motor-shaft AMT203S** (§23):
+decided to add an AMT203S-V absolute encoder on the DC-motor shaft to assist AF. It
+fixes the §22.1 no-move/stiction failure (verified motion + closed-loop motor
+positioning + a power-persistent absolute datum for focus presets), does **not** need
+to capture gear/spur lash (the contrast loop already compensates it via same-direction
+dither + direction-matched landing), and is chosen over the month-long gear-output
+remount and the draw-wire encoder. §23 also records the **flat-score disambiguation**
+(peak vs lash vs stiction vs defocus floor). Previous: 2026-07-12 — **autofocus metric/landing fixes + bench-box BSOD analysis**
+(§22): AF now uses a brightness-invariant, pre-blurred full-res metric (clean repeatable
+focus peak, no more static-scene score swings) and a **direction-matched landing** that
+approaches `best_pos` from the same side the search found it (closes the 13–35 %
+final-vs-best gap from open-loop gear lash). SHM pool auto-scales to RAM (24 @ 64 GB
+operational — unchanged; 8 @ 32 GB bench). **Three BSODs on the bench box (32 GB) are
+hardware/driver, not the app** — three different stop codes in one afternoon plus a
+year-long WDF_VIOLATION history predating all this work; run MemTest86. Operational 64 GB
+machine unaffected. Previous: 2026-07-12 — **oblique-motor "bonkers" homing root-caused** (§21): the
+capture-app-only homing failure was a **marginal 24 V supply** — under two-camera load
+the oblique couldn't reach its hard-stop torque threshold so HLFB never asserted (8 s
+timeout). Raising to nominal **28 V** fixed it (5/5 homing success, ~4.6 s). ClearCore
+firmware reflashed with kept **safe-abort** (a motor that fails to home / a sweep that
+keeps faulting now disables + drops to mode 0 instead of hunting forever) and the
+`home wait N ms` diagnostic. Previous: 2026-07-09 — **OrthoSim ground-distance ruler +
+fast-load** (§20):
+new human-readable scale (toggle **G** / `--scale`) locked to the imagery for reading
+distance/speed and effective GSD from the Iron661 image; new `--reduce {1,2,4,8}`
+decodes the gigapixel ortho at 1/N res (GSD auto-scaled) so it loads in seconds; window
+now fits the screen. Launch caveat: agent-spawned Qt apps inherit
+`QT_QPA_PLATFORM=offscreen` (invisible) — override with `windows` when launching for
+display. Previous: 2026-07-09 — first **autofocus ground-test session** (§18): ran the
 hardware-free simulator path (§14.7 layer 1); new `tools/af_ground_test.py` metrics
 sweep reports **54/54 runs converged** — the software baseline for the real rig.
 ClearCore reflashed 2026-07-09 (unblocks on-hardware M5); exposure/gain left unlocked
@@ -530,7 +596,7 @@ are clocked by frame arrivals plus a settle count.
 `assisted` (default True), `step_pulses` / `coarse_step_pulses`,
 `assisted_bracket_pulses` (max excursion per side in assisted mode),
 `max_total_pulses` (hard safety cap), `settle_frames`, `measure_frames`,
-`improve_frac` (min relative improvement to count as better), `patience`,
+`patience` (flat/declining steps before reversing/stopping; `best` advances on any real gain),
 `backlash_pulses` (extra pulses sent on every direction reversal — calibratable),
 `strength` (`$Sn` level used during a run), `min_texture_score` /
 `max_low_texture_frames`, `edge_band`, `drive_cadence_to_min`.
@@ -868,3 +934,460 @@ in M5 per §18; M5 forces coarse per §15.3). One-line functional change; no ref
 **Still open.** Camera 3 (`2439007`) failed to enumerate on every launch this session
 (only 2/3 cameras) — persistent, not the transient §6 hiccup; needs a physical
 CXP/power check on that camera.
+
+## 20. OrthoSim: ground-distance ruler, fast load, launch caveat (2026-07-09)
+
+First real drive of the OrthoSim screen rig with the `Bnei_brak.tif` ortho
+(15021×77786 px, **GSD 5 cm/px**, ~1.17 Gpx GeoTIFF on Drive). Three changes plus one
+environment gotcha that cost most of the session to diagnose.
+
+### 20.1 Human-readable ground-distance ruler
+
+A labeled scale along the scroll axis (yellow ticks on round distances — `100 m`,
+`1 km`, … — with `m`/`km` labels), **locked to the imagery** (ticks scroll at exactly
+the imagery velocity/direction). Purpose: from the Iron661 image you can read cumulative
+distance / speed and measure camera-px per known ground distance — i.e. the **effective
+GSD** that already folds in screen distance + crop, which is what you tune zoom/speed
+against (complements the machine-readable coded bar; both can be on at once).
+
+- Toggle live with **G**; start on with `--scale`; config `scale_enabled` /
+  `scale_target_px` (desired ~px between ticks, default 200).
+- Pure math lives in `tools/orthosim_core.py`: `nice_interval_m()` (1/2/5×10ⁿ interval)
+  and `scale_ticks()` (direction-aware `(distance, screen_pos)` list). Rendering is
+  `OrthoView._draw_scale()` in `tools/orthosim_gui.py` (left edge vertical scroll,
+  bottom edge horizontal).
+- Labels are **cumulative simulated distance** (matches the HUD/CSV), not ortho-tile
+  position — the ortho loops, so cumulative is the meaningful quantity.
+- Self-check: `tools/test_orthosim_scale.py` (Qt-free, no framework, `py -3`) — guards
+  round-tick spacing + imagery-locking. **Passes.**
+
+### 20.2 `--reduce {1,2,4,8}` fast load
+
+Full-res decode of the ~1.17 Gpx ortho on the main thread (before the window shows)
+took minutes and ~6–7 GB RAM. `--reduce N` decodes at 1/N via `cv2.IMREAD_REDUCED_*`
+and **scales `ortho_gsd_cm` by N**, so calibration/scale/HUD are unchanged — only the
+source pixels are coarser (a monitor can't show the full res anyway). `--reduce 4` loads
+in ~30 s. Also: window now sizes to the available screen and pins top-left (a fixed
+1280×800 overflowed small/virtual displays).
+
+### 20.3 Launch caveat — `QT_QPA_PLATFORM=offscreen`
+
+**Symptom.** OrthoSim launched from the agent shell was completely invisible (no window,
+no taskbar entry) despite the process being healthy and logging `window shown,
+visible=True`. Chased several wrong leads (OOM, off-screen placement, session mismatch).
+
+**Root cause.** The agent/automation shell has **`QT_QPA_PLATFORM=offscreen`** in its
+environment, so Qt renders to a virtual offscreen buffer (reports a phantom 800×800
+screen, creates no real window). `.NET`/Windows correctly saw the real 1920×1080 desktop
+in the same session — only Qt was redirected.
+
+**Fix.** Prepend **`$env:QT_QPA_PLATFORM = "windows"`** when launching for display, e.g.:
+
+```powershell
+$env:QT_QPA_PLATFORM = "windows"; $env:OPENCV_IO_MAX_IMAGE_PIXELS = "10000000000"
+py -3 tools/orthosim_gui.py "Running TIF\Bnei_brak.tif" --gsd 5.0 --scale --windowed
+```
+
+Launching from a **normal interactive terminal needs no override** (it doesn't set
+`offscreen`). This affects any Qt GUI started from the agent shell (Iron661 app too).
+
+## 21. Oblique-motor "bonkers" homing — marginal 24 V supply (2026-07-12)
+
+**Symptom.** Commanding a mode from the **Iron661 capture app** made the oblique
+(`motor1`) fail to home and "go bonkers" — hunting past its limits, then faulting. The
+same `$M0*`/`$M1*` from the Arduino Serial Monitor, from `main.py`, and homing straight
+from Teknic **MSP** all worked fine.
+
+**Isolation ladder (what ruled out software).** Same ClearCore, same wire-level
+command (`serial_comm.FocusController` sends an identical `$Mn*\n`; the app sends
+nothing extra for M0):
+
+| Vehicle | Cameras | Result |
+|---|---|---|
+| MSP (motor only, no ClearCore) | — | homes fine, repeatable |
+| `main.py` sim | none | fine |
+| `main.py --real` | **1** streaming | fine |
+| Iron661 capture app | **2** streaming | **5/5 fail** |
+
+Firmware diagnostics (temporarily added to `EnableAndHome`) proved the software was
+never confusing the motor: on every failure the drive entered homing **clean**
+(`alerts=0`), no interrupt activity (`trigISR+=0`, `DI6=0` — the `SweepOnTrig` ISR is
+the only interrupt and it never fired), and `EnableAndHome` is a **blocking busy-wait**
+that services no serial during homing — so no queued app command can reach the motor
+mid-home. HLFB simply **never asserted** and it ran the full `home wait 8000 ms`
+timeout.
+
+**Root cause.** **Marginal supply voltage (24 V).** Hard-stop homing needs enough bus
+voltage to drive the axis into its stop hard enough to trip the torque threshold. Under
+the capture app's heavier electrical load (**two** cameras streaming over PoCXP + the
+writer/SHM pipeline), the rail sagged just enough that the oblique couldn't reach that
+threshold — so it kept hunting and HLFB never came up. `main.py` (one camera) and MSP
+(no extra load) had the headroom, which is why only the full app tripped it.
+
+**Fix (validated).** Raised the supply to **nominal 28 V**. Re-test in the capture app
+with both cameras: **5/5 homing success**, oblique completes in a consistent **~4.6 s**
+(vs the 8000 ms timeout at 24 V), including a run ~15 min into the session. Lesson:
+**check supply-voltage margin under full system load** — a marginal rail shows up as
+intermittent, app-correlated motor faults that masquerade as software bugs.
+
+**Firmware changes kept as defense-in-depth** (`Parallax_CLRCR_V2_4.ino`, reflashed
+2026-07-12):
+
+- **Homing safe-abort** — any motor that doesn't assert HLFB within `timeout` is now
+  **disabled** instead of left enabled (previously it kept running its homing move →
+  the endless "bonkers" hunt). Applies to all three homing branches. `$Fault*` is sent
+  to the host on a partial homing failure (one motor homes, the other doesn't).
+- **Sweep safe-abort** — `maxMoveFaults` (5) consecutive faulted moves in
+  `MoveAbsolutePosition` → `abortToSafeMode()` disables both motors and drops to mode 0
+  (`sweepAborted` unwinds the in-flight `Sweep`/`SweepStepM5`), instead of the old
+  fault → re-home → re-fault loop.
+- **`home wait N ms`** diagnostic retained in `EnableAndHome` (cheap, and it's what
+  localised this); the noisier `pre-home`/`trigISR`/`DI6` probes were removed once the
+  cause was found.
+
+**Operational note (KAYA grabber).** During this session the capture app repeatedly
+failed camera bring-up with `KYPY_STATUS_INVALID_FGHANDLE`. Cause: **Vision Point was
+open** (holds the frame grabber exclusively); a stale grabber handle can also linger
+after a hard kill. Fix: close Vision Point (and any leftover Python), or reboot to
+clear a stuck handle, then relaunch.
+
+## 22. Autofocus metric/landing fixes + bench-box BSOD analysis (2026-07-12)
+
+> **Scope note.** All of the crashes below are on the **bench test box** (32 GB RAM),
+> not the operational 64 GB machine. The operational machine is unaffected by any of
+> this.
+
+### 22.1 Autofocus — two fixes that made the hill-climb usable
+
+Live M4 static-focus runs (vertical camera at a window) with per-position `af-trace`
+instrumentation showed the metric, not the search, was the problem, then exposed a
+second, actuator problem:
+
+1. **Brightness-invariant metric + light pre-blur** (`focus_measure_full_res` in
+   `host/capture/autofocus.py`). The full-res green-subgrid Laplacian variance is now
+   (a) normalised by mean² (kills auto-exposure/gain score swings — the earlier
+   ~900↔1600 range on a *static* scene) and (b) **pre-blurred with a σ≈1 Gaussian**
+   before the Laplacian. The Laplacian is a high-pass and was amplifying sensor noise,
+   which put a **10–16 % frame-to-frame spread on the score at a fixed lens position**.
+   A gentle smooth costs little real focus signal (defocus blurs over several pixels)
+   and roughly doubled the SNR: the focus curve went from a noisy flat line to a
+   **clean, repeatable peak** (peak-to-tail ≈ 2×, `best_pos` clustered −2/−1/0 across
+   runs instead of the earlier `+2, −13, −2, +0` chaos). `measure_frames=4`,
+   `step_pulses=1`.
+
+2. **Direction-matched landing** (`_begin_return`). Even with the clean peak, the
+   returned picture was **13–35 % softer than the best AF measured** (`final < best` in
+   every run). Cause: open-loop DC gear lash is **direction-dependent** — AF found best
+   travelling one way, then returned to `best_pos` from the *other* side, so the optics
+   settled a whole lash-band off. The old lash-comp only fixed the *commanded* position,
+   not the *approach direction*. Fix: record `best_dir` (travel direction when `best_pos`
+   was set) and on return **overshoot to the far side, then approach `best_pos` in
+   `best_dir`** — reproducing the exact lash state of the best measurement. Guarded by a
+   `final_score ≥ 0.75·best_score` assertion in `test_backlash_does_not_prevent_convergence`
+   (large-lash sim). All AF self-checks pass.
+
+Still staged (needs ClearCore reflash before use): **`$S0*` "Strength 0"** (`str0=3500`)
+for extra-fine focus increments; host `clearcore_protocol.set_strength(0)` supports it.
+AF config stays at strength 1 until it's flashed and confirmed. **Caution:** one live
+run read an *identical* score at every position — the focus motor didn't move at all at
+strength 1 (stiction / dropped pulse). Sort out reliable single-pulse motion before
+going finer, or Strength 0 will just produce more no-move runs.
+
+**RAM-scaled SHM pool** (`pipeline.py`): `SHM_POOL_SLOTS` now scales with physical RAM
+(~0.5 slots/GB, clamped [8, 24]) → **24 @ 64 GB (operational, unchanged)**, 8 @ 32 GB
+(bench). Bench commit dropped from ~17.7 GB to ~5.7 GB. This does **not** degrade the
+operational machine's recording depth.
+
+### 22.2 BSODs on the bench box — hardware/driver, not the app
+
+Three bug-checks on 2026-07-12 while running the capture app, **three different stop
+codes**:
+
+| Time | Bugcheck | Notes |
+|---|---|---|
+| 17:03 | `0x1A` MEMORY_MANAGEMENT | subcode `0x61941` |
+| 17:21 | `0x1A` MEMORY_MANAGEMENT | subcode `0x41790` |
+| 17:56 | `0x0A` IRQL_NOT_LESS_OR_EQUAL | read of a kernel addr at IRQL 2; hit at app launch / KAYA DMA bring-up |
+
+Plus a **year-long history on this same box**: five `0x10D` WDF_VIOLATION bug-checks
+across **July 2025** (7/5, 7/9, 7/11, 7/12/2025) — long before any of the AF/pool work
+existed.
+
+**Verdict: this is failing RAM or a buggy kernel driver, not the capture app.**
+- A user-mode Python process **cannot** produce `0x0A`/`0x1A`/`0x10D` — those are
+  kernel-mode faults. An app can *trigger* a latent fault under memory/DMA load; it
+  cannot *be* the fault (you'd get a Python traceback, not a BSOD).
+- The instability **predates our work by a year** (2025 WDF_VIOLATIONs).
+- **Three different stop codes from one workload** is the textbook bad-RAM signature —
+  corruption lands in a different kernel structure each run.
+- Reducing the pool to 5.7 GB did **not** stop it → not simply "asking for too much RAM".
+- The `0x0A` hit at camera bring-up (KAYA frame-grabber DMA into RAM) — a DMA-heavy
+  driver writing a bad region is a plausible trigger for that specific code.
+
+**Next step to close it out.** Run **MemTest86** (bootable USB, multiple passes;
+per-DIMM if there are two) — stronger than Windows `mdsched`. Only the *last* crash is
+saved (full dump at `C:\Windows\MEMORY.DMP`, overwritten each time; `C:\Windows\Minidump`
+is empty). If MemTest is clean, analyse `MEMORY.DMP` to name the faulting driver (likely
+KAYA grabber or GPU).
+
+## 23. Focus encoder — motor-shaft AMT203S decision + flat-score logic (2026-07-19)
+
+Evaluated adding an absolute encoder to assist AF (§14.8 "future per-motor encoders").
+Candidate: **Same Sky AMT203S-V** — 12-bit (4096 count/rev) absolute, SPI — mounted on
+the **DC-motor shaft** (`docs/amt20.pdf`; verify max-RPM spec, see §23.5).
+
+### 23.1 Mechanical chain
+
+NMB SE30R2NTCD brushed DC motor -> **encoder on motor shaft** -> StepperOnline EGS14-G45
+planetary gearbox (**45:1**) -> 3D-printed spur gear (70 T) meshing with a spur gear glued
+to the lens focus ring (108 T), both module 0.8. Total reduction motor->ring =
+45 x (108/70) = **69.4:1**. Focus ring dia. 81 mm.
+
+### 23.2 Why the motor shaft (not the gear output, not a draw-wire)
+
+- **Resolution is a non-issue.** 4096 count/rev x 69.4 ~= 284 k counts per ring rev =
+  **~0.0013 deg/count referred to the ring** — three orders of magnitude finer than
+  needed. The only real question is backlash.
+- **AF closes on the image, not on position.** Focus correctness never depends on knowing
+  where the lens is; the encoder's value is in the **actuator**, not the focus criterion.
+- **The dominant open-loop failure is actuation reliability, not lash.** Per §22.1 a live
+  run "read an identical score at every position — the motor didn't move at all (stiction /
+  dropped pulse)." Today `position` = a blind cumulative pulse count where **1 pulse != a
+  repeatable amount of motion** (stiction, PWM/supply variation — cf. §21, dropped pulses).
+  A motor-shaft encoder fixes exactly this class of bug: **verified motion** (know a pulse
+  moved the shaft, or didn't), **closed-loop positioning** (move *to a count* instead of
+  timing blind pulses -> faster, monotonic convergence), and an **absolute, power-cycle-
+  persistent datum** (focus currently has *no* home reference at all) that enables **focus
+  presets** (infinity / hyperfocal / last-good) the current architecture can't do.
+- **What it does NOT capture:** gear/spur lash. Referred to the motor, ~1 deg of ring lash
+  is ~69 deg of motor rotation, so the encoder sees the lash as its own motion but can't
+  tell where in the band the lens sits. **This is acceptable** — the AF already neutralises
+  lash *optically* (same-direction dither approach + `backlash_pulses` in `_begin_cycle` /
+  `_go_to_arm`, and the direction-matched landing of §22.1). So motor-side buys ~90% of the
+  practical benefit for ~10% of the effort and **zero schedule hit**; the gear-output
+  remount (>= 1 month) and the SICK draw-wire are both rejected.
+
+### 23.3 Flat-score disambiguation (peak vs lash vs stiction vs floor)
+
+The encoder senses the **motor**, never the lens. "No lens motion" is inferred from the
+**image score** staying flat, so *lash* = (encoder counts up) AND (image flat) — it takes
+**both** signals; neither alone reveals it.
+
+A naive "gradient == 0 => at peak" rule would false-lock in the lash band. The AF does not
+use that rule: `_servo_update` in `host/capture/autofocus.py` samples a **3-point
+mini-curve** (-d, centre, +d) and gates lock on **peakedness**, not a flat gradient:
+
+- **True peak** — lash taken up, all arms move the lens: centre HIGH, both arms LOWER ->
+  `peak_avg > 0` (concave) -> **lock**.
+- **Lash band** — lens moves for no arm: all three read the same -> `peak_avg ~= 0`
+  (not concave) -> "defocus floor / plateau, never lock, widen the probe."
+
+So flat-**and**-concave = peak; flat-**and**-not-concave = lash/floor -> keep hunting. Lash
+is never mistaken for a peak, and the image alone makes that call (the encoder is not what
+prevents the false lock).
+
+What the encoder **uniquely** adds is separating a third flat-score case the image can't:
+
+| Case | Motor encoder | Image score |
+|---|---|---|
+| Stiction / dropped pulse (§22.1 no-move) | counts = 0 | flat |
+| Lash band | counts != 0 | flat |
+| Defocus floor (far from focus) | counts != 0 | flat |
+
+Without an encoder all three look identical ("sent pulses, score didn't move"); with it the
+**no-move** case is uniquely identified (encoder flat) — the failure the encoder fixes.
+Honest limit: the encoder alone still **cannot** separate lash from the defocus floor (both
+= motor motion + flat image); only the image peakedness does.
+
+Same pairing **measures the lash band**: drive one way until the image responds, reverse,
+count the motor-encoder counts elapsed before the image responds again = lash referred to
+motor counts (encoder supplies the count, the image supplies the "lens re-engaged" event).
+
+### 23.4 Optional later: true backlash-free ring position
+
+If absolute presets or **printed-gear slip/wear detection** (a motor encoder can't see it)
+ever justify measuring the ring directly, prefer a **magnetic arc/ring scale bonded to the
+81 mm focus ring, read by a fixed head** (off-axis rotary magnetic encoder, or an AS5311-
+class readhead over a magnetic strip) — you already glue a gear to that ring, so a thin
+scale adds ~no mechanical complexity and has **zero coupling backlash**. Not the draw-wire.
+
+### 23.5 Integration caveats
+
+- **Max RPM (the one real risk of motor-shaft mounting).** The motor shaft is the *fastest*
+  point (before the 45:1). Verify the AMT203's max operating speed + absolute-update rate
+  against the SE30R2NTCD slew RPM under focus drive — the spec to confirm in `docs/amt20.pdf`.
+- **SPI wiring on the ClearCore.** AMT203 is SPI absolute (with a "set zero" command); 3
+  motors -> 3 encoders -> 3 CS lines or a mux, plus a firmware `FocusAxis` reading counts.
+  Document in `docs/clearcore_serial_protocol.md` when implemented.
+- **Lash-repeatable presets** only work if a preset is always approached from **one fixed
+  direction** (same trick the dither already uses).
+- Realises the §14.8 `FocusAxis` abstraction: replace the cumulative-pulse bookkeeping in
+  `autofocus.py` (`_drive` / `_RunState.position`) with encoder-count moves + a "did it
+  move?" guard, without touching the dither/servo search logic.
+
+### 23.6 Measuring the lash — manual creep + score-vs-encoder scatter (2026-07-27)
+
+The **automatic** backlash probe (the §23.3 drive-until-image-responds pairing, once
+`BacklashProbeEngine`) was **removed** — on the real rig it kept mis-tripping: per-frame
+Laplacian noise plus the long indoor exposure (30 ms vs a 3 ms pulse) faked an early "lens
+responded", giving implausible ~19-count readings. It was replaced by a **manual, operator-
+in-the-loop** method that reads the lash straight off a graph. This is now the way to get the
+number; the automatic engine and its self-check are gone (see the top-of-file banner).
+
+**Why two peaks = the lash.** The AMT203S sits on the **motor shaft**, *upstream* of the
+69.4:1 train (§23.1), so its count leads the lens by the whole gear/spur dead-band. Creep the
+focus *through* best-focus and the image-sharpness peak appears at one motor-encoder reading;
+reverse and creep back through, and because the motor first has to eat the lash before the
+lens turns, the **same optical peak now appears at a different encoder reading**. Plot focus
+score (Y) vs encoder (X) and you get **two humps** — one per travel direction. Their
+horizontal separation **is the backlash, referred to the motor shaft**.
+
+**Workflow (M4 or M5, encoder streaming):**
+1. Lock a well-textured **Fine tile** ("Lock tile") so the score tracks one fixed patch.
+2. Optionally tick **"Log CSV"** (writes `timestamp, frame, encoder, focus_score` to
+   `Session logs/Iron661_focus_<stamp>.csv`; see `host/capture/focus_csv_log.py`).
+3. Creep with the **Up/Down** focus hotkeys (`$S0` = 3 ms @ 7000, or a coarser strength)
+   from one side, *past* best focus, then reverse and creep back past it. Do **2-3 full
+   passes each way** — the peak is shallow and noisy, so averaging sweeps matters.
+4. Watch the always-on **top-right scatter**; the up-arm and down-arm humps show the lash live.
+
+**Analysis (reproducible from the CSV):**
+- Segment the rows into **monotonic runs** by encoder direction (ignore <30-count jitter);
+  keep only runs whose span crosses the peak (>~1500 counts here).
+- Per run, find the focus-peak encoder position two ways: **argmax** of the per-encoder mean
+  score, and a **score-weighted centroid** over the sharp region (weight = `score − baseline`,
+  baseline ~ the run's floor). They should agree to ~100 counts; disagreement = a lopsided/
+  noisy peak.
+- Average the up-run peaks and the down-run peaks separately; **backlash = |up_peak −
+  down_peak|**.
+
+**Measured (this rig, indoor static target, shallow peak so ±~150 counts):**
+- str1 (10 ms @ 7000), 2 passes each way: **~1,210 (argmax) / ~1,295 (centroid)** counts.
+- str0 (3 ms @ 7000), 1 pass each way: **~1,412 / ~1,461** counts.
+- Backlash is mechanical (independent of drive strength), so take **~1,300 ± 150 motor
+  counts** ≈ **~1.6° of focus-ring rotation** (1300 / (4096 × 69.4) rev) — consistent with the
+  §23.2 "~1° ring ≈ 69° motor" estimate, and plausible for a 45:1 planetary + 3D-printed
+  spur pair. Compensation on a reversal is therefore ~1,300 counts (~54 of the str0 3 ms pulses).
+
+**Counts-per-pulse (same CSV, plateau-to-plateau step, one hotkey press per plateau):**
+- str0 (3 ms): **median ~24-25 counts/pulse** (mean ~28, dragged up by bundled taps).
+- str1 (10 ms): **~120-225 counts/pulse**.
+- So a 3 ms pulse buys only ~**1/6** of a 10 ms pulse, not 3/10 — sub-linear because a fixed
+  chunk of each short pulse is spent breaking stiction before the shaft turns. `$S0` = the
+  finest reliable step (below 3 ms the motor only buzzes).
+
+**Gotchas:** creep a **high-contrast, well-defocused** patch so the peak is sharp; the first
+few frames right after a reversal and the odd single-frame score dropout are noisy — drop
+short runs and outliers before peak-finding.
+
+## 24. Non-blocking focus pulses + AF servo/tile overhaul (2026-07-22)
+
+A long session driving live M4 (flight-focus, exercised static on the bench) and M5 (bench
+flight-sim, moving mirrors) autofocus. Two families of change: a **firmware fix** that stops
+focus pulses from stalling the trigger cadence, and a **host AF rework** so the servo actually
+holds/finds focus and picks a sensible target. `tools/test_autofocus.py` is **27/27**.
+
+### 24.1 Firmware — focus pulses now run off a timer, not `delay()` (`Parallax_CLRCR_V2_4.ino`)
+
+**Problem.** A `+`/`-` focus command used to drive the H-bridge and then **busy-block** for the
+pulse duration (`focusIncCount × focusTimeIncrement` ms of 10 ms/pulse drive) inside
+`CheckMessages()`. That blocking time is stolen from the main `loop()`, so it lands *inside* the
+trigger cadence and pushes trigger-to-trigger out — the measured focus frame rate collapsed to
+**~2.9 Hz** against the **4.8 Hz** (`minTimeBetweenFrames` 209 ms) ceiling, and M5 "slowed down
+very much during capture". Variable cadence also corrupts AF: a stale/late frame makes the servo
+read a phantom gradient and drive the **wrong way**.
+
+**Fix (non-blocking `millis()` timer).** The pulse is now *scheduled*, not waited on:
+- Globals `bool focusPulseActive` / `uint32_t focusPulseEndTime` (§~119-123).
+- The `+` / `-` handlers set `focusMotorPin.State(±focusStrength)`, then
+  `focusPulseActive = true; focusPulseEndTime = millis() + focusIncCount·focusTimeIncrement;`
+  and **return immediately** (no `delay`, §~423-441).
+- `serviceFocusPulse()` (§~314) turns the motor **off** once `millis()` passes
+  `focusPulseEndTime`, or immediately if the mode leaves 4/5 (safety). Gated on `focusPulseActive`
+  so it's a cheap no-op otherwise.
+- Called from `loop()` (§~298) **and** inside the cadence busy-waits of `TakePicsInPlace()`
+  (§~748) and the M5 step's frame gate (§~725) — so a pulse that finishes mid-wait is stopped
+  promptly instead of drifting to the next `loop()`.
+
+Net: the motor still gets the same drive time, but it overlaps the trigger cadence instead of
+blocking it. **The operator has flashed this build.** (Encoderless drive is still open-loop; 1
+pulse ≠ a repeatable amount of motion — see §22.1/§23. This fix is about *cadence*, not motion
+repeatability.)
+
+### 24.2 Host AF — timing instrumentation to prove the lag (`host/capture/autofocus.py`)
+
+To confirm the cadence story from the host side (and catch stale-frame servo errors):
+- `af-time arm=… pos=… lag=…s settle=… frame_dt=…s score=…` logged at each arm measurement —
+  wall-clock **lag** from issuing a lens move to scoring it, and **`frame_dt`** (feed_frame
+  delivery interval). `_RunState` gained `arm_drive_t` / `last_frame_t` / `frame_dt`.
+- `_dump_select_frame()` writes `af_select_frame.png` (+ `_roi.png`) at acquisition — the exact
+  decimated frame the picker scored and the ROI it chose — for offline analysis. Guarded to skip
+  tiny (<400 px) test frames so the suite doesn't litter the repo.
+- Scratch `tools/_af_tile_probe.py` re-scores a dumped frame with the current σ-7 high-pass vs
+  Difference-of-Gaussians band-passes (comparison showed the current metric was already the best
+  of the candidates on a real hazy frame).
+
+### 24.3 Host AF — continuous dither servo + acquisition robustness
+
+The old hill-climb was replaced by a **continuous dither servo** suited to a moving scene, with:
+- **Motion-adaptive profile** (`AutoFocusConfig.apply_scene_profile`, `adaptive_profile=True`):
+  starts on the STATIC (averaged + anchored) profile and promotes to the fast per-patch tracking
+  profile once sustained motion is measured. **Profile follows detected motion, never the mode
+  label** (M4 in flight is *moving* — see the top-of-file M4/M5 warning).
+- **Coarse sweep-to-max escalation** — if the dither can't find a slope or snap-back trips, it
+  sweeps for the global peak, then hands back to the dither (leashed to the coarse best).
+- **Snap-back anchor** — tracks the best absolute centre-arm score/position and refuses to lock
+  far below it (kills the "walk away from good focus" and floor-lock failures).
+- **Strong-peak lock / anchored lock** — a concave 3-point peak (§23.3) locks immediately on a
+  static scene instead of dithering forever; RProp-style **adaptive step** grows while the
+  gradient sign holds and shrinks when it flips (fixes the sawtooth crawl).
+- **Upward landing** (`_rest_upward`) — the final park always approaches from below to seat gear
+  lash the same way the arms measured it.
+
+### 24.4 Host AF — saturation-aware tile ranking
+
+`_unclipped_texture` median-fills clipped pixels before the Gaussian high-pass and **scores only
+unclipped detail**, so a genuinely detailed but partly-overexposed tile isn't rejected for a flat
+one. Tests `test_saturation_aware_prefers_unclipped_detail` /
+`test_partly_clipped_busy_beats_featureless_unclipped`.
+
+### 24.5 Host AF — seed the target from the Fine preview (fixes "AF picks bushes")
+
+**Symptom (operator).** With the scene *somewhat defocused*, manual **Fine** mode shows the
+**building/gantry** but **AF's Zoom tile picks bushes**.
+
+**Root cause (not a metric/region/resolution bug).** Fine and AF use the *same* picker, frame,
+config and metric. The difference is **when** the pick is made: the Fine tracker locks a tile
+while the scene is **sharp** and then *deliberately holds it through blur* (it only re-picks on a
+genuine pan-out, never when the image just softens). AF, on start, ran `_force_focus_coarse()`
+which calls `_reset_fine_tracker()` — **discarding that held ROI** — then re-picked on the now
+**blurry** acquisition frame, where coarse texture (bushes) out-scores fine detail (building).
+
+**Fix.** `_on_autofocus_requested` grabs `self._fine_tracker.roi` **before** forcing coarse and
+passes it as `seed_roi` → `AutoFocusController.start_single` → `AutoFocusEngine.start` →
+`_RunState.seed_roi`. `_acquire` uses the seed verbatim (clamped + scored, logs
+`af-acquire seeded-from-fine …`) instead of re-picking; it's **one-shot** (a later pan-out
+reacquire re-picks normally). So: get the target sharp in Fine, then press **Auto-focus while
+still on Fine** and AF focuses *that* tile. Starting AF straight from Coarse (or clicking Coarse
+first, which resets the Fine tracker) leaves no seed and AF picks as before. Test
+`test_seed_roi_is_used_instead_of_repicking`.
+
+### 24.6 Freeze / responsiveness fixes
+
+- **App "NOT RESPONDING" during M5** — PCB pulse-acknowledgement serial spam was flooding the log
+  path; it's now filtered. Full-res emission was made **idempotent** so AF reliably has the
+  full-res tap on start.
+
+### 24.7 Status / open items
+
+- Firmware non-blocking pulses: **flashed**; expect `frame_dt` to sit near 0.21 s. Re-check the
+  `af-time` logs to confirm lag is now ~one frame and steady.
+- Seed fix (§24.5): **not yet hardware-verified** — the last on-hardware run predated it (log
+  showed `af-acquire target=full-frame`, no `seeded-from-fine`). Relaunch and test via the
+  Fine→Auto-focus workflow above.
+- Still worth doing (deferred): **SNR-gated lock** — require centre > arms by more than the
+  measured cycle-to-cycle noise before counting toward "done", else widen the dither (a run
+  declared "in focus" via `locked_cycles` on a noise-dominated hazy tile, not a real peak).
+- Two log oddities to keep an eye on: snap-back repeatedly firing at `centre +0` (servo not
+  moving off zero before giving up), and a late `no frame in 5s … armed but not streaming` before
+  shutdown.
