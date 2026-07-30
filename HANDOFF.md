@@ -12,7 +12,30 @@
 >   tracking servo). The fast/slow servo profile must follow **detected scene motion**,
 >   never the mode label — keying "M4 = static" is WRONG (M4 in flight is moving).
 
-_Last updated: 2026-07-27 — **manual backlash telemetry (scrapped the automatic test)**:
+_Last updated: 2026-07-30 — **M6 "Timelapse" mode** (§26): a new recording mode for a
+**side-by-side comparison against the Phase One camera** — mirrors held in the mid
+(Focus/M4) position firing **one trigger per second**, with full-res frames written to
+disk exactly like M0/M1. Added to firmware (`$M6*` → `setMode(6)`, `picsInPlaceDelay =
+1000`) and the Iron661 app (`Mode.M6`, "Timelapse" button, added to `_RECORDING_MODES`).
+Previous: 2026-07-30 — **encoder closed-loop autofocus (AF v2) + servo-BSOD root cause**
+(§25): the AMT203S motor-shaft encoder is integrated (`EncoderTracker`/`EncoderAxis` in
+`focus_axis.py`, `$ENC` parsed in `serial_client.py`; polarity is **negative** —
+`encoder_counts_per_pulse=-24` — because a `-` pulse raises the count) and the M4/M5
+autofocus was **rewritten** from the §24 dither servo into a paced open-loop
+**dive-then-climb** engine (`autofocus_v2.py`) that only *reads* the encoder: dive below
+focus (str3), climb up in fine str0 steps taking one settled `(encoder, score)` sample per
+frame, peak-detect, then park by descending to the dive bottom and creeping back up onto the
+peak **at the climb's own pace**. Making the climb score only the **settled** frame per step
+(`climb_settle_frames`) removed the motion-lag that parked the lens a few counts below focus →
+**focuses consistently** on the bench. **STOP now halts in place** (the old `park_upward`
+re-park burst yanked the lens off focus and corrupted the next run). The repeated **BSODs were
+the OLD flooding servo, not the hardware** — bisection: old build fine overnight, new code fine
+idle, serial stress wedged the PCB but didn't BSOD, full AF cycle on the new engine completed
+clean; the cure was the paced engine + **non-blocking serial TX thread** + **frame conflation**
+(no GUI-thread serial blocking / 8 MB frame pileup). Still watch: BSODs were sporadic, and a
+separate **firmware bug wedges the PCB after ~676 pulses** (power-cycle to recover). Committed
+as "Add encoder closed-loop autofocus (AF v2)"; self-checks `tools/test_autofocus_v2.py` (9).
+Previous: 2026-07-27 — **manual backlash telemetry (scrapped the automatic test)**:
 the automatic on-rig backlash probe was removed after it kept mis-measuring lash (per-frame
 sharpness noise + a 30 ms exposure faked an early "lens responded", giving implausible ~19-count
 readings). Deleted `host/capture/focus_probe.py` + `tools/test_backlash_measure.py` and stripped
@@ -1391,3 +1414,244 @@ first, which resets the Fine tracker) leaves no seed and AF picks as before. Tes
 - Two log oddities to keep an eye on: snap-back repeatedly firing at `centre +0` (servo not
   moving off zero before giving up), and a late `no frame in 5s … armed but not streaming` before
   shutdown.
+
+---
+
+## 25. Encoder closed-loop autofocus (AF v2) + servo-BSOD root cause (2026-07-29/30)
+
+The AMT203S encoder (§23) is now integrated and the whole M4/M5 autofocus was
+**rewritten** from the continuous dither servo (§24) into a paced, open-loop
+**dive-then-climb** engine that only *reads* the encoder. This section records the
+encoder wiring, the new engine, the serial/memory hardening, and the BSOD
+investigation that turned out to be the **old servo**, not the hardware.
+
+Committed as `Add encoder closed-loop autofocus (AF v2): dive-then-climb engine`
+(30 files). The engine sits **beside** the legacy servo (`autofocus.py`) —
+`AutoFocusController` can drive either for A/B testing.
+
+### 25.1 Encoder integration (host side)
+
+- **Hardware:** AMT203S-V absolute encoder on the DC-motor shaft (SPI, 12-bit =
+  4096 counts/rev). The ClearCore reads it and streams `$ENC=<count>` lines — fast
+  (~100 ms) in M4/M5, slow (~2000 ms) elsewhere. `$ENC=-1` = SPI read failed.
+- **`EncoderTracker`** (`host/capture/focus_axis.py`): unwraps the wrapping 0–4095
+  absolute count into a **monotonic total** (handles the rev roll-over), so the host
+  has a continuous position. `serial_client.py` parses `$ENC` off the serial reader
+  thread and exposes `encoder_position` / `encoder_present`.
+- **`FocusAxis` abstraction:** `OpenLoopAxis` (pulse-count only, legacy/tests) and
+  `EncoderAxis` (closed-loop — issues `+`/`-` pulse bursts and reads the encoder back).
+  A `raw_count` property gives the live pre-origin/pre-scale count for diagnostics
+  ("is the tracker frozen?" vs "did origin/scale math cancel the move?").
+- **Polarity (critical):** on this rig a `-` pulse *raises* the raw count, so
+  `encoder_counts_per_pulse` is **NEGATIVE (-24.0)**. With that, `position =
+  (raw-origin)/cpp` increases on a `+` drive (as the move math assumes). An earlier
+  `+24` inverted this and made every "dive down" run *away upward* into the end stop
+  ("how the fuck is this in focus?"). Lash ≈ **1290 counts**; one str3 pulse ≈ 34
+  position-units (~800 counts), one str0 pulse ≈ ~1 unit.
+
+### 25.2 AF v2 — the dive-then-climb engine (`host/capture/autofocus_v2.py`)
+
+Why not the servo: the settle-and-verify servo re-commanded an **absolute** `move_to`
+every frame against ~10 Hz encoder feedback and 15–22 ms discrete pulses. On stale
+feedback it overshot (a −120 target ran to −1387) and fired 1000-char correction
+bursts — violent oscillation. The fix is to **never** run an absolute-position servo:
+take **fixed open-loop steps** and merely read where the encoder landed. A constant
+feedback lag then only shifts the whole curve by a constant, which the upward park
+cancels.
+
+Phases (`ACQUIRE → DIVE → CLIMB → PARK → HOLD/DONE`):
+
+1. **Dive** — str3, `dive_bursts=4` × 1 pulse down, seating the gear lash from below.
+   Separate bursts (encoder re-read between) so a stalled motor / end stop is caught
+   early (`dive_min_drop_pulses`).
+2. **Climb** — str0, `climb_step_pulses=2` up per frame, one **(encoder, score)** sample
+   per frame; peak-detect on "score rose then fell" (`peak_fall_frac`,
+   `peak_confirm_samples`). One-way, so the lash stays seated and every sample shares
+   the same mechanical state → clean curve.
+3. **Park** — descend back to the **climb start (dive bottom)** minus a margin, then
+   **creep up** onto `best_pos`. Both legs now run at the **climb's pace** (str0, small
+   steps, one per frame); descend and creep have **separate time budgets**.
+4. **Hold/Done** — one-shot lands and holds (atmospheric lens is static for hours;
+   `reverify_interval_s=0`).
+
+Key debugging outcomes this session:
+
+- **Motion lag was the "soft park".** The climb sampled the encoder **while moving**
+  (reads a few counts behind), but the park **settled** before its final read (no lag)
+  — so it parked a few counts *below* the true peak. `climb_settle_frames` (take N
+  frames per step, score only the settled last one) reads an un-lagged position and
+  makes focus **consistent**. Confirmed on-rig: the manual pauses (step-gate) were
+  doing exactly this by hand.
+- **Park pace / aliasing.** An earlier park descended with str3 (~34 counts/pulse) —
+  coarse enough to alias the ~10 Hz encoder and seat the lash differently → soft park.
+  Doing the whole park at the climb's fine str0 pace fixed it.
+- **STOP must not move.** `stop()` used to re-park via the legacy `park_upward()` (a
+  big absolute burst) — that yanked the lens off focus on STOP and left pulses draining
+  that corrupted the next run's dive ("crazy rapid moves after STOP"). `stop()` now
+  **halts in place**.
+- **Whole-run scatter:** `_emit_sample()` pushes (encoder, score) every frame across
+  dive/climb/park (not just the climb), so the graph traces the entire down-up-down-up
+  trajectory — the creep-up limb re-peaking at the same encoder as the climb's
+  `best_pos` is the visual proof there's no residual lag.
+- **Debug step-gate** (`step_gate`): pauses at every phase boundary until the operator
+  presses **SPACE** (app-wide `QShortcut` in `app.py` → `controller.step()` →
+  `engine.step()`). Used to confirm the post-climb move was *not* flinging the motor to
+  end-of-travel.
+- **Do NOT slam trigger cadence to minimum** (`drive_cadence_to_min=False`): that
+  legacy dither trick starved the AMT203S SPI read (`$ENC=-1` / frozen at 0 through the
+  whole dive).
+
+Config lives in `app.py` (`AutoFocusConfigV2`): `strength=0`, `dive_strength=3`,
+`dive_bursts=4`×1, `climb_step_pulses=2`, `encoder_counts_per_pulse=-24`,
+`backlash_pulses = round(1.7×1290/24)`. Self-checks: `tools/test_autofocus_v2.py`
+(9 cases: axis, static converge/recover, encoder land-from-below, one-shot,
+stuck-motor-fails, climb-settle, **stop-halts-in-place**, step-gate).
+
+### 25.3 Serial + memory hardening (what stopped the freezes)
+
+- **Non-blocking serial TX** (`serial_comm.py`): a bounded `queue.Queue` + background
+  TX thread with `write_timeout=1.0`. `_send` only enqueues, so the **GUI thread never
+  blocks** on serial — this removed the freeze under a pulse storm. `test_serial_tx_queue.py`.
+- **Frame conflation** (`pipeline.py` + `app.py`): `_focus_frame_inflight` +
+  `note_focus_frame_consumed()` keep **at most one** 8 MB focus frame in flight; stale
+  frames are dropped instead of piling up in the Qt event queue (the ~40 MB/s growth
+  that preceded the crashes).
+- SHM pool still auto-scales to RAM (8 slots @ 32 GB bench, 24 @ 64 GB operational).
+
+### 25.4 BSOD root cause — the OLD flooding servo, not the box
+
+- **Symptom:** repeated BSODs during AF — `0x1A MEMORY_MANAGEMENT`, `0xBE`, `0xA`,
+  `0x133 DPC_WATCHDOG`, plus a WHEA fatal hardware error. Looked like bad RAM.
+- **Bisection:** old build left running overnight → **no BSOD**. New code idle in
+  coarse/fine for an hour → stable. Serial-only stress → **wedged the PCB but did NOT
+  BSOD Windows**. Full AF cycle on the rewritten engine → completed, no BSOD.
+- **Conclusion:** the crashes tracked the **old flooding AF servo** — the
+  settle-and-verify loop re-issuing `move_to` bursts on stale ~10 Hz feedback created a
+  serial command storm that, combined with **blocking serial writes on the GUI thread**
+  and the 8 MB frame pileup, wedged the driver/kernel. The paced dive-then-climb engine
+  + non-blocking TX (§25.3) removed it; system stable 17.5 h+ across the tests. **Not
+  ruled out for good** — the crashes were *sporadic*, so keep watching boot time /
+  process life across runs (a handful of clean runs is not proof).
+- **Separate firmware bug (still open):** the ClearCore **wedges** (stops answering
+  serial) after ~676 sustained pulses / ~135 s. This explains AF flakiness (frozen
+  encoder, oscillation) but does **not** BSOD Windows. Recover with a **PCB
+  power-cycle**; real fix belongs in firmware. `tools/serial_af_stress.py` reproduces it
+  without the camera.
+
+### 25.5 Status / open items
+
+- **Focuses consistently** on the static bench with `climb_settle_frames=3`. The
+  no-pauses run (`step_gate=False`) is being validated to confirm the built-in per-phase
+  settle is enough on its own.
+- `climb_settle_frames=3` is a **DEBUG** (slow) value — tune down to the minimum settle
+  once the encoder's true settle time is measured.
+- `step_gate=False` for production one-shot; flip to `True` only to inspect phases.
+- **Open:** the PCB pulse-wedge firmware bug (§25.4); still-sporadic BSOD watch.
+- Flight (moving-scene) path is unchanged in spirit — single-object patch tracking
+  keeps the scored ROI on target during a slow pan; the multi-object stitch for fast
+  churn remains a future layer (not needed to find focus on a near-static scene).
+
+### 25.6 Flight layer: two-object tracking + handover (design, not yet built)
+
+The dive-then-climb sweep takes **seconds**, but in flight the ground **pans
+continuously** — any single scored patch drifts across the FOV and exits before the
+sweep finishes. The static bench hides this (the patch never moves). The plan for
+flight is a **two-object tracking + handover** scheme that stitches focus samples from
+successive ground patches into **one continuous score-vs-encoder curve**, so the sweep
+can run to completion regardless of scene motion.
+
+**Why it's valid.** The thing we correct is the **atmospheric lens** — defocus that is
+**~uniform across the whole field of view** and drifts only over **hours** (§ engine
+docstring / §23). So *best focus is the same encoder position no matter which ground
+patch you look at.* That is the key enabler: two different patches, scored at the same
+encoder position, should report the **same trend**, so their samples belong on the same
+curve. (Absolute sharpness differs per patch — see normalisation below — but the
+*location of the peak in encoder space* does not.)
+
+**The handover loop:**
+
+1. **Acquire** a high-texture patch at the **leading edge** of the optical flow (the
+   side new ground enters from) — `leading_edge_from_motion()` +
+   `select_leading_edge_roi()` already pick this.
+2. **Track + score** it every frame as it traverses the FOV (`PatchTracker` gives the
+   per-frame `dx,dy`; the ROI is advanced by the flow). Each frame contributes one
+   `(encoder, score)` sample to the sweep curve.
+3. **Before it exits** the trailing edge (`_roi_pinned_against_flow()` detects a patch
+   pinned against the outflow edge), **acquire a second** leading-edge patch and run
+   **both** for a few overlap frames.
+4. **Cross-calibrate on the overlap:** while both patches are in-frame and being
+   scored, compute a **scale factor** that maps the incoming patch's score onto the
+   outgoing patch's (they have different absolute contrast). Apply it so the stitched
+   curve has **no discontinuity** at the handover.
+5. **Drop** the outgoing patch once it leaves; the incoming patch is now the primary.
+   Repeat — an unbounded relay of patches carries one continuous curve across the whole
+   dive-then-climb, however far the scene has panned.
+
+**Normalisation options** (pick per rig noise): per-object divide-by-own-running-max,
+or the overlap scale factor above (preferred — it's a direct measurement, no
+assumption about each patch's absolute texture). The **peak encoder position** is what
+we read off the stitched curve; absolute score magnitude only matters for the
+contrast/lock check.
+
+**Failure handling:** reject featureless / sky patches (`min_texture_score`,
+`_frame_is_featureless`) so a blank stretch doesn't inject a false low; if no valid
+leading-edge patch exists for several frames, pause the sweep (don't advance the
+motor) until texture returns rather than sampling garbage.
+
+**Scaffolding already present** (so this is an extension, not a rewrite): the engine
+holds `rs.objects` as a **list** of `_TrackedObject(oid, roi)` with a `next_oid`
+counter; `_advance_objects()` already moves every tracked ROI by the flow, drops ones
+pinned against the outflow, and **re-acquires a leading-edge patch when the list goes
+empty**. What's missing for true flight is: (a) running **two** objects concurrently
+with a deliberate overlap window, (b) the **overlap scale-factor** cross-calibration,
+and (c) feeding the *stitched* (normalised) samples — not just the primary object's —
+into the climb's peak detector.
+
+**ponytail:** deliberately deferred. Single-object tracking is correct for the static
+bench and slow pans we can actually test now; the relay only earns its complexity at
+fast flight churn, which we can't exercise until we fly (or drive M5 mirrors fast
+enough to pan a patch fully across the FOV within one sweep). Build it against an M5
+fast-pan bench case first, with the stitched curve drawn on the same score-vs-encoder
+scatter so the handover seams are visible.
+
+## 26. Timelapse mode — M6 (2026-07-30)
+
+**Why.** A recording mode for a **side-by-side comparison against the Phase One
+camera**: park the mirrors in the mid position and grab one full-res frame per second
+so the Iron 661 output can be lined up against the Phase One's on the same static/slow
+scene. It reuses M4's "fire in place" mechanics but, unlike M4 (preview-only), it
+**writes to disk like M0/M1**.
+
+**Behaviour.** Mirrors held at the **mid position** (`(0,0)`, same as Focus/M4), **one
+trigger pulse per second**, host records **full-res** frames to the per-camera drives
+via the same `.bay14` write path as M0/M1.
+
+### 26.1 Firmware (`Parallax_CLRCR_V2_4.ino`)
+
+- `loop()` `case 6: TakePicsInPlace();` — reuses the M4 in-place routine (mid position +
+  periodic trigger; the trigger period is the global `picsInPlaceDelay`).
+- `$M6*` handler → `setMode(6)`.
+- `setMode(6)`: `setupMotorsFast()` then `picsInPlaceDelay = 1000` (one trigger/sec).
+  Because M6 shares `TakePicsInPlace()` with M4, entering another mode and returning
+  re-runs `setMode` so the 1000 ms is re-applied on each M6 entry.
+- `+`/`-`/`>`/`<` remain gated to `mode==4||mode==5`, so M6 stays a fixed 1 Hz (no live
+  rate tuning) — intentional for a controlled comparison.
+
+### 26.2 Host (Iron661Capture)
+
+- `mode_controller.py`: new `Mode.M6`, button label **"Timelapse"**, button widths, and
+  **added to `_RECORDING_MODES`** — so `can_write()`/`is_recording_mode()` treat M6 as a
+  recording mode and every existing writer/exposure gate picks it up automatically.
+- `serial_client.py`: PCB int `6 → Mode.M6`.
+- `app.py`: mode button + tooltip; `Mode.M6 → 6` for `$M6*`; M6 included in the
+  recording-mode branches (pre-flight "nothing will be saved" warning, refuse-if-not-armed
+  guard, full-res emission, `.bay14line` open, GPS-correlator reset). M6 stays on the
+  **normal preview stack** (not the focus panel — `in_focus` is still M4/M5 only).
+- Docs: `docs/clearcore_serial_protocol.md` `$M6*`; `serial_comm.py` docstring.
+
+### 26.3 Status / notes
+
+- Firmware **flashed** by the operator (2026-07-30) before this session's app launch.
+- M6 reuses the M0/M1 file naming, so `SweepCounter` still rolls sweep/frame indices in
+  groups of 13 even though the mirrors don't sweep. Acceptable for the comparison
+  (frames are contiguous 1 Hz); a flat timelapse counter is a possible later tweak.

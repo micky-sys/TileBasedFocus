@@ -97,6 +97,7 @@ The same `Serial` parser handles many commands; only focus-relevant ones are sum
 
 - `$M0*` … `$M7*` — other operating modes  
 - `$M5*` — **ground-test mode**: a continuous, non-blocking *stepped* sweep (one mirror position + one frame per firmware loop) with host autofocus running in the background — `+`/`-`/`>`/`<` are serviced between every frame. Preview-only on the host (not a recording mode).  
+- `$M6*` — **timelapse mode**: mirrors held in the mid position (same as M4) firing one trigger per second (`setMode(6)` sets `picsInPlaceDelay = 1000`). Host records full-res frames to disk (same write path as M0/M1).  
 - `$P<n>*` — set mode-5 stepped-sweep positions per cycle (clamped to `[2, 64]`). Applied live when already in M5 (recomputes mirror angles and restarts the step index); otherwise stored for the next M5 entry.  
 - `$stop*`, `$reset*` — stop / full `setup()`  
 - `$Click*` — trigger sweep start flag  

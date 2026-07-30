@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -325,6 +326,89 @@ class _FocusScatterGraph(QWidget):
         p.end()
 
 
+class _PreviewStack(QStackedWidget):
+    """Host that swaps the single focus display (page 0) for the two-object split
+    preview (page 1). The score graphs are parented HERE -- not on either page --
+    so they stay visible over both views (the standing "scatter always on" rule)."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.overlay: Optional[QWidget] = None          # bottom-right AF telemetry
+        self.scatter_overlay: Optional[QWidget] = None  # top-right score-vs-enc scatter
+
+    def resizeEvent(self, ev):  # noqa: N802 -- Qt naming
+        super().resizeEvent(ev)
+        self.reposition_overlays()
+
+    def reposition_overlays(self) -> None:
+        m = 6
+        ov = self.overlay
+        if ov is not None:
+            ov.move(max(0, self.width() - ov.width() - m),
+                    max(0, self.height() - ov.height() - m))
+            ov.raise_()
+        sc = self.scatter_overlay
+        if sc is not None:
+            sc.move(max(0, self.width() - sc.width() - m), m)
+            sc.raise_()
+
+
+class _DualObjectPreview(QWidget):
+    """Split-screen: two panes, each following ONE tracked object from the moment
+    it enters the FOV until it pans off, so the operator can watch each object for
+    as long as possible. Fed coarse-frame grayscale crops via :meth:`set_pane_gray8`
+    (the tracker relays a fresh object onto a pane as soon as the old one exits)."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet("background:#101010;")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(2)
+        self._panes: list[QLabel] = []
+        for i in range(2):
+            lab = QLabel(f"object {i + 1}: waiting…")
+            lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lab.setStyleSheet(
+                "background:#0a0a0a; color:#888; font-family:Consolas, monospace;"
+                "font-size:11px; border:1px solid #222;"
+            )
+            # Ignored policy + a tiny fixed minimum size decouples the label's size
+            # from its pixmap. A QLabel reports its pixmap's size as minimumSizeHint,
+            # so scaling each crop to the label's CURRENT size (rounding up a pixel)
+            # would creep the layout -> stacked-widget sizeHint -> the whole window
+            # bigger every frame. Ignored means the layout drives the label, never
+            # the other way round.
+            lab.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
+            )
+            lab.setMinimumSize(1, 1)
+            lab.setScaledContents(False)
+            row.addWidget(lab, 1)
+            self._panes.append(lab)
+
+    def set_pane_gray8(self, idx: int, gray8: Optional[np.ndarray]) -> None:
+        """Show a grayscale crop (H×W uint8) in pane *idx*; None -> idle placeholder."""
+        if idx < 0 or idx >= len(self._panes):
+            return
+        lab = self._panes[idx]
+        if gray8 is None or gray8.size == 0:
+            lab.setPixmap(QPixmap())
+            lab.setText(f"object {idx + 1}: waiting…")
+            return
+        g = np.ascontiguousarray(gray8)
+        h, w = g.shape[:2]
+        qimg = QImage(g.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
+        pix = QPixmap.fromImage(qimg)
+        tw, th = max(1, lab.width()), max(1, lab.height())
+        scaled = pix.scaled(
+            tw, th,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        lab.setPixmap(_crop_pixmap_center(scaled, tw, th))
+
+
 class FocusPanel(QWidget):
     """M4 focus UI: coarse live preview or fine tile + inset; compact controls."""
 
@@ -349,6 +433,7 @@ class FocusPanel(QWidget):
     autofocus_algorithm_changed = Signal(str)  # "legacy" | "sweep_and_hold"
     fine_lock_changed = Signal(bool)     # freeze the tracked Fine tile (no re-pick)
     csv_log_toggled = Signal(bool)       # start/stop focus-telemetry CSV logging
+    preview_toggled = Signal(bool)       # split-screen two-object preview on/off
 
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
@@ -483,6 +568,15 @@ class FocusPanel(QWidget):
         self._clahe_chk.toggled.connect(self._on_clahe_display_toggled)
         top_row.addWidget(self._clahe_chk)
 
+        self._preview_toggle = QPushButton("2-obj preview")
+        self._preview_toggle.setCheckable(True)
+        self._preview_toggle.setToolTip(
+            "Split the view into two panes, each following one tracked object from "
+            "when it enters until it leaves the FOV (independent of autofocus)."
+        )
+        self._preview_toggle.toggled.connect(self._on_preview_toggle)
+        top_row.addWidget(self._preview_toggle)
+
         outer.addLayout(top_row)
 
         self._display = _FocusTileDisplayLabel("M4: waiting for first focus frame…")
@@ -496,17 +590,29 @@ class FocusPanel(QWidget):
         )
         self._display.setMinimumHeight(320)
         self._display.setScaledContents(False)
-        self._af_graph = _AFTelemetryGraph(self._display)
-        self._display.overlay = self._af_graph
-        self._display.reposition_overlay()
+
+        # Stack: page 0 = the normal single focus display; page 1 = the two-object
+        # split preview. The score graphs are parented on the STACK (not the display)
+        # so they float over whichever page is showing (scatter stays always-on).
+        self._preview_stack = _PreviewStack()
+        self._preview_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._preview_stack.addWidget(self._display)          # page 0
+        self._dual_preview = _DualObjectPreview()
+        self._preview_stack.addWidget(self._dual_preview)     # page 1
+        self._preview_stack.setCurrentIndex(0)
+
+        self._af_graph = _AFTelemetryGraph(self._preview_stack)
+        self._preview_stack.overlay = self._af_graph
         # Always-on encoder-vs-score scatter for the manual backlash workflow,
         # top-right (bottom-left is the Fine overview inset, bottom-right the AF
         # telemetry graph).
-        self._scatter_graph = _FocusScatterGraph(self._display)
-        self._display.scatter_overlay = self._scatter_graph
+        self._scatter_graph = _FocusScatterGraph(self._preview_stack)
+        self._preview_stack.scatter_overlay = self._scatter_graph
         self._scatter_graph.show()
-        self._display.reposition_scatter_overlay()
-        outer.addWidget(self._display, 1)
+        self._preview_stack.reposition_overlays()
+        outer.addWidget(self._preview_stack, 1)
 
         outer.addLayout(self._build_bottom_control_row())
         outer.addLayout(self._build_autofocus_row())
@@ -536,6 +642,26 @@ class FocusPanel(QWidget):
         self._sync_fine_toggle_caption()
         sub = FocusSubMode.FINE if checked else FocusSubMode.COARSE
         self.focus_submode_changed.emit(sub)
+
+    def _on_preview_toggle(self, checked: bool) -> None:
+        self._preview_stack.setCurrentIndex(1 if checked else 0)
+        self._preview_stack.reposition_overlays()  # keep the graphs on top of the new page
+        if not checked:
+            self._dual_preview.set_pane_gray8(0, None)
+            self._dual_preview.set_pane_gray8(1, None)
+        self.preview_toggled.emit(bool(checked))
+
+    def preview_active(self) -> bool:
+        return self._preview_toggle.isChecked()
+
+    def receive_object_crops(self, crops) -> None:
+        """Paint the two tracked-object crops (list of 2 grayscale uint8 arrays or
+        None) into the split-preview panes. No-op unless preview mode is on."""
+        if not self._preview_toggle.isChecked():
+            return
+        for i in range(2):
+            crop = crops[i] if crops is not None and i < len(crops) else None
+            self._dual_preview.set_pane_gray8(i, crop)
 
     def _install_m4_arrow_hotkeys(self) -> None:
         """Arrow keys mirror Focus ± and Trigger period < > while M4 is active.

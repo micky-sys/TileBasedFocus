@@ -154,6 +154,14 @@ class FocusSceneSimulator:
     def optical_pulses(self) -> float:
         return self._optical
 
+    @property
+    def carrier_pulses(self) -> float:
+        """Commanded (pre-lash) carrier position -- the motor shaft. The AMT203S
+        encoder sits here (upstream of the gear lash), so this is what an
+        EncoderAxis reads back; the optics (:attr:`optical_pulses`) lag it by the
+        backlash band."""
+        return self._carrier
+
     def current_blur_sigma(self) -> float:
         return self.base_blur + self.blur_per_pulse * abs(self._optical - self.best_focus)
 

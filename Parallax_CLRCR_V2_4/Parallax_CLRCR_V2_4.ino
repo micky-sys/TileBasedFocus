@@ -319,6 +319,9 @@ void loop() {
     case 5:
       SweepStepM5();
       break;
+    case 6:
+      TakePicsInPlace();
+      break;
   }
 
     serviceFocusPulse();
@@ -419,6 +422,9 @@ void CheckMessages() {
       }
       if (incomingSerialMessage.equals("$M5*")){  //Mode 5, ground test: continuous stepped sweep with host autofocus running in the background (focus +/- serviced between frames)
         setMode(5);
+      }
+      if (incomingSerialMessage.equals("$M6*")){  //Mode 6, timelapse: mirrors in mid position (like M4) firing once per second, host records full-res (like M0/M1)
+        setMode(6);
       }
       if (incomingSerialMessage.startsWith("$P")){  //Set mode-5 (ground test) positions per sweep, e.g. "$P40*"
         int requested = incomingSerialMessage.substring(2).toInt();  //toInt stops at the trailing '*'
@@ -909,8 +915,9 @@ void setupMotorsSlow() {
     break;
     case 4:
      mode = 4;
-     Serial.println("Mode 4: Focus adjustment");          
+     Serial.println("Mode 4: Focus adjustment");
      setupMotorsFast();
+     picsInPlaceDelay = minTimeBetweenFrames;  //AF runs at the camera's max FPS (209 ms floor); reset any leftover (e.g. M6's 1000 ms)
     break;
     case 5:
      mode = 5;
@@ -919,6 +926,13 @@ void setupMotorsSlow() {
      calculateMotorAngles();
      setupMotorsFast();
      m5Index = 0;
+     picsInPlaceDelay = minTimeBetweenFrames;  //AF runs at the camera's max FPS (209 ms floor); reset any leftover
+    break;
+    case 6:
+     mode = 6;
+     Serial.println("Mode 6: Timelapse (mid position, 1 Hz, full-res recording)");
+     setupMotorsFast();
+     picsInPlaceDelay = 1000;  //one trigger per second
     break;
   }
  }

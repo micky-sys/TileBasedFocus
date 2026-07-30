@@ -30,6 +30,7 @@ class Mode(Enum):
     M3 = "M3"
     M4 = "M4"
     M5 = "M5"
+    M6 = "M6"
 
 
 # Operator-facing mode button labels (PCB commands remain $M0* / $M1* / …).
@@ -39,6 +40,7 @@ MODE_BUTTON_LABELS: dict[Mode, str] = {
     Mode.M3: "CollectionON",
     Mode.M4: "Focus",
     Mode.M5: "Ground Test",
+    Mode.M6: "Timelapse",
 }
 
 # Fixed button widths so longer labels do not reflow the mode row.
@@ -48,6 +50,7 @@ MODE_BUTTON_WIDTH_FULL: dict[Mode, int] = {
     Mode.M3: 92,
     Mode.M4: 52,
     Mode.M5: 92,
+    Mode.M6: 84,
 }
 
 MODE_BUTTON_WIDTH_COMPACT: dict[Mode, int] = {
@@ -56,6 +59,7 @@ MODE_BUTTON_WIDTH_COMPACT: dict[Mode, int] = {
     Mode.M3: 78,
     Mode.M4: 42,
     Mode.M5: 78,
+    Mode.M6: 72,
 }
 
 
@@ -73,7 +77,7 @@ class FocusSubMode(Enum):
     FINE = "fine"
 
 
-_RECORDING_MODES = frozenset({Mode.M0, Mode.M1})
+_RECORDING_MODES = frozenset({Mode.M0, Mode.M1, Mode.M6})
 
 
 class ModeController:

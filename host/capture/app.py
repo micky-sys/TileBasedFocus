@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
 
 from .autofocus import AutoFocusController, FineFocusTracker
 from .autofocus import focus_measure_full_res as af_full_res_measure
+from .dual_tracker import DualObjectTracker
 from .autofocus_v2 import AutoFocusConfigV2
 from .kyfg_backend import KyfgCamera
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
@@ -681,6 +682,9 @@ class MainWindow(QMainWindow):
         self._raw_focus_drops_wrong_cam = 0
         self._raw_focus_forwarded = 0
         self._fine_tracker = FineFocusTracker()
+        # Independent two-object tracker for the optional split-screen preview
+        # (relays a leading-edge patch onto each pane; runs with or without AF).
+        self._dual_tracker = DualObjectTracker()
         # Latest Fine tile bbox the acquisition auto-picked (updated per frame), and
         # the ROI pinned by "Lock tile" (freezes that tile; the focus-telemetry
         # scatter/CSV score that tile as the operator creeps focus).
@@ -1848,6 +1852,11 @@ class MainWindow(QMainWindow):
                 "Ground Test — stepped mirror sweep with autofocus running "
                 "in the background; preview only (no writes).",
             ),
+            (
+                Mode.M6,
+                "Timelapse — mirrors in mid position firing once per second; "
+                "frames are written to disk.",
+            ),
         ):
             label = MODE_BUTTON_LABELS[mode]
             btn = QPushButton(label)
@@ -2120,6 +2129,7 @@ class MainWindow(QMainWindow):
         )
         self._focus_panel.fine_lock_changed.connect(self._on_fine_lock_changed)
         self._focus_panel.csv_log_toggled.connect(self._on_csv_log_toggled)
+        self._focus_panel.preview_toggled.connect(self._on_preview_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2171,7 +2181,7 @@ class MainWindow(QMainWindow):
             dive_burst_pulses=1,    # ONE str3 pulse per burst -> the dive is 4 str3 pulses total
             dive_min_drop_pulses=3, # just confirm the 4-pulse dive actually moved down
             climb_step_pulses=2,    # str0 pulses/frame on the way up (fine)
-            climb_settle_frames=3,  # DEBUG: take 3 frames/step, score the settled last one (kills motion lag)
+            climb_settle_frames=1,  # score every frame; the firmware now paces at the 209 ms floor
             encoder_counts_per_pulse=af_counts_per_pulse,
             # 1.7x margin over the measured ~1290-count lash: park_upward only lands the
             # lens on focus when its down-then-up excursion EXCEEDS the true dead-band.
@@ -2358,6 +2368,7 @@ class MainWindow(QMainWindow):
         pipeline.acq.raw_focus_frame.connect(self._on_raw_focus_frame_slot)
         pipeline.acq.raw_focus_tile_rgb.connect(self._on_raw_focus_tile_rgb_slot)
         pipeline.acq.raw_focus_roi_u16.connect(self._on_raw_focus_roi_u16_slot)
+        pipeline.acq.raw_focus_preview_crops.connect(self._on_raw_focus_preview_crops)
         pipeline.acq.failed.connect(self._on_pipeline_failed_slot)
         pipeline.acq.log_line.connect(self._log)
         # AcquisitionThread now owns the drop counter (the writer is a
@@ -2465,7 +2476,7 @@ class MainWindow(QMainWindow):
 
     def _on_mode_clicked(self, mode: Mode) -> None:
         # Map Mode.Mn -> int for the protocol command.
-        n = {Mode.M0: 0, Mode.M1: 1, Mode.M3: 3, Mode.M4: 4, Mode.M5: 5}[mode]
+        n = {Mode.M0: 0, Mode.M1: 1, Mode.M3: 3, Mode.M4: 4, Mode.M5: 5, Mode.M6: 6}[mode]
 
         if self._pending_mode_apply is not None or self._pending_mode_timer is not None:
             self._log("cancelled pending deferred mode apply (new mode choice)")
@@ -2476,7 +2487,7 @@ class MainWindow(QMainWindow):
         # disk and stare at an empty drive. We still send the mode to the
         # PCB (the user may want to enter M0/M1 just to drive the lights);
         # the writers self-gate.
-        if mode in (Mode.M0, Mode.M1):
+        if mode in (Mode.M0, Mode.M1, Mode.M6):
             missing: list[str] = []
             if not (self._context.project or "").strip():
                 missing.append("project name")
@@ -2519,7 +2530,7 @@ class MainWindow(QMainWindow):
                     f"$M{n}*: {exc}"
                 )
         if arm_failed:
-            if mode in (Mode.M0, Mode.M1):
+            if mode in (Mode.M0, Mode.M1, Mode.M6):
                 self._log(
                     f"refusing to send $M{n}*: cams {arm_failed} not armed"
                 )
@@ -3199,6 +3210,80 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"set_focus_roi failed: {exc}")
 
+    @Slot(bool)
+    def _on_preview_toggled(self, on: bool) -> None:
+        """Start the two-object preview fresh each time it's toggled (or restarted)
+        and switch full-res emission on/off so the panes can show sensor-native crops."""
+        self._dual_tracker.reset()
+        self._set_preview_full_res(bool(on))
+
+    def _set_preview_full_res(self, enable: bool) -> None:
+        """Turn full-res emission on (active camera) / off for the two-object preview,
+        and clear the pinned preview ROIs. Leaves emission ON if autofocus is still
+        using it on that camera, so we never yank the full-res feed out from under AF."""
+        p = self._active_pipeline()
+        if p is None:
+            return
+        try:
+            if enable:
+                p.set_full_res_emission(True)
+            else:
+                p.set_preview_rois([])
+                if p.camera_number not in self._af_full_res_cams:
+                    p.set_full_res_emission(False)
+        except Exception as exc:
+            self._log(f"preview full-res {'on' if enable else 'off'} failed: {exc}")
+
+    def _feed_dual_preview(self, raw) -> None:
+        """Track up to two leading-edge patches on the coarse frame and pin each pane's
+        ROI (scaled to full-res sensor pixels, Bayer-quad aligned) so the pipeline ships
+        sensor-native crops from the held slot. Display-only, no AF coupling; painting
+        happens in :meth:`_on_raw_focus_preview_crops` when the crops arrive."""
+        panes = self._dual_tracker.update(raw)
+        p = self._active_pipeline()
+        if p is None:
+            return
+        scale = KyfgCamera.SUBSAMPLE_FACTOR
+        rois: list = []
+        for pane in panes:
+            if pane is None:
+                rois.append(None)
+                continue
+            _oid, (x0, y0, x1, y1) = pane
+            # Coarse -> full-res, then snap the origin to an even (Bayer-quad) grid so
+            # the green-plane slice in the paint slot always lands on green.
+            fx0 = (int(x0) * scale) & ~1
+            fy0 = (int(y0) * scale) & ~1
+            fx1 = int(x1) * scale
+            fy1 = int(y1) * scale
+            rois.append((fx0, fy0, fx1, fy1))
+        try:
+            p.set_preview_rois(rois)
+        except Exception as exc:
+            self._log(f"set_preview_rois failed: {exc}")
+
+    def _on_raw_focus_preview_crops(self, crops, ts_iso: str) -> None:
+        """Paint the two sensor-native object crops into the split-preview panes.
+        Runs on the GUI thread; releases the pipeline's crop conflation latch first so
+        the next batch can be staged while we render this one."""
+        p = self._active_pipeline()
+        if p is not None:
+            try:
+                p.note_preview_crops_consumed()
+            except Exception:
+                pass
+        gray = []
+        for crop in (crops or []):
+            if crop is None or getattr(crop, "size", 0) == 0:
+                gray.append(None)
+                continue
+            # Green plane (real sensor pixels, no demosaic) at full-res/2, scaled to
+            # 8-bit -- ~4x sharper than the old coarse-tap crop, cheap enough for the
+            # GUI thread.
+            g = crop[0::2, 1::2]
+            gray.append((g >> 6).clip(0, 255).astype("uint8"))
+        self._focus_panel.receive_object_crops(gray)
+
     def _on_focus_submode_changed(self, sub: FocusSubMode) -> None:
         self._modes.set_focus_submode(sub)
         # Coarse<->Fine is a different scene/score scale, so the old score-vs-encoder
@@ -3668,6 +3753,10 @@ class MainWindow(QMainWindow):
                     f"{self._raw_focus_drops_wrong_cam}); ignored"
                 )
             return
+        # Optional split-screen two-object preview: independent of AF and of the
+        # coarse/fine submode, so feed it from the raw coarse frame up front.
+        if self._focus_panel.preview_active():
+            self._feed_dual_preview(raw)
         if self._modes.focus_submode() == FocusSubMode.FINE:
             self._update_fine_leading_edge(active, raw)
             return
@@ -3675,9 +3764,20 @@ class MainWindow(QMainWindow):
         if self._raw_focus_forwarded == 1 or (
             self._raw_focus_forwarded % 16 == 0
         ):
+            # Measured arrival fps over the logged window -- tells us whether the
+            # real limiter is the PCB trigger (~4.8 fps @ 209 ms) or host-side frame
+            # conflation (GUI thread too busy, dropping stale frames before us).
+            now = time.monotonic()
+            last = getattr(self, "_raw_focus_last_log_t", None)
+            fps = ""
+            if last is not None:
+                dt = now - last
+                if dt > 0:
+                    fps = f" ~{16 / dt:.1f} fps"
+            self._raw_focus_last_log_t = now
             self._log(
                 f"raw_focus_frame -> focus panel #{self._raw_focus_forwarded} "
-                f"(cam{pipeline.camera_number})"
+                f"(cam{pipeline.camera_number}){fps}"
             )
         self._focus_panel.receive_raw_frame(raw, ts_iso)
         # Feed the autofocus engine the coarse decimated frame for the active
@@ -4014,7 +4114,7 @@ class MainWindow(QMainWindow):
                     f"cam{p.camera_number}: set_fine_focus(False) failed: {exc}"
                 )
 
-        wants_full_res = mode in (Mode.M0, Mode.M1)
+        wants_full_res = mode in (Mode.M0, Mode.M1, Mode.M6)
         for p in self._pipelines:
             try:
                 p.set_full_res_emission(wants_full_res)
@@ -4051,6 +4151,9 @@ class MainWindow(QMainWindow):
             self._reset_fine_tracker()
         else:
             self._reset_fine_tracker()
+        self._dual_tracker.reset()
+        if mode not in (Mode.M4, Mode.M5):
+            self._set_preview_full_res(False)
 
         for p in self._pipelines:
             p.sweep.reset()
@@ -4066,11 +4169,11 @@ class MainWindow(QMainWindow):
         # The CameraPipeline.open_line call resets the per-camera
         # sweep counter as part of its work, so the "sweep 1 frame 1"
         # invariant lines up with the start of each container.
-        if mode in (Mode.M0, Mode.M1):
+        if mode in (Mode.M0, Mode.M1, Mode.M6):
             # Zero correlator decision counters only when STARTING a capture
             # (coming from a non-recording mode). A M1<->M0 flip keeps the
             # tally running so the whole capture is measured as one window.
-            if prev_mode not in (Mode.M0, Mode.M1):
+            if prev_mode not in (Mode.M0, Mode.M1, Mode.M6):
                 self._gps_correlator.reset_stats()
             self._open_lines_for_active_pipelines()
         else:

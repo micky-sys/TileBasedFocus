@@ -1,7 +1,8 @@
 """Serial communication with the ClearCore focus-control PCB.
 
 Protocol (115200 baud, newline-terminated):
-  $Mn*\\n          -> set PCB mode n (0/1 = recording, 3 = manual line, 4 = focus)
+  $Mn*\\n          -> set PCB mode n (0/1 = recording, 3 = manual line, 4 = focus,
+                     6 = timelapse: mid position, 1 Hz, recording)
   $Cn*\\n          -> select PCB camera slot n (1-3); host maps Iron661 serial
                      to n via ``PCB_FOCUS_CAMERA_SLOT_BY_SERIAL`` (2439006→1,
                      2439007→2, 2439008→3).

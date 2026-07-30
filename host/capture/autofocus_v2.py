@@ -146,14 +146,17 @@ class AutoFocusConfigV2:
     shaft to be at rest waits out the full down-then-up pulse train."""
     park_stable_frames: int = 2
     """Consecutive at-target-and-stable frames required before the park is DONE."""
-    park_max_wait_s: float = 30.0
+    park_max_wait_s: float = 45.0
     """Bound on the CREEP-up leg (clock is reset when descend hands off). A creep that
-    never reaches best_pos still finishes rather than hanging forever. Sized for the
-    gentle str0 climb-pace creep (~climb_step_pulses/frame over ~100+ units)."""
-    park_descend_max_s: float = 20.0
+    never reaches best_pos still finishes rather than hanging forever. AF runs at only
+    ~1-2 fps, so a deep (~1 lash + margin) creep at park_coarse_step_pulses/frame needs
+    tens of seconds -- too tight a bound made the creep TIME OUT short of the peak."""
+    park_descend_max_s: float = 35.0
     """Separate bound on the descend leg. Previously descend + creep shared one clock,
     so a stalled descend ate the whole budget and the creep never ran (parked far below
-    focus). Sized for the gentle str0 climb-pace descend back to the dive bottom."""
+    focus). At ~1-2 fps the deep descend needs this much wall-clock even at the coarse
+    park step -- a 20 s bound timed out at only ~26 pulses below the peak (< 1 lash), so
+    the lash never reversed and the lens parked soft ('it went back a lot less')."""
     step_gate: bool = False
     """Debug: pause at every phase boundary (acquire->dive->climb->descend->creep->
     settle) and wait for ``step()`` (operator SPACE) before continuing. Lets the
@@ -171,6 +174,19 @@ class AutoFocusConfigV2:
     """Within this many pulse-units of best_pos the creep drops to single-pulse steps so
     the lens is seated onto the peak gently (operator saw the final move overshoot when
     it arrived fast)."""
+    park_climb_band_pulses: int = 36
+    """Between park_slow_band_pulses and this, the creep slows from the coarse bulk step
+    to the CLIMB's own pace (climb_step_pulses/frame) -- so the final approach onto the
+    peak mirrors the climb that found it, decelerating well before the seat instead of
+    blasting in at the coarse step and stopping abruptly. Must exceed
+    park_slow_band_pulses."""
+    park_coarse_step_pulses: int = 6
+    """str0 pulses/frame for the DESCEND and the far-from-peak part of the creep. AF is
+    frame-gated at ~1-2 fps, so the fine climb step (2/frame) can't traverse the deep
+    lash-clearing excursion within the time budget -- it timed out short and left the
+    lash un-reversed. Precision doesn't matter out here (we're below focus, not
+    measuring); the gentle single-pulse seat inside park_slow_band_pulses still lands
+    the peak without aliasing, so this only speeds the bulk travel."""
     park_descend_margin_pulses: int = 20
     """The park first descends to best_pos - lash - THIS, and waits until the encoder
     actually REACHES that depth, so the gear lash is fully reversed (the lens really
@@ -661,14 +677,25 @@ class AutoFocusEngineV2:
         rs.best_pos = int(best_pos)
         # Reproduce the trajectory the CLIMB already proved lands on focus: the climb
         # started at the dive bottom and rode the lens UP to best_pos. So descend back
-        # to the climb's start (a touch below, for margin), then creep up.
-        # Do BOTH legs at the CLIMB's own gentle pace: str0, small climb_step_pulses
-        # steps, one per frame. The earlier str3 descend jumped ~34 encoder counts per
-        # pulse -- coarse enough to alias the ~10 Hz encoder and land the seat in the
-        # wrong place. Fine str0 steps move the same units the climb did, so the lash
-        # re-seats identically and there's no aliasing.
+        # below the peak (past the lash), then creep up onto it. Both legs stay at str0
+        # (never the coarse str3, which jumped ~34 counts/pulse and aliased the ~10 Hz
+        # encoder), but move in COARSE park_coarse_step_pulses bursts until near the
+        # peak -- AF is only ~1-2 fps, so a fine 2/frame step can't cover the deep
+        # lash-clearing excursion in time. The final seat inside park_slow_band_pulses
+        # drops to single str0 pulses, so the lens still lands the peak alias-free.
         self._set_strength_safe(self.cfg.strength)
-        rs.park_descend_target = int(round(rs.climb_start_pos)) - self.cfg.park_descend_margin_pulses
+        # Descend far enough below the peak to fully REVERSE the gear lash before
+        # creeping back up, so the final approach re-seats the lash from below (same
+        # direction as the climb that found the peak). The climb started at the dive
+        # bottom, but a SHORT dive/climb (e.g. the 4-pulse str3 dive) can leave
+        # climb_start less than one lash below best_pos -- descending only to it then
+        # doesn't take up the slack and the lens parks soft ("doesn't go far enough
+        # back to clear the backlash"). So descend to whichever is DEEPER: the dive
+        # bottom, or a full lash + margin below the peak.
+        margin = self.cfg.park_descend_margin_pulses
+        by_climb = int(round(rs.climb_start_pos)) - margin
+        by_lash = int(rs.best_pos) - self.cfg.backlash_pulses - margin
+        rs.park_descend_target = min(by_climb, by_lash)
         rs.park_phase = "descend"
         rs.park_move_since = time.monotonic()
         rs.park_since = 0.0
@@ -681,8 +708,8 @@ class AutoFocusEngineV2:
         rs = self._rs
         cfg = self.cfg
         now = time.monotonic()
-        # Phase 1: step DOWN to the target depth at the CLIMB's pace -- str0,
-        # climb_step_pulses per frame -- until the encoder reaches it. Own time budget
+        # Phase 1: step DOWN to the target depth in coarse str0 bursts
+        # (park_coarse_step_pulses/frame) until the encoder reaches it. Own time budget
         # so a slow descend can't starve the creep.
         if rs.park_phase == "descend":
             pos = int(round(self._axis.position))
@@ -699,12 +726,12 @@ class AutoFocusEngineV2:
 
                 self._gate(f"park-descend (pos={pos:+d})", "PARK-creep", _enter_creep)
                 return
-            self._axis.step_pulses(-1, cfg.climb_step_pulses)  # one climb-sized step/frame
+            self._axis.step_pulses(-1, cfg.park_coarse_step_pulses)  # coarse: just get below
             return
         timed_out = (now - rs.park_move_since) >= cfg.park_max_wait_s
-        # Phase 2: creep UP onto best_pos at the same climb pace (str0,
-        # climb_step_pulses per frame; single steps inside the slow band so the lens
-        # seats gently instead of overshooting). Stop when the encoder reaches the peak.
+        # Phase 2: creep UP onto best_pos at str0 -- coarse park_coarse_step_pulses
+        # bursts until near the peak, then single pulses inside the slow band so the lens
+        # seats gently instead of overshooting. Stop when the encoder reaches the peak.
         if rs.park_phase == "creep":
             pos = int(round(self._axis.position))
             if pos >= int(rs.best_pos) - cfg.park_tolerance_pulses or timed_out:
@@ -720,7 +747,15 @@ class AutoFocusEngineV2:
                            "PARK-settle+measure", _enter_settle)
                 return
             remaining = int(rs.best_pos) - pos
-            step = 1 if remaining <= cfg.park_slow_band_pulses else cfg.climb_step_pulses
+            # Three-speed approach: coarse bulk travel far out, decelerate to the
+            # CLIMB's own pace as we near the peak (so the approach mirrors the climb
+            # that located focus), then single pulses for the gentle, alias-free seat.
+            if remaining <= cfg.park_slow_band_pulses:
+                step = 1
+            elif remaining <= cfg.park_climb_band_pulses:
+                step = cfg.climb_step_pulses
+            else:
+                step = cfg.park_coarse_step_pulses
             self._axis.step_pulses(+1, step)
             rs.park_creep_last_t = now
             return
@@ -779,21 +814,24 @@ class AutoFocusEngineV2:
     # %% scoring %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
     def _score_primary(self, frame) -> Optional[float]:
-        """Sharpness of the tracked target patch. Prefer the full-res crop metric
-        (real high frequencies -> a sharp peak) and fall back to the coarse-frame
-        measure when no full-res crop is available."""
+        """Sharpness of the tracked target patch, ALWAYS on the sensor-native full-res
+        crop when that path is wired (every real M4/M5 run). The 4x-decimated coarse
+        frame aliases away the high frequencies focus lives in, so scoring it peaks in
+        the wrong place and walks a good focus into blur. When the full-res crop is
+        momentarily stale the callback returns None and we return None too: the caller
+        skips that sample and waits for a fresh crop rather than substituting a blurry
+        coarse score. Only when NO full-res path is wired at all (sim / encoderless
+        bench) do we score the frame we were handed."""
         rs = self._rs
         if not rs.objects:
             return None
         roi = rs.objects[0].roi
         if self._full_res_score is not None:
             try:
-                s = self._full_res_score(roi)
+                return self._full_res_score(roi)  # sensor-native; None -> skip, never guess
             except Exception:  # pragma: no cover - UI guard
                 log.exception("full_res_score failed")
-                s = None
-            if s is not None:
-                return float(s)
+                return None
         return float(focus_measure(frame, roi))
 
     def _frame_is_featureless(self, frame: np.ndarray) -> bool:

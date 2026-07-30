@@ -481,6 +481,11 @@ class AcquisitionThread(QThread):
     # Full-res uint16 crop of the pinned focus ROI, emitted alongside the coarse
     # tap during autofocus so AF can score focus on real high frequencies.
     raw_focus_roi_u16 = Signal(object, str)  # (np.ndarray uint16 crop, ISO timestamp)
+    # Full-res uint16 crops of the two-object preview ROIs (list, one entry per pane,
+    # None where a pane has no object), cropped from the same held full-res slot as the
+    # AF ROI so the split preview shows sensor-native detail instead of the 8x-decimated
+    # coarse tap. Display-only; independent of AF.
+    raw_focus_preview_crops = Signal(object, str)  # (list[np.ndarray|None], ISO timestamp)
     fetch_timeout_count = Signal(int)
     # Cumulative count of sweep frames AcquisitionThread had to drop
     # rather than submit to the writer subprocess. Reasons include
@@ -588,6 +593,11 @@ class AcquisitionThread(QThread):
         # case is dropping/keeping one extra frame, which is invisible at preview.
         self._focus_frame_inflight = False
         self._focus_frames_conflated = 0  # diag: frames dropped by conflation
+        # Two-object preview: full-res ROIs (sensor-pixel coords) to crop from the held
+        # slot each frame, and a conflation latch so the (larger) crops can't balloon
+        # the GUI queue any more than the coarse tap can. Set from the GUI thread.
+        self._preview_rois: list = []
+        self._preview_crops_inflight = False
         # State-transition logging for "why we couldn't write": a
         # missing project name + a busy trigger would otherwise emit
         # ~40 lines/sec into the log, freezing the GUI's QPlainTextEdit.
@@ -650,6 +660,17 @@ class AcquisitionThread(QThread):
         at most ~1 extra frame in flight -- which keeps the preview live without
         letting the 8 MB payloads accumulate."""
         self._focus_frame_inflight = False
+
+    def set_preview_rois(self, rois: list) -> None:
+        """Two-object preview: pin the full-res ROIs (sensor-pixel coords, one per pane,
+        None where a pane is empty) to crop from the held slot each frame. List
+        assignment is atomic under the GIL, so no lock is needed."""
+        self._preview_rois = list(rois) if rois else []
+
+    def note_preview_crops_consumed(self) -> None:
+        """GUI-thread ack for a ``raw_focus_preview_crops`` batch (see
+        ``note_focus_frame_consumed``); releases the crop conflation latch."""
+        self._preview_crops_inflight = False
 
     def set_fine_focus_enabled(self, enabled: bool) -> None:
         """M4 only: when True, focus tap reads full-res from pool and emits RGB."""
@@ -981,7 +1002,11 @@ class AcquisitionThread(QThread):
                             in_focus_mode
                             and self._focus_tap_enabled
                             and want_focus_tap
-                            and (self._fine_focus or self._focus_roi is not None)
+                            and (
+                                self._fine_focus
+                                or self._focus_roi is not None
+                                or bool(self._preview_rois)
+                            )
                         )
                         if defer_release:
                             slot_for_fine = int(full_u16)
@@ -1093,6 +1118,34 @@ class AcquisitionThread(QThread):
                                 ).copy()
                                 self.raw_focus_roi_u16.emit(crop, acquire_ts_iso)
                                 self._focus_roi_crops_shipped += 1
+                            # Two-object preview: crop each pinned ROI from the SAME
+                            # held slot (sensor-native pixels) and ship the batch, with
+                            # its own conflation latch so the (bigger) crops can't back
+                            # up the GUI queue. Slot release is unchanged (the single
+                            # release in the finally covers this read too).
+                            if (
+                                self._preview_rois
+                                and slot_for_fine is not None
+                                and self._pool is not None
+                                and not self._preview_crops_inflight
+                            ):
+                                fvp = self._pool.slot_view(slot_for_fine)
+                                fhp, fwp = fvp.shape[:2]
+                                crops: list = []
+                                for proi in self._preview_rois:
+                                    if proi is None:
+                                        crops.append(None)
+                                        continue
+                                    px0, py0, px1, py1 = proi
+                                    px0 = max(0, min(int(px0), fwp - 2))
+                                    py0 = max(0, min(int(py0), fhp - 2))
+                                    px1 = max(px0 + 2, min(int(px1), fwp))
+                                    py1 = max(py0 + 2, min(int(py1), fhp))
+                                    crops.append(
+                                        np.ascontiguousarray(fvp[py0:py1, px0:px1]).copy()
+                                    )
+                                self._preview_crops_inflight = True
+                                self.raw_focus_preview_crops.emit(crops, acquire_ts_iso)
                             # Conflate: only emit if the GUI has consumed the
                             # previous 8 MB frame. Otherwise drop this one so the
                             # queued-event backlog can't grow unbounded (the crash).
@@ -2611,6 +2664,15 @@ class CameraPipeline:
         """M4 autofocus: pin the Fine focus tap to a fixed full-res ROI, or
         ``None`` to restore the default winning-tile auto-pick."""
         self.acq.set_focus_roi(roi)
+
+    def set_preview_rois(self, rois: list) -> None:
+        """Two-object preview: pin the full-res ROIs (sensor pixels, one per pane,
+        None where empty) cropped from the held slot for the split preview."""
+        self.acq.set_preview_rois(rois)
+
+    def note_preview_crops_consumed(self) -> None:
+        """GUI-thread ack releasing the two-object-preview crop conflation latch."""
+        self.acq.note_preview_crops_consumed()
 
     # -- focus capture submit -----------------------------------------------
 
