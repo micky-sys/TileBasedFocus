@@ -18,15 +18,21 @@ Wire format (a single row of equal-width cells, left to right)::
 Each cell is one bit: 1 = white, 0 = black. The payload is packed MSB-first in
 this fixed field order:
 
-    version       :  4 bits   format version (currently 1)
+    version       :  4 bits   format version (currently 2)
     tick          : 20 bits   monotonic display-refresh counter (wraps at 2^20)
     distance_mm   : 32 bits   absolute cumulative simulated ground distance (mm)
     velocity_mmps : 20 bits   instantaneous simulated ground speed (mm/s)
+    gsd_cm_e2     : 16 bits   simulated camera GSD in 0.01 cm/cam-px (0..655.35);
+                              the "altitude" proxy -- smaller GSD = lower flight
+                              height. 0 = under-defined (display M not calibrated).
     flags         :  4 bits   bit0=seam, bit1=paused, bit2=calibration, bit3=rsvd
-    reserved      :  8 bits   zero (padding to a byte boundary -> 88 payload bits)
 
-The CRC8 (poly 0x07, init 0x00) is computed over the 11 packed payload bytes so
+The CRC8 (poly 0x07, init 0x00) is computed over the 12 packed payload bytes so
 a partially-smeared read is rejected rather than silently mis-decoded.
+
+Format v2 (2026-08-05) replaced the v1 8-bit ``reserved`` pad with the 16-bit
+``gsd_cm_e2`` altitude field; the display and capture sides both import this one
+module, so the wire format can never drift between them.
 """
 
 from __future__ import annotations
@@ -35,18 +41,18 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 # ── Field layout ─────────────────────────────────────────────────────────────
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 _FIELDS = (
     ("version", 4),
     ("tick", 20),
     ("distance_mm", 32),
     ("velocity_mmps", 20),
+    ("gsd_cm_e2", 16),
     ("flags", 4),
-    ("reserved", 8),
 )
-PAYLOAD_BITS = sum(width for _, width in _FIELDS)   # 88
-PAYLOAD_BYTES = PAYLOAD_BITS // 8                    # 11
+PAYLOAD_BITS = sum(width for _, width in _FIELDS)   # 96
+PAYLOAD_BYTES = PAYLOAD_BITS // 8                    # 12
 CRC_BITS = 8
 
 # A 16-cell sync/anchor prefix. Starts and ends with a white then black cell so
@@ -64,6 +70,7 @@ FLAG_CALIBRATION = 0x4
 
 _DIST_MAX_MM = (1 << 32) - 1
 _VEL_MAX_MMPS = (1 << 20) - 1
+_GSD_MAX_E2 = (1 << 16) - 1
 _TICK_MOD = 1 << 20
 
 
@@ -74,6 +81,7 @@ class GroundTruth:
     distance_mm: int = 0
     tick: int = 0
     velocity_mmps: int = 0
+    gsd_cm_e2: int = 0
     flags: int = 0
     version: int = FORMAT_VERSION
 
@@ -85,6 +93,11 @@ class GroundTruth:
     @property
     def velocity_mps(self) -> float:
         return self.velocity_mmps / 1000.0
+
+    @property
+    def gsd_cm(self) -> float:
+        """Simulated camera GSD in cm/cam-px (0.0 when the display left it unset)."""
+        return self.gsd_cm_e2 / 100.0
 
     @property
     def seam(self) -> bool:
@@ -122,8 +135,8 @@ def _pack_payload(gt: GroundTruth) -> bytes:
         "tick": int(gt.tick) % _TICK_MOD,
         "distance_mm": _clamp(int(gt.distance_mm), 0, _DIST_MAX_MM),
         "velocity_mmps": _clamp(int(gt.velocity_mmps), 0, _VEL_MAX_MMPS),
+        "gsd_cm_e2": _clamp(int(gt.gsd_cm_e2), 0, _GSD_MAX_E2),
         "flags": _clamp(int(gt.flags), 0, (1 << 4) - 1),
-        "reserved": 0,
     }
     bits = 0
     nbits = 0
@@ -144,6 +157,7 @@ def _unpack_payload(payload: bytes) -> GroundTruth:
         distance_mm=out["distance_mm"],
         tick=out["tick"],
         velocity_mmps=out["velocity_mmps"],
+        gsd_cm_e2=out["gsd_cm_e2"],
         flags=out["flags"],
         version=out["version"],
     )

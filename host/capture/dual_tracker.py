@@ -83,33 +83,50 @@ class DualObjectTracker:
         self,
         cfg: Optional[AutoFocusConfig] = None,
         pad: float = 1.5,
-        stagger_frames: int = 8,
     ) -> None:
         self.cfg = cfg or AutoFocusConfig()
         self._pad = float(pad)
-        # Don't acquire a 2nd patch within this many frames of the previous acquire,
-        # so the pair doesn't enter (and later exit) the FOV in lockstep -- that would
-        # collapse the two panes into one moment and defeat the "view each as long as
-        # possible" goal. ponytail: fixed frame gate; upgrade path = acquire the 2nd
-        # once the 1st crosses the FOV midpoint.
-        self._stagger = int(stagger_frames)
         self._tracker = PatchTracker()
         self._objects: List[_Obj] = []
         self._pane_oid: List[Optional[int]] = [None, None]
         self._next_oid = 0
         self._frames = 0
-        self._last_acquire = -(10 ** 9)
         self.motion_dx = 0.0
         self.motion_dy = 0.0
+        self._reset_diag()
+
+    def _reset_diag(self) -> None:
+        # Live "why is the second pane empty?" state, read by :meth:`debug_line`.
+        self.last_response = 0.0
+        self.last_lead: Optional[str] = None
+        self.last_acquire_result = "none"
+        self.last_score = 0.0
+        self.retired = 0
 
     def reset(self) -> None:
         self._tracker.reset()
         self._objects = []
         self._pane_oid = [None, None]
         self._frames = 0
-        self._last_acquire = -(10 ** 9)
         self.motion_dx = 0.0
         self.motion_dy = 0.0
+        self._reset_diag()
+
+    def debug_line(self) -> str:
+        """One line of live state naming the exact gate that blocked an acquire.
+
+        ``last_acquire_result`` is one of: ``have2`` (both panes busy), ``low_response``
+        (phase correlation below ``min_track_response``), ``await_midpoint`` (the live
+        patch hasn't crossed the FOV midpoint yet), ``texture`` / ``overlap`` (rejected
+        in ``_try_acquire``), or ``acquired``.
+        """
+        return (
+            f"dx={self.motion_dx:+.1f} dy={self.motion_dy:+.1f} "
+            f"resp={self.last_response:.3f} lead={self.last_lead} "
+            f"objs={len(self._objects)}{[o.oid for o in self._objects]} "
+            f"retired={self.retired} gate={self.last_acquire_result} "
+            f"score={self.last_score:.2f}/{self.cfg.min_texture_score}"
+        )
 
     def update(self, frame: np.ndarray) -> List[Pane]:
         if frame is None or getattr(frame, "ndim", 0) < 2:
@@ -118,6 +135,7 @@ class DualObjectTracker:
         fh, fw = frame.shape[:2]
         dx, dy, response = self._tracker.update(frame)
         self.motion_dx, self.motion_dy = dx, dy
+        self.last_response = response
 
         # Advance / retire only when the scene genuinely moved. A low correlation
         # usually means the image blurred (hand-defocus, AF excursion), not that the
@@ -134,26 +152,64 @@ class DualObjectTracker:
                 )
                 if clamped is None or _roi_pinned_against_flow(clamped, dx, dy, fw, fh):
                     self._free_pane(obj.oid)  # panned off the FOV -> drop + free its pane
+                    self.retired += 1
                     continue
                 obj.roi = clamped
                 survivors.append(obj)
             self._objects = survivors
 
         # Relay: keep up to two patches alive, staggered so they don't march in lockstep.
-        if len(self._objects) < 2 and (response >= self.cfg.min_track_response or not self._objects):
-            if (self._frames - self._last_acquire) >= self._stagger or not self._objects:
-                self._try_acquire(frame, dx, dy)
+        if len(self._objects) >= 2:
+            self.last_acquire_result = "have2"
+        elif not (response >= self.cfg.min_track_response or not self._objects):
+            self.last_acquire_result = "low_response"
+        elif not self._past_midpoint(dx, dy, fw, fh):
+            self.last_acquire_result = "await_midpoint"
+        else:
+            self._try_acquire(frame, dx, dy)
 
         self._bind_panes()
         return self._panes(frame)
 
+    def _past_midpoint(self, dx: float, dy: float, fw: int, fh: int) -> bool:
+        """True once every live patch has been carried past the FOV midpoint along the
+        flow axis -- the trigger for acquiring the *second* patch.
+
+        A fixed frame gate cannot do this job. The number of frames a patch survives is
+        ``FOV_extent / per-frame flow``, which shifts with scroll speed and again with
+        preview conflation (a dropped frame doubles the apparent step). Measured on the
+        OrthoSim bench that count fell to ~8 frames while the gate was also 8, so each
+        successor was acquired just as its predecessor exited and the two were never on
+        screen together. Keying on position instead makes the overlap a fixed *fraction*
+        of each patch's life (~half) at any speed or frame rate.
+        """
+        if not self._objects:
+            return True
+        if abs(dx) < 0.5 and abs(dy) < 0.5:
+            return True  # no meaningful flow -- nothing to stagger against
+        horizontal = abs(dx) >= abs(dy)
+        for o in self._objects:
+            if horizontal:
+                centre, midpoint, flow = (o.roi[0] + o.roi[2]) / 2.0, fw / 2.0, dx
+            else:
+                centre, midpoint, flow = (o.roi[1] + o.roi[3]) / 2.0, fh / 2.0, dy
+            # Flow < 0 carries the patch toward 0, so "past" means below the midpoint.
+            if (centre > midpoint) if flow < 0 else (centre < midpoint):
+                return False
+        return True
+
     def _try_acquire(self, frame: np.ndarray, dx: float, dy: float) -> None:
         lead = leading_edge_from_motion(dx, dy)
+        self.last_lead = lead
         roi, score = select_leading_edge_roi(frame, lead, self.cfg)
+        self.last_score = score
         if score < self.cfg.min_texture_score:
+            self.last_acquire_result = "texture"
             return
         if any(_overlaps(roi, o.roi) for o in self._objects):
+            self.last_acquire_result = "overlap"
             return  # same patch the other pane already holds -- wait for fresh content
+        self.last_acquire_result = "acquired"
         self._objects.append(_Obj(oid=self._next_oid, roi=roi, lead=lead, born=self._frames))
         self._next_oid += 1
         self._last_acquire = self._frames

@@ -93,12 +93,37 @@ def test_update_smoke_returns_two_panes() -> None:
     assert isinstance(out, list) and len(out) == 2, out
 
 
+def test_two_panes_overlap_at_any_scroll_speed() -> None:
+    """Both panes must stay occupied for a real share of the run at slow AND fast
+    scroll. The old fixed frame gate passed at slow speed and collapsed at fast speed
+    (successor acquired exactly as its predecessor exited), which is the bench symptom:
+    a second box flashing for a single frame. Speeds are per-frame flow in pixels, and
+    240 px/frame on a 600 px-tall frame is deliberately brutal -- ~2.5 frames of life.
+    """
+    rng = np.random.default_rng(7)
+    fh, fw = 600, 800
+    big = rng.integers(0, 4096, size=(fh * 6, fw), dtype=np.uint16)
+    for step in (20, 80, 240):
+        tr = DualObjectTracker()
+        both = 0
+        frames = 40
+        for k in range(frames):
+            y = (k * step) % (fh * 5)
+            panes = tr.update(np.ascontiguousarray(big[y:y + fh, :]))
+            if panes[0] is not None and panes[1] is not None:
+                both += 1
+        assert both >= frames // 4, (
+            f"step={step}: both panes occupied only {both}/{frames} frames"
+        )
+
+
 def main() -> int:
     tests = [
         test_overlaps_helper,
         test_relay_binds_frees_and_rebinds_stably,
         test_reset_clears_state,
         test_update_smoke_returns_two_panes,
+        test_two_panes_overlap_at_any_scroll_speed,
     ]
     for t in tests:
         t()

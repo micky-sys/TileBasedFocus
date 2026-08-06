@@ -389,6 +389,41 @@ def leading_edge_from_motion(dx: float, dy: float) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def _tiles_in_lead_band(tiles, lead_edge: str, edge_band: float) -> list[Tile]:
+    """The tiles nearest ``lead_edge``, taking the leading ``edge_band`` fraction of
+    the span the candidates actually cover along the flow axis.
+
+    This is the leading-edge preference expressed as a *filter* rather than a grid
+    region, which is what lets it combine with an interior-masked grid --
+    :class:`TileGrid` regions are mutually exclusive by construction.
+
+    The band is measured against the CANDIDATE TILES, not the frame. After interior
+    masking the usable area is a sub-rectangle, and grid quantisation shrinks it
+    again: with the default 0.12 inset and 5 tiles/frame the lowest interior tile
+    centre lands at 0.62 of frame height, so a frame-relative "bottom 25 %" band
+    matches nothing and silently disables the preference. Content enters the *usable*
+    area at its edge, so that is the edge worth preferring. Never returns empty --
+    the extreme tile always qualifies.
+    """
+    tiles = list(tiles)
+    if not tiles:
+        return []
+    vertical = lead_edge in ("top", "bottom")
+    centres = [
+        (t.y0 + t.y1) / 2.0 if vertical else (t.x0 + t.x1) / 2.0 for t in tiles
+    ]
+    lo, hi = min(centres), max(centres)
+    span = hi - lo
+    if span <= 0:
+        return tiles
+    band = max(0.0, min(1.0, float(edge_band)))
+    if lead_edge in ("top", "left"):
+        limit = lo + span * band
+        return [t for t, c in zip(tiles, centres) if c <= limit]
+    limit = hi - span * band
+    return [t for t, c in zip(tiles, centres) if c >= limit]
+
+
 def select_leading_edge_roi(
     frame: np.ndarray,
     lead_edge: Optional[str],
@@ -411,6 +446,15 @@ def select_leading_edge_roi(
             exclude_edge=cfg.exclude_edge,
             edge_band=cfg.edge_band,
         )
+        # A moving bench scene wants BOTH: mask off the bezel/strip *and* still take
+        # the patch that just entered, so it has the whole usable width to cross
+        # before it exits. Masking alone used to win outright, which handed back tiles
+        # already part-way across -- short dwell, and the two-object relay never got
+        # its overlap.
+        if lead_edge is not None:
+            banded = _tiles_in_lead_band(grid, lead_edge, cfg.edge_band)
+            if banded:
+                grid = banded
     elif lead_edge is None:
         # No leading edge (bench/static, or flight before the pan starts): search
         # the WHOLE interior for the sharpest tile, not a tiny centre circle. The

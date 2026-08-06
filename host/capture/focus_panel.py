@@ -434,6 +434,8 @@ class FocusPanel(QWidget):
     fine_lock_changed = Signal(bool)     # freeze the tracked Fine tile (no re-pick)
     csv_log_toggled = Signal(bool)       # start/stop focus-telemetry CSV logging
     preview_toggled = Signal(bool)       # split-screen two-object preview on/off
+    dual_track_toggled = Signal(bool)    # two-object tracking overlay (green boxes) on/off
+    orthosim_toggled = Signal(bool)      # OrthoSim ground-truth decode + AF interior masking on/off
 
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
@@ -449,6 +451,8 @@ class FocusPanel(QWidget):
         self._last_fine_meta: Optional[dict] = None
         # Autofocus winning-tile overlay (coarse-frame pixel coords) or None.
         self._af_roi: Optional[tuple[int, int, int, int]] = None
+        # Two-object tracking overlay: list of (oid, coarse-frame roi) green boxes.
+        self._track_rois: list = []
         # When True, the coarse preview shows just the AF tile, zoomed to fill,
         # instead of the whole frame with the tile outlined -- lets the operator
         # watch focus sharpen on the actual patch AF is optimising.
@@ -577,6 +581,46 @@ class FocusPanel(QWidget):
         self._preview_toggle.toggled.connect(self._on_preview_toggle)
         top_row.addWidget(self._preview_toggle)
 
+        self._track_toggle = QPushButton("2-obj track")
+        self._track_toggle.setCheckable(True)
+        self._track_toggle.setToolTip(
+            "Track two leading-edge objects (no autofocus) and outline each with a "
+            "green box + its object id on the coarse preview, to check the flow of "
+            "objects from the leading edge across the FOV."
+        )
+        self._track_toggle.toggled.connect(self._on_track_toggle)
+        top_row.addWidget(self._track_toggle)
+
+        # OrthoSim bench rig: decode the on-screen optical ground-truth bar
+        # (distance / velocity / simulated GSD) and mask AF off the bezel + bar.
+        # The W/H/edge must match the OrthoSim display run so the homography
+        # samples the bar cells at their known positions.
+        self._ortho_toggle = QPushButton("OrthoSim GT")
+        self._ortho_toggle.setCheckable(True)
+        self._ortho_toggle.setToolTip(
+            "OrthoSim rig: decode the screen's optical ground-truth bar (distance / "
+            "velocity / simulated GSD ~= altitude) and log + overlay it, and restrict "
+            "AF tiles to the screen interior (off the bezel, fiducials and optical "
+            "strip). Set screen W/H + bar edge to match the OrthoSim display run."
+        )
+        self._ortho_toggle.toggled.connect(self._on_orthosim_toggle)
+        top_row.addWidget(self._ortho_toggle)
+
+        self._ortho_w = QSpinBox()
+        self._ortho_w.setRange(640, 15360)
+        self._ortho_w.setValue(3840)
+        self._ortho_w.setToolTip("OrthoSim display width (px)")
+        top_row.addWidget(self._ortho_w)
+        self._ortho_h = QSpinBox()
+        self._ortho_h.setRange(480, 8640)
+        self._ortho_h.setValue(2160)
+        self._ortho_h.setToolTip("OrthoSim display height (px)")
+        top_row.addWidget(self._ortho_h)
+        self._ortho_bar = QComboBox()
+        self._ortho_bar.addItems(["top", "bottom"])
+        self._ortho_bar.setToolTip("Which screen edge the optical bar sits on")
+        top_row.addWidget(self._ortho_bar)
+
         outer.addLayout(top_row)
 
         self._display = _FocusTileDisplayLabel("M4: waiting for first focus frame…")
@@ -653,6 +697,40 @@ class FocusPanel(QWidget):
 
     def preview_active(self) -> bool:
         return self._preview_toggle.isChecked()
+
+    def _on_track_toggle(self, checked: bool) -> None:
+        if not checked:
+            self._track_rois = []
+            if not self._fine_toggle.isChecked() and self._last_coarse_raw is not None:
+                self._refresh_coarse_preview()
+        self.dual_track_toggled.emit(bool(checked))
+
+    def track_active(self) -> bool:
+        return self._track_toggle.isChecked()
+
+    def _on_orthosim_toggle(self, checked: bool) -> None:
+        # Lock the layout inputs while active so the decoder's ScreenLayout can't
+        # drift mid-run; the app reads them when the toggle flips on.
+        for w in (self._ortho_w, self._ortho_h, self._ortho_bar):
+            w.setEnabled(not checked)
+        self.orthosim_toggled.emit(bool(checked))
+
+    def orthosim_active(self) -> bool:
+        return self._ortho_toggle.isChecked()
+
+    def ortho_screen_wh(self) -> tuple[int, int]:
+        return int(self._ortho_w.value()), int(self._ortho_h.value())
+
+    def ortho_bar_edge(self) -> str:
+        return self._ortho_bar.currentText()
+
+    def set_track_rois(self, rois: list) -> None:
+        """Set the two-object tracking boxes to outline on the coarse preview.
+        ``rois`` is a list of (oid, (x0,y0,x1,y1)) in coarse-frame pixel coords
+        (entries may be None for an idle pane)."""
+        self._track_rois = list(rois) if rois else []
+        if not self._fine_toggle.isChecked() and self._last_coarse_raw is not None:
+            self._refresh_coarse_preview()
 
     def receive_object_crops(self, crops) -> None:
         """Paint the two tracked-object crops (list of 2 grayscale uint8 arrays or
@@ -1192,16 +1270,35 @@ class FocusPanel(QWidget):
             gray8.data, gw, gh, gw, QImage.Format.Format_Grayscale8
         ).copy()
         pix = QPixmap.fromImage(qimg)
-        if self._af_roi is not None:
+        if self._af_roi is not None or self._track_rois:
             rh, rw = raw_u16.shape[:2]
             sx, sy = gw / max(1, rw), gh / max(1, rh)
-            x0, y0, x1, y1 = self._af_roi
             painter = QPainter(pix)
             painter.setPen(QPen(QColor(0, 255, 0), 2))
-            painter.drawRect(
-                int(x0 * sx), int(y0 * sy),
-                max(1, int((x1 - x0) * sx)), max(1, int((y1 - y0) * sy)),
-            )
+            if self._af_roi is not None:
+                x0, y0, x1, y1 = self._af_roi
+                ax0, ay0 = int(x0 * sx), int(y0 * sy)
+                painter.drawRect(
+                    ax0, ay0,
+                    max(1, int((x1 - x0) * sx)), max(1, int((y1 - y0) * sy)),
+                )
+                # Labelled "AF": it shares the tracking boxes' green, holds still (AF
+                # pins a tile rather than following the scene) and survives an AF stop,
+                # so unlabelled it reads as a frozen tracked object.
+                painter.drawText(ax0 + 3, ay0 + 14, "AF")
+            # Two-object tracking boxes: same green as the AF tile, labelled with the
+            # object id so the leading-edge -> trailing-edge flow (and re-acquires,
+            # where the id jumps) is visible frame to frame.
+            for entry in self._track_rois:
+                if entry is None:
+                    continue
+                oid, (x0, y0, x1, y1) = entry
+                dx0, dy0 = int(x0 * sx), int(y0 * sy)
+                painter.drawRect(
+                    dx0, dy0,
+                    max(1, int((x1 - x0) * sx)), max(1, int((y1 - y0) * sy)),
+                )
+                painter.drawText(dx0 + 3, dy0 + 14, f"#{oid}")
             painter.end()
         self._display.setPixmap(
             pix.scaled(

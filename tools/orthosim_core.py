@@ -51,10 +51,13 @@ class OrthoSimConfig:
     magnification: float = 1.0         # M: camera-px per screen-px (from fiducials)
 
     # Simulated flight
-    ground_speed_mps: float = 40.0     # initial simulated ground speed
+    ground_speed_mps: float = 51.44    # ~100 kn flight default (51.44 m/s = 100.0 kn)
     speed_step_mps: float = 2.0        # Up/Down increment
     max_speed_mps: float = 400.0
-    zoom: float = 0.0                  # 0 => auto "fit width" at startup
+    # ~10k ft AGL for the 300 mm lens (cam 2439008), p=3.45 um: sim GSD = 5/1.4264 =
+    # 3.505 cm/cam-px -> altitude = 2852.9 * GSD_cm = 10,000 ft (HANDOFF §28). A 400 mm
+    # lens reads ~13.3k ft at the same zoom. Set 0 to restore "auto fit width".
+    zoom: float = 1.4264               # screen-px per ortho-px
     zoom_step: float = 1.05            # multiplicative per key press
     scroll_dir: str = "up"            # content flows: "up","down","left","right"
 

@@ -63,6 +63,7 @@ from .autofocus import AutoFocusController, FineFocusTracker
 from .autofocus import focus_measure_full_res as af_full_res_measure
 from .dual_tracker import DualObjectTracker
 from .autofocus_v2 import AutoFocusConfigV2
+from .orthosim_decode import ScreenLayout, SpeedDistanceTracker, decode_frame
 from .kyfg_backend import KyfgCamera
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
@@ -685,6 +686,8 @@ class MainWindow(QMainWindow):
         # Independent two-object tracker for the optional split-screen preview
         # (relays a leading-edge patch onto each pane; runs with or without AF).
         self._dual_tracker = DualObjectTracker()
+        self._dual_track_frames = 0
+        self._dual_track_last_live = -1
         # Latest Fine tile bbox the acquisition auto-picked (updated per frame), and
         # the ROI pinned by "Lock tile" (freezes that tile; the focus-telemetry
         # scatter/CSV score that tile as the operator creeps focus).
@@ -2130,6 +2133,8 @@ class MainWindow(QMainWindow):
         self._focus_panel.fine_lock_changed.connect(self._on_fine_lock_changed)
         self._focus_panel.csv_log_toggled.connect(self._on_csv_log_toggled)
         self._focus_panel.preview_toggled.connect(self._on_preview_toggled)
+        self._focus_panel.dual_track_toggled.connect(self._on_dual_track_toggled)
+        self._focus_panel.orthosim_toggled.connect(self._on_orthosim_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2181,7 +2186,13 @@ class MainWindow(QMainWindow):
             dive_burst_pulses=1,    # ONE str3 pulse per burst -> the dive is 4 str3 pulses total
             dive_min_drop_pulses=3, # just confirm the 4-pulse dive actually moved down
             climb_step_pulses=2,    # str0 pulses/frame on the way up (fine)
-            climb_settle_frames=1,  # score every frame; the firmware now paces at the 209 ms floor
+            climb_settle_frames=1,  # (superseded by climb_lucky_frames; kept for config parity)
+            # SNR: lucky-imaging + curve-fit peak (revert with climb_lucky_frames=1,
+            # peak_curve_fit=False). Outdoors/in-flight the score is noisier -- dwell
+            # 3 frames/position and keep the sharpest (turbulence/vibration only blur),
+            # ~3x climb time at ~4.8 fps but a much cleaner score-vs-encoder curve.
+            climb_lucky_frames=3,
+            peak_curve_fit=True,
             encoder_counts_per_pulse=af_counts_per_pulse,
             # 1.7x margin over the measured ~1290-count lash: park_upward only lands the
             # lens on focus when its down-then-up excursion EXCEEDS the true dead-band.
@@ -2199,6 +2210,18 @@ class MainWindow(QMainWindow):
             # descend fling it to end-of-travel?). Set False for normal one-shot AF.
             step_gate=False,
         )
+        # Keep a handle so the OrthoSim toggle can flip AF interior/edge masking on
+        # this shared dataclass (the engine re-reads it every frame). OrthoSim decode
+        # state is lazily armed by _on_orthosim_toggled.
+        self._af_cfg = af_cfg
+        # Share that same dataclass with the two-object tracker (built earlier in
+        # __init__, before af_cfg exists), so its boxes honour the OrthoSim interior
+        # masking too -- otherwise it tracks the bezel/office while AF ignores it.
+        self._dual_tracker.cfg = af_cfg
+        self._ortho_layout: Optional[ScreenLayout] = None
+        self._ortho_tracker: Optional[SpeedDistanceTracker] = None
+        self._ortho_last_t = 0.0
+        self._ortho_fail = 0
         self._autofocus = (
             AutoFocusController(
                 self._serial,
@@ -3234,6 +3257,236 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"preview full-res {'on' if enable else 'off'} failed: {exc}")
 
+    def _on_dual_track_toggled(self, on: bool) -> None:
+        """Start the two-object tracking overlay fresh each time it's toggled. Pure
+        coarse-frame tracking (no full-res, no AF); clears the boxes when turned off."""
+        self._dual_tracker.reset()
+        if not on:
+            self._focus_panel.set_track_rois([])
+
+    def _on_orthosim_toggled(self, on: bool) -> None:
+        """Arm/disarm OrthoSim bench mode: (1) flip AF interior/edge masking on the
+        shared AF config so focus tiles stay off the bezel/fiducials/optical bar, and
+        (2) build the decoder ScreenLayout + a fresh SpeedDistanceTracker for the live
+        ground-truth readout. Log-only -- nothing here drives AF."""
+        if on:
+            w, h = self._focus_panel.ortho_screen_wh()
+            edge = self._focus_panel.ortho_bar_edge()
+            self._ortho_layout = ScreenLayout(screen_w=w, screen_h=h, bar_edge=edge)
+            self._ortho_tracker = SpeedDistanceTracker()
+            self._ortho_last_t = 0.0
+            self._ortho_fail = 0
+            self._af_cfg.restrict_interior = True
+            self._af_cfg.exclude_edge = edge
+            self._log(
+                f"OrthoSim GT: ON (screen {w}x{h}, bar={edge}); AF tiles restricted "
+                "to screen interior (off bezel/fiducials/optical strip)."
+            )
+        else:
+            self._ortho_layout = None
+            self._ortho_tracker = None
+            self._af_cfg.restrict_interior = False
+            self._af_cfg.exclude_edge = None
+            self._log("OrthoSim GT: OFF; AF interior restriction cleared.")
+
+    def _feed_orthosim(self, raw) -> None:
+        """Throttled (~1 Hz) decode of the OrthoSim optical ground-truth bar from the
+        coarse frame; logs + overlays measured/encoded velocity, distance and
+        simulated GSD (altitude proxy). Best-effort -- silent until fiducials + CRC
+        both pass. ponytail: runs on the 4x-subsampled coarse frame; if ArUco can't
+        resolve the fiducials there, a full-res crop tap is the upgrade path."""
+        if self._ortho_layout is None or self._ortho_tracker is None:
+            return
+        # Stand down while AF is hunting. One decode (ArUco + homography over the whole
+        # coarse frame) blocks the GUI thread long enough to conflate ~2-3 focus frames,
+        # which halves the rate AF ticks at -- doubling the sweep, and with it how far
+        # the scene pans mid-sweep. The interior/edge tile masking is a separate config
+        # flip that stays armed, so we lose only the telemetry, and only for the few
+        # seconds of a run (the readout is constant at fixed scroll speed anyway).
+        af = getattr(self, "_autofocus", None)
+        if af is not None and af.is_running():
+            return
+        now = time.monotonic()
+        if now - self._ortho_last_t < 1.0:
+            return
+        self._ortho_last_t = now
+        try:
+            gt = decode_frame(raw, self._ortho_layout)
+        except Exception as exc:  # pragma: no cover - UI guard
+            self._log(f"OrthoSim decode error: {exc}")
+            return
+        if gt is None:
+            self._ortho_fail += 1
+            if self._ortho_fail % 5 == 1:
+                # Separate "fiducials not found" from "found but bar/CRC bad" and report
+                # the frame we actually decode (4x coarse), so a live "everything is
+                # visible but nothing decodes" can be triaged without a rebuild.
+                try:
+                    from .orthosim_decode import _to_gray_u8, detect_fiducials
+                    g = _to_gray_u8(raw)
+                    src = detect_fiducials(g, self._ortho_layout.aruco_dict)
+                    stage = ("no fiducials found"
+                             if src is None else "fiducials OK, bar/CRC failed")
+                    # Report the *sensor* range: ``g`` is min-max normalised, so its
+                    # own min/max is always 0/255 and says nothing about exposure.
+                    detail = (f"{stage}; frame={g.shape[1]}x{g.shape[0]} "
+                              f"raw min/max={int(raw.min())}/{int(raw.max())}")
+                    # One-shot diagnostic dump, guarded to a single write.
+                    if not getattr(self, "_ortho_dbg", False):
+                        self._ortho_dbg = True
+                        if src is None:
+                            # Nothing to rectify against, so dump the frame as the
+                            # camera sees it -- the usual causes (corner markers
+                            # outside the FOV, or too defocused to resolve) are
+                            # obvious on sight and invisible in any scalar we log.
+                            detail += self._dump_ortho_frame_debug(g)
+                        else:
+                            # Bar, not fiducials: save the rectified display-space
+                            # image + per-cell levels to separate blur from a
+                            # brightness gradient from a sampling offset.
+                            detail += self._dump_ortho_bar_debug(raw)
+                except Exception as exc:  # pragma: no cover - diag only
+                    detail = f"diag error: {exc}"
+                self._log(f"OrthoSim GT: no decode ({detail}) x{self._ortho_fail}")
+            return
+        self._ortho_fail = 0
+        if not getattr(self, "_ortho_scale_logged", False):
+            self._ortho_scale_logged = True
+            self._log(self._measure_ortho_scale(raw))
+        mm = self._ortho_tracker.update(gt)
+        if mm is None:
+            return
+        # GSD -> altitude (ft): alt = 10 * GSD_cm * f_mm / p_um * 3.28084 (HANDOFF §28).
+        # Focal length is per lens (keyed by camera serial); pitch is the shared IMX661
+        # sensor (3.45 um). Falls back to raw GSD when the lens focal length is unknown.
+        _CAM_FOCAL_MM = {"2439008": 300.0, "2439007": 400.0, "2439006": 400.0}
+        _PITCH_UM = 3.45
+        alt_txt = f"GSD {mm.gsd_cm:.3f} cm/px" if mm.gsd_cm > 0 else "unset"
+        ap = self._active_pipeline()
+        if mm.gsd_cm > 0 and ap is not None:
+            f_mm = _CAM_FOCAL_MM.get(str(ap.camera_serial).strip())
+            if f_mm:
+                alt_ft = 10.0 * mm.gsd_cm * f_mm / _PITCH_UM * 3.28084
+                alt_txt = f"{alt_ft:,.0f} ft (GSD {mm.gsd_cm:.3f} cm/px)"
+        flags = " SEAM" if mm.seam else ""
+        if gt.paused:
+            flags += " PAUSED"
+        _KN = 1.943844  # m/s -> knots
+        text = (
+            f"OrthoSim GT: dist={mm.distance_m:.1f} m  "
+            f"vel meas={mm.velocity_mps * _KN:.1f} / "
+            f"enc={mm.encoded_velocity_mps * _KN:.1f} kn  "
+            f"alt={alt_txt}{flags}"
+        )
+        self._focus_panel.set_autofocus_status(text)
+        self._log(text)
+
+    def _dump_ortho_frame_debug(self, gray_u8) -> str:
+        """One-shot: save the coarse frame the decode actually runs on, for the
+        'no fiducials found' case where there is nothing to rectify against."""
+        try:
+            import cv2
+            from pathlib import Path
+            p = Path(__file__).resolve().parents[2] / "ortho_dbg_frame.png"
+            cv2.imwrite(str(p), gray_u8)
+            return f" [dbg saved: {p.name}]"
+        except Exception as exc:  # pragma: no cover - diag only
+            return f" [dbg error: {exc}]"
+
+    def _measure_ortho_scale(self, raw) -> str:
+        """Measure camera-px per display-px from the corner fiducials.
+
+        The altitude readout is derived from the bar's ``gsd_cm``, which the display
+        computed as ``ortho_gsd_cm / (Z * M)`` from a hand-set ``--M``. Nothing in
+        that chain observes the camera, so an uncalibrated M silently scales the
+        reported altitude. The markers are at known display-pixel positions, so
+        measuring their imaged separation gives M independently and makes the
+        altitude checkable. One-shot: costs a second ArUco pass, and M only changes
+        when the rig geometry does.
+        """
+        try:
+            from .orthosim_decode import (
+                _to_gray_u8, detect_fiducials, measure_scale,
+            )
+            lay = self._ortho_layout
+            src = detect_fiducials(_to_gray_u8(raw), lay.aruco_dict)
+            if src is None:
+                return "OrthoSim scale: fiducials not resolvable; M unmeasured"
+            ss = KyfgCamera.SUBSAMPLE_FACTOR  # decode runs on the decimated tap
+            mx, my = (v * ss for v in measure_scale(src, lay))
+            if mx <= 0 or my <= 0:
+                return "OrthoSim scale: degenerate marker geometry"
+            return (f"OrthoSim scale: M measured = {mx:.4f} x / {my:.4f} y "
+                    f"camera-px per display-px (anisotropy {mx / my:.3f}); "
+                    f"altitude scales as 1/M, so the readout is only right if the "
+                    f"display was launched with --M {(mx + my) / 2:.4f}")
+        except Exception as exc:  # pragma: no cover - diag only
+            return f"OrthoSim scale: measure error: {exc}"
+
+    def _dump_ortho_bar_debug(self, raw) -> str:
+        """One-shot: save the rectified screen + bar-band crop and report the per-cell
+        levels, so a 'fiducials OK / bar CRC fail' can be diagnosed (blur vs. gradient
+        vs. offset) from the actual pixels. Returns a short suffix for the log line."""
+        try:
+            import cv2
+            from pathlib import Path
+            from .orthosim_decode import rectify_screen, _sample_bits
+            import orthosim_codec as codec
+            lay = self._ortho_layout
+            rect = rectify_screen(raw, lay)
+            if rect is None:
+                return " [dbg: rectify failed]"
+            root = Path(__file__).resolve().parents[2]
+            cv2.imwrite(str(root / "ortho_dbg_rectified.png"), rect)
+            centers, cell_w = lay.bar_cell_centers()
+            cy = int(round(centers[0][1]))
+            y0 = max(0, cy - lay.bar_height_px // 2 - 8)
+            y1 = min(rect.shape[0], cy + lay.bar_height_px // 2 + 8)
+            x0 = max(0, int(centers[0][0] - cell_w))
+            x1 = min(rect.shape[1], int(centers[-1][0] + cell_w))
+            cv2.imwrite(str(root / "ortho_dbg_bar.png"), rect[y0:y1, x0:x1])
+            bits = _sample_bits(rect, lay)
+            # per-cell mean levels along the band, to expose a brightness gradient
+            win = max(1, int(cell_w * 0.3))
+            lv = []
+            for cx, ccy in centers:
+                xa, xb = int(cx) - win, int(cx) + win + 1
+                ya, yb = int(ccy) - win, int(ccy) + win + 1
+                lv.append(float(rect[max(0, ya):yb, max(0, xa):xb].mean()))
+            import numpy as _np
+            lv = _np.asarray(lv)
+            sync_ok = bits[:codec.SYNC_BITS] == list(codec.SYNC_PATTERN) \
+                if hasattr(codec, "SYNC_PATTERN") else "?"
+            head = "".join(str(b) for b in bits[:24])
+            return (f" [dbg saved: rect={rect.shape[1]}x{rect.shape[0]} "
+                    f"cell_w={cell_w:.1f} lv min/mean/max="
+                    f"{lv.min():.0f}/{lv.mean():.0f}/{lv.max():.0f} "
+                    f"lv_left/right={lv[:10].mean():.0f}/{lv[-10:].mean():.0f} "
+                    f"sync_ok={sync_ok} bits[:24]={head}]")
+        except Exception as exc:  # pragma: no cover - diag only
+            return f" [dbg error: {exc}]"
+
+    def _feed_dual_track(self, raw) -> None:
+        """Run the two-object tracker on the coarse frame and outline each pane's tile
+        (coarse-frame coords, with its object id) on the main preview. No AF, no
+        full-res -- this is the 'watch the leading-edge object flow' test tool."""
+        panes = self._dual_tracker.update(raw)
+        rois: list = []
+        for pane in panes:
+            if pane is None:
+                rois.append(None)
+                continue
+            oid, (x0, y0, x1, y1) = pane
+            rois.append((oid, (int(x0), int(y0), int(x1), int(y1))))
+        self._focus_panel.set_track_rois(rois)
+        # Diagnostic: log on every change in occupied-pane count (so a box that
+        # flickers for a single frame is still captured) plus a periodic heartbeat.
+        live = sum(1 for p in panes if p is not None)
+        self._dual_track_frames += 1
+        if live != self._dual_track_last_live or self._dual_track_frames % 16 == 1:
+            self._dual_track_last_live = live
+            self._log(f"2-obj[{live}]: {self._dual_tracker.debug_line()}")
+
     def _feed_dual_preview(self, raw) -> None:
         """Track up to two leading-edge patches on the coarse frame and pin each pane's
         ROI (scaled to full-res sensor pixels, Bayer-quad aligned) so the pipeline ships
@@ -3753,10 +4006,18 @@ class MainWindow(QMainWindow):
                     f"{self._raw_focus_drops_wrong_cam}); ignored"
                 )
             return
-        # Optional split-screen two-object preview: independent of AF and of the
-        # coarse/fine submode, so feed it from the raw coarse frame up front.
-        if self._focus_panel.preview_active():
+        # Optional two-object tools: independent of AF and of the coarse/fine submode,
+        # fed from the raw coarse frame up front. Mutually exclusive so the shared
+        # tracker only advances once per frame -- the green-box overlay (main preview)
+        # takes priority over the split-screen crop preview.
+        if self._focus_panel.track_active():
+            self._feed_dual_track(raw)
+        elif self._focus_panel.preview_active():
             self._feed_dual_preview(raw)
+        # OrthoSim bench rig: decode the on-screen optical ground-truth bar (throttled
+        # inside). Independent of AF and submode; log + overlay only.
+        if self._focus_panel.orthosim_active():
+            self._feed_orthosim(raw)
         if self._modes.focus_submode() == FocusSubMode.FINE:
             self._update_fine_leading_edge(active, raw)
             return
@@ -4366,6 +4627,10 @@ def main() -> int:
     parser.add_argument(
         "--log-level", default="INFO", help="Python logging level (DEBUG/INFO/WARNING)",
     )
+    parser.add_argument(
+        "--screen", type=int, default=None,
+        help="Monitor index to place the window on (QApplication.screens() order).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -4390,6 +4655,15 @@ def main() -> int:
         gps_port=args.gps_port,
     )
     win.show()
+    if args.screen is not None:
+        # Recenter the window onto the requested monitor after show() (geometry
+        # isn't valid until then). Keeps it a normal resizable window -- the
+        # operator can maximize; we just pick the screen.
+        screens = app.screens()
+        if 0 <= args.screen < len(screens):
+            geo = win.frameGeometry()
+            geo.moveCenter(screens[args.screen].availableGeometry().center())
+            win.move(geo.topLeft())
     return app.exec()
 
 

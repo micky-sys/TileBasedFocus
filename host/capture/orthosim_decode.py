@@ -77,18 +77,28 @@ class ScreenLayout:
         )
 
     def bar_cell_centers(self) -> Tuple[np.ndarray, float]:
-        """Return (Nx2 cell-centre coords in display px, cell_w). Matches the
-        display's ``_draw_bar`` layout exactly."""
+        """Return (Nx2 cell-centre coords in display px, cell_w).
+
+        Mirrors ``tools/orthosim_gui.py::_draw_bar`` EXACTLY: the bar shares the
+        fiducial row (vertically centred on the marker band, not stacked below it)
+        and is inset horizontally to clear each corner marker + its 6 px quiet zone +
+        a side margin. These two formulas must track that method; a drift here samples
+        the wrong band and every frame fails CRC even with the screen fully visible.
+        ponytail: the pixel geometry is duplicated across the display and the decoder
+        (they run on different PCs); upgrade path = hoist it into ``orthosim_codec``.
+        """
         n = codec.TOTAL_CELLS
-        if self.bar_edge == "top":
-            top = self.fiducial_px + self.fiducial_margin_px + 12
-        else:
-            top = self.screen_h - self.bar_height_px
-        x0 = self.bar_margin_px
-        x1 = self.screen_w - self.bar_margin_px
+        s = self.fiducial_px
+        fm = self.fiducial_margin_px
+        bh = self.bar_height_px
+        band_top = fm if self.bar_edge == "top" else self.screen_h - fm - s
+        top = band_top + max(0, (s - bh) // 2)
+        clear = fm + s + 6 + self.bar_margin_px   # matches _draw_bar's ``clear``
+        x0 = clear
+        x1 = self.screen_w - clear
         band_w = x1 - x0
         cell_w = band_w / n
-        cy = top + self.bar_height_px / 2.0
+        cy = top + bh / 2.0
         centers = np.array(
             [[x0 + (i + 0.5) * cell_w, cy] for i in range(n)], dtype=np.float32
         )
@@ -102,7 +112,16 @@ def _to_gray_u8(frame: np.ndarray) -> np.ndarray:
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if cv2 is not None else img[..., 0]
     if img.dtype == np.uint16:
-        img = (img >> 8).astype(np.uint8)
+        # This is right-justified sensor data (e.g. BayerRG14, values 0..16383). A
+        # fixed ``>>8`` treats it as full 16-bit and crushes a near-full-scale screen
+        # into a 0..63 u8 -- too little contrast for ArUco to resolve the marker bits.
+        # Stretch to the full 0..255 range so marker edges keep maximum contrast
+        # regardless of bit depth / exposure.
+        if cv2 is not None:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        else:
+            m = int(img.max()) or 1
+            img = ((img.astype(np.uint32) * 255) // m).astype(np.uint8)
     elif img.dtype != np.uint8:
         img = np.clip(img, 0, 255).astype(np.uint8)
     return np.ascontiguousarray(img)
@@ -131,6 +150,35 @@ def detect_fiducials(gray_u8: np.ndarray, dict_name: str) -> Optional[np.ndarray
     if not all(k in by_id for k in (0, 1, 2, 3)):
         return None
     return np.array([by_id[0], by_id[1], by_id[2], by_id[3]], dtype=np.float32)
+
+
+def measure_scale(
+    src: np.ndarray, layout: ScreenLayout
+) -> Tuple[float, float]:
+    """Imaged camera-px per display-px along each screen axis, from marker centres.
+
+    ``src`` is the id 0..3 (TL,TR,BR,BL) array from :func:`detect_fiducials`. The
+    markers sit at *known* display-pixel positions, so their imaged separation
+    measures the magnification ``M`` that the display otherwise takes on faith from
+    its ``--M`` flag. That matters because the encoded GSD -- and the altitude the
+    capture app derives from it -- is ``ortho_gsd_cm / (Z * M)``: an uncalibrated M
+    scales the reported altitude by exactly the same factor, with nothing in the
+    decode able to notice. Averages the two opposite edges per axis so a modest
+    perspective tilt cancels instead of biasing one side.
+
+    Returns (x, y) in camera-px per display-px, in whatever resolution ``src`` was
+    detected at -- multiply by the decimation factor for full-res camera px.
+    """
+    dst = layout.fiducial_centers()
+
+    def edge(a: int, b: int) -> float:
+        known = float(np.hypot(*(dst[a] - dst[b])))
+        return float(np.hypot(*(src[a] - src[b]))) / known if known else 0.0
+
+    return (
+        (edge(0, 1) + edge(3, 2)) / 2.0,   # top and bottom edges
+        (edge(0, 3) + edge(1, 2)) / 2.0,   # left and right edges
+    )
 
 
 def rectify_screen(
@@ -165,8 +213,42 @@ def _sample_bits(rectified_gray: np.ndarray, layout: ScreenLayout) -> List[int]:
         patch = rectified_gray[y0:y1, x0:x1]
         vals.append(float(patch.mean()) if patch.size else 0.0)
     arr = np.array(vals, dtype=np.float32)
-    thr = float((arr.max() + arr.min()) / 2.0)
-    return [1 if v >= thr else 0 for v in arr]
+    return [1 if v >= t else 0 for v, t in zip(arr, _cell_thresholds(arr))]
+
+
+_ENVELOPE_CELLS = 15
+"""Width (in cells) of the local black/white envelope used to threshold the bar."""
+
+
+def _cell_thresholds(arr: np.ndarray) -> np.ndarray:
+    """Per-cell 0/1 decision level, tracking illumination across the bar.
+
+    A single global ``(max+min)/2`` assumes the bar is evenly lit. On the real rig
+    it is not: the imaged white level ramps by better than 5:1 end to end (measured
+    ~205 at one end against ~43 at the other) while black stays near 15, so the far
+    end's whites fall under a global midpoint and read as black -- every frame fails
+    CRC even with the screen fully visible and in focus. Thresholding each cell
+    against the midpoint of its *local* min/max envelope follows the ramp instead.
+
+    ponytail: a run of >= ``_ENVELOPE_CELLS`` identical cells collapses the local
+    envelope (min == max), which would split a flat run down the middle, so those
+    windows fall back to the global midpoint. Ceiling: a long run sitting in a badly
+    lit stretch can still misread; the CRC catches it and we simply use the next
+    frame (decode runs ~1 Hz). Upgrade path = encode with a run-length limit, or fit
+    a smooth illumination model over the whole bar rather than a sliding window.
+    """
+    k = min(_ENVELOPE_CELLS, arr.size)
+    if k < 3:
+        return np.full(arr.shape, (float(arr.max()) + float(arr.min())) / 2.0)
+    pad = np.pad(arr, (k // 2, k - 1 - k // 2), mode="edge")
+    win = np.lib.stride_tricks.sliding_window_view(pad, k)
+    lo, hi = win.min(axis=1), win.max(axis=1)
+    global_span = float(arr.max() - arr.min())
+    return np.where(
+        (hi - lo) >= 0.25 * global_span,
+        (lo + hi) / 2.0,
+        (float(arr.max()) + float(arr.min())) / 2.0,
+    )
 
 
 def decode_frame(
@@ -191,6 +273,7 @@ class MeasuredMotion:
     distance_m: float
     velocity_mps: float          # from Δdistance / Δt (measured)
     encoded_velocity_mps: float  # velocity field the display encoded
+    gsd_cm: float                # simulated camera GSD (altitude proxy); 0 if unset
     tick: int
     seam: bool
     ok: bool
@@ -239,6 +322,7 @@ class SpeedDistanceTracker:
             distance_m=gt.distance_m,
             velocity_mps=vel,
             encoded_velocity_mps=gt.velocity_mps,
+            gsd_cm=gt.gsd_cm,
             tick=gt.tick,
             seam=gt.seam,
             ok=True,
@@ -270,8 +354,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
     if gt is None:
         print("decode FAILED (no fiducials / bad CRC)")
         return 1
+    gsd_txt = f"{gt.gsd_cm:.3f} cm/px" if gt.gsd_cm > 0 else "unset"
     print(
         f"distance={gt.distance_m:.3f} m  velocity={gt.velocity_mps:.3f} m/s  "
+        f"gsd={gsd_txt}  "
         f"tick={gt.tick}  seam={gt.seam} paused={gt.paused} calib={gt.calibration}"
     )
     return 0

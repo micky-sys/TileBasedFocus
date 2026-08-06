@@ -69,11 +69,103 @@ from .autofocus import (
     leading_edge_from_motion,
     select_leading_edge_roi,
 )
+# Reuse the dual-preview tracker's ROI-overlap test so the on-deck handover object
+# can't re-pick the patch the primary already holds (same content -> useless cross-cal).
+from .dual_tracker import _overlaps
 from .focus_axis import FocusAxis, OpenLoopAxis
 
 log = logging.getLogger(__name__)
 
 Roi = tuple[int, int, int, int]  # (x0, y0, x1, y1)
+
+
+def _fit_peak(samples: list, window: int, log_domain: bool = True) -> Optional[float]:
+    """Sub-sample peak position of a noisy score curve via a local parabola fit.
+
+    ``samples`` is the climb's ``[(pos, score), ...]`` in climb order. We fit a
+    quadratic to the ``window`` points on each side of the argmax and return the
+    vertex ``-b/2a`` -- using ALL those points averages out the per-sample noise
+    that makes a raw argmax jump around. Returns ``None`` (caller falls back to
+    argmax) when there aren't enough points, the fit isn't concave (``a >= 0`` --
+    no real hump), or the vertex lands outside the fitted span (extrapolation is
+    not a measurement). The vertex is clamped to the fitted x-range as a guard.
+
+    ``log_domain`` fits ``log(score)`` first. The metric is a variance estimator,
+    so its noise is multiplicative (SD grows with the score); ``log`` is the
+    variance-stabilising transform that turns that into ~constant additive noise,
+    which is what plain least-squares assumes. It's also a better-shaped model: a
+    near-focus sharpness peak is ~Gaussian and ``log(Gaussian)`` is exactly a
+    parabola. If the log fit is degenerate we fall through to the linear fit (also
+    the ``log_domain=False`` path).
+    """
+    if not samples or window < 1:
+        return None
+    xs_all = [p for p, _ in samples]
+    ys_all = [s for _, s in samples]
+    i = int(np.argmax(ys_all))
+    lo, hi = max(0, i - window), min(len(samples), i + window + 1)
+    xs = np.asarray(xs_all[lo:hi], dtype=np.float64)
+    ys = np.asarray(ys_all[lo:hi], dtype=np.float64)
+    if xs.size < 3 or np.ptp(xs) <= 0:
+        return None
+    xmin, xmax = float(xs.min()), float(xs.max())
+
+    def _vertex(vals: np.ndarray) -> Optional[float]:
+        a, b, _c = np.polyfit(xs, vals, 2)
+        if a >= 0:  # not concave -> no interior peak to refine
+            return None
+        xv = -b / (2.0 * a)
+        if xv < xmin or xv > xmax:  # extrapolation is not a measurement
+            return None
+        return float(xv)
+
+    if log_domain:
+        r = _vertex(np.log(np.clip(ys, 1e-9, None)))
+        if r is not None:
+            return r
+    return _vertex(ys)  # linear fallback / log_domain=False
+
+
+class _CrossCal:
+    """Overlap cross-calibration between two tracked objects' focus scores.
+
+    While object A (the scored primary) and object B (the on-deck handover target)
+    are BOTH in the frame, we score each on the SAME frame and keep their ratio. The
+    robust ``ratio()`` = ``median(A / B)`` is the scale that maps B's scores onto A's
+    scale, so when A pans off and B is promoted the stitched score curve stays
+    continuous (``B_norm = B * ratio``). Two design choices matter:
+
+    * We keep RATIOS, not a slope fit: the focus metric is a variance estimator with
+      multiplicative noise, so a per-frame A/B ratio is the noise-stable quantity.
+    * We take the MEDIAN, so a single blurred/occluded overlap frame can't skew the
+      calibration (the mean would).
+
+    ``valid()`` gates on having at least ``min_overlap`` usable pairs -- a handover with
+    too little shared visibility is untrustworthy, and the engine falls back rather
+    than stitching blind.
+    """
+
+    def __init__(self, min_overlap: int) -> None:
+        self._min_overlap = int(min_overlap)
+        self._ratios: list[float] = []
+
+    def add(self, score_a: Optional[float], score_b: Optional[float]) -> None:
+        # Guard the denominator: a near-flat/near-black B gives a huge, meaningless
+        # ratio that median can't fully tame if enough of them pile up.
+        if score_a is None or score_b is None:
+            return
+        if score_a > 0.0 and score_b > 1e-6:
+            self._ratios.append(float(score_a) / float(score_b))
+
+    def valid(self) -> bool:
+        return len(self._ratios) >= self._min_overlap
+
+    def ratio(self) -> float:
+        return float(np.median(self._ratios)) if self._ratios else 1.0
+
+    @property
+    def count(self) -> int:
+        return len(self._ratios)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +225,22 @@ class AutoFocusConfigV2:
     the peak (rejects a single-frame noise dip)."""
     climb_min_samples: int = 5
     """Minimum samples before a peak may be declared (need a rising shoulder first)."""
+    climb_lucky_frames: int = 1
+    """Lucky-imaging: frames scored at EACH encoder position before stepping. The
+    per-position score is the MAX over them -- turbulence/vibration only ever blur
+    (lower) sharpness, so the sharpest frame in a short burst is the least-corrupted
+    read of true focus, while the mean is biased low. 1 = score every frame (fastest,
+    today's behaviour); >1 trades ~Nx climb time for a cleaner curve. Supersedes the
+    dead ``climb_settle_frames`` knob (which was set but never read)."""
+    peak_curve_fit: bool = True
+    """Refine ``best_pos`` by fitting a parabola to the score curve near the argmax
+    (see :func:`_fit_peak`) instead of trusting a single noisy sample. Off -> raw
+    argmax (revert switch)."""
+    peak_fit_window: int = 3
+    """Samples each side of the argmax used by the curve fit."""
+    peak_fit_log: bool = True
+    """Fit the peak parabola on log(score) (variance-stabilising for the metric's
+    multiplicative noise; log(Gaussian)==parabola). Off -> plain linear fit."""
 
     # %% Park + hold %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     park_tolerance_pulses: int = 4
@@ -196,6 +304,12 @@ class AutoFocusConfigV2:
     park_settle_s: float = 1.2
     """Wall-clock dwell AFTER the encoder has arrived at best_pos (lets the shaft ring
     down) before the parked-score sanity check + hold."""
+    park_settle_max_s: float = 8.0
+    """HARD cap on the whole settle sub-phase. The dwell above wants the encoder to sit
+    still within park_stable_pulses, but full-res crops stream every frame during park
+    and jitter the encoder SPI read, so on a live rig that dwell can never latch and the
+    park hangs at 'parking at focus' forever. We already KNOW best_pos from the climb, so
+    when this cap trips we measure once (best effort) and hold there anyway."""
     settle_frames: int = 3
     """Frames averaged for the parked-focus sanity measurement."""
     backlash_pulses: int = 3
@@ -218,6 +332,22 @@ class AutoFocusConfigV2:
     min_track_response: float = 0.05
     """phaseCorrelate response floor below which we don't trust the motion vector
     (so we hold the ROI rather than chase a garbage shift)."""
+
+    # %% Cross-object handover (moving-scene climb) %%%%%%%%%%%%%%%%%%%%%%%
+    enable_handover: bool = True
+    """Keep a second leading-edge object on deck during the CLIMB and cross-calibrate
+    the two so the score-vs-encoder curve can be stitched across a handover when the
+    primary pans off mid-climb. Off = single-object climb (finishes/fails as before
+    when the target leaves), which is all a near-static bench needs."""
+    xcal_min_overlap_frames: int = 6
+    """Minimum frames with BOTH objects textured-and-visible before their cross-cal
+    ratio is trusted for a handover. Fewer -> too little shared visibility to pin the
+    A/B scale; the engine then finishes the climb with the peak so far instead of
+    stitching a new object on an unknown scale."""
+    handover_stagger_frames: int = 8
+    """Don't acquire the on-deck object until this many frames after the primary was
+    acquired, so the pair doesn't enter (and later leave) the FOV in lockstep -- that
+    would give near-zero overlap to calibrate on. Mirrors DualObjectTracker's stagger."""
 
     # %% Hold / re-verify %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     reverify_interval_s: float = 0.0
@@ -279,6 +409,17 @@ class _RunState:
     motion_dy: float = 0.0
     objects: list = field(default_factory=list)  # objects[0] = the scored target
     next_oid: int = 0
+    # cross-object handover (climb): objects[0] is the scored primary, objects[1] the
+    # on-deck target. cross_cal builds the A/B scale during their overlap; on handover
+    # cumulative_scale folds it in so the whole climb curve lives on the first object's
+    # scale (the peak detector then works across the seam).
+    primary_oid: Optional[int] = None
+    ondeck_oid: Optional[int] = None
+    cross_cal: Optional["_CrossCal"] = None
+    cumulative_scale: float = 1.0
+    handovers: int = 0
+    seam_positions: list = field(default_factory=list)
+    last_acquire_frame: int = -(10 ** 9)
     # dive
     dive_start_pos: float = 0.0
     dive_bursts_left: int = 0
@@ -293,11 +434,15 @@ class _RunState:
     # climb
     climb_start_pos: float = 0.0
     climb_wait: int = 0  # frames left to settle after a step before scoring
+    lucky_scores: list = field(default_factory=list)  # scores at the current position
+    lucky_left: int = 0  # frames still to collect at the current position before stepping
+    last_score: Optional[float] = None  # score _emit_sample computed this frame (reused by park settle)
     # park
     park_phase: str = "descend"   # descend -> creep -> settle
     park_descend_target: float = 0.0
     park_since: float = 0.0
     park_move_since: float = 0.0
+    park_settle_since: float = 0.0  # settle-phase entry (never reset by jitter -> hard cap)
     park_creep_last_t: float = 0.0
     park_last_pos: float = 1e9
     park_scores: list = field(default_factory=list)
@@ -486,10 +631,18 @@ class AutoFocusEngineV2:
         """Push one (encoder, score) point to the graphs for the current frame, so the
         scatter graph traces the WHOLE run (dive down, climb up, park down-and-back-up)
         -- not just the climb. Cheap: reuses the same score the ticks would compute."""
-        if not self._rs.objects:
+        rs = self._rs
+        if not rs.objects:
+            rs.last_score = None
             return
         pos = int(round(self._axis.position))
-        score = self._score_primary(frame)
+        raw = self._score_primary(frame)
+        # Same normalisation as the climb: after a handover the parked object is the
+        # promoted one, so scale its score onto the anchor object's curve so the park
+        # settle's "parked but soft" check compares against the peak on one scale.
+        score = raw * rs.cumulative_scale if raw is not None else None
+        rs.last_score = score  # stash: park settle reuses this (the full-res
+        # latch is consume-once, so re-scoring the same frame there returns None)
         if score is not None:
             self._sample(pos, score, True)
 
@@ -559,6 +712,31 @@ class AutoFocusEngineV2:
             roi, score = select_leading_edge_roi(frame, lead, self.cfg)
             if score >= self.cfg.min_texture_score:
                 self._add_object(roi)
+                rs.last_acquire_frame = rs.frames
+            return
+        # Handover prep (CLIMB only): keep a SECOND, non-overlapping leading-edge patch
+        # on deck so that if the primary pans off mid-climb we can promote an object we
+        # already cross-calibrated against -- rather than a cold fresh patch on an
+        # unknown score scale. Staggered so the pair doesn't march through the FOV in
+        # lockstep (which would give ~no overlap to calibrate on).
+        if (
+            self.cfg.enable_handover
+            and self.state == AFStateV2.CLIMB
+            and len(rs.objects) == 1
+            and response >= self.cfg.min_track_response
+            and (rs.frames - rs.last_acquire_frame) >= self.cfg.handover_stagger_frames
+        ):
+            lead = self._resolve_lead()
+            roi, score = select_leading_edge_roi(frame, lead, self.cfg)
+            if score >= self.cfg.min_texture_score and not _overlaps(roi, rs.objects[0].roi):
+                obj = self._add_object(roi)
+                rs.ondeck_oid = obj.oid
+                # Fresh calibration: the ratio is A/B for THIS B, so any stale ratios
+                # from a previous on-deck object (that panned off before promotion) must
+                # not carry over.
+                rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
+                rs.last_acquire_frame = rs.frames
+                log.info("af2-climb on-deck acquired oid=%d roi=%s", obj.oid, roi)
 
     # %% dive (fast, below focus) %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -603,7 +781,7 @@ class AutoFocusEngineV2:
         log.info("af2-dive burst left=%d pos=%+d raw=%s", rs.dive_bursts_left,
                  int(round(pos)), "n/a" if raw is None else int(round(raw)))
 
-    # %% climb (fine, one sample per frame) %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    # %% climb (fine, lucky-imaging max over climb_lucky_frames per position) %%%
 
     def _begin_climb(self) -> None:
         rs = self._rs
@@ -614,60 +792,184 @@ class AutoFocusEngineV2:
         rs.min_score = 1e30
         rs.best_pos = None
         rs.fell_count = 0
+        rs.lucky_scores = []
+        rs.lucky_left = max(1, self.cfg.climb_lucky_frames)
         rs.climb_start_pos = float(self._axis.position)
+        # Handover bookkeeping: the object we start scoring is the calibration anchor
+        # (scale 1.0); a fresh cross-cal collects the A/B ratio for the on-deck object.
+        rs.primary_oid = rs.objects[0].oid if rs.objects else None
+        rs.ondeck_oid = None
+        rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
+        rs.cumulative_scale = 1.0
+        rs.handovers = 0
+        rs.seam_positions = []
+        rs.last_acquire_frame = rs.frames
         self.state = AFStateV2.CLIMB
         self._status("autofocus v2: climbing to focus")
-        log.info("af2-climb begin from pos=%+d step=%d",
-                 int(round(rs.climb_start_pos)), self.cfg.climb_step_pulses)
+        log.info("af2-climb begin from pos=%+d step=%d lucky=%d handover=%s",
+                 int(round(rs.climb_start_pos)), self.cfg.climb_step_pulses,
+                 self.cfg.climb_lucky_frames, self.cfg.enable_handover)
+
+    def _handle_handover(self) -> bool:
+        """Reconcile a mid-climb primary change that ``_advance_objects`` (run earlier
+        this frame) may have made by dropping the panned-off primary and shifting the
+        on-deck object into ``objects[0]``. Returns True iff the climb was finished
+        here (the caller must then return).
+
+        Only a valid, calibrated promotion of the KNOWN on-deck object may be stitched:
+        we fold its cross-cal scale into ``cumulative_scale`` so the curve stays on the
+        anchor object's scale. Any other primary change -- a cold fresh patch acquired
+        after BOTH objects were lost, or a promotion with too little overlap to trust --
+        is unstitchable, so we finish the climb with the peak found so far instead of
+        extending the curve on an unknown scale."""
+        rs = self._rs
+        cur = rs.objects[0].oid if rs.objects else None
+        if cur is None or rs.primary_oid is None or cur == rs.primary_oid:
+            if cur is not None:
+                rs.primary_oid = cur
+            return False
+        if (
+            self.cfg.enable_handover
+            and cur == rs.ondeck_oid
+            and rs.cross_cal is not None
+            and rs.cross_cal.valid()
+        ):
+            r = rs.cross_cal.ratio()
+            rs.cumulative_scale *= r
+            rs.handovers += 1
+            pos = int(round(self._axis.position))
+            rs.seam_positions.append(pos)
+            log.info("af2-climb handover #%d @pos=%+d ratio=%.3f cum_scale=%.4g "
+                     "(overlap n=%d)", rs.handovers, pos, r, rs.cumulative_scale,
+                     rs.cross_cal.count)
+            rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
+            rs.primary_oid = cur
+            rs.ondeck_oid = None
+            return False
+        # Not a stitchable handover: either tracker relabel churn on a near-static
+        # scene (no on-deck acquired yet) or a cold reacquire after both were lost.
+        # The pre-handover climb never tracked identity -- it just kept scoring
+        # objects[0] -- so do the same: re-anchor onto the new primary and keep
+        # climbing rather than aborting a barely-started climb. Peak POSITION is
+        # scale-invariant within a segment, so accumulating across an equal-scale
+        # relabel is safe. ponytail: an *uncalibrated* real handover (primary pans
+        # off before overlap calibrates) continues on an unknown A/B scale, which
+        # can bias only the cross-seam score COMPARE, not the argmax; the upgrade
+        # path is the calibrated stitch above, which handover_stagger is tuned for.
+        log.info("af2-climb primary changed %s->%s, no stitchable cross-cal -> "
+                 "re-anchor and continue", rs.primary_oid, cur)
+        rs.primary_oid = cur
+        rs.ondeck_oid = None
+        if rs.cross_cal is not None:
+            rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
+        return False
 
     def _climb_tick(self, frame: np.ndarray) -> None:
         rs = self._rs
         cfg = self.cfg
         pos = int(round(self._axis.position))
-        score = self._score_primary(frame)
+
+        # Fold in any handover the tracker made this frame (may finish the climb).
+        if self._handle_handover():
+            return
+
+        # While BOTH objects are visible, sample their SAME-frame coarse scores to build
+        # the A/B calibration the next handover uses. Coarse (not full-res) because the
+        # pipeline taps only one full-res crop/frame (the primary's); the ratio is a
+        # content-scale constant that survives the resolution drop (module notes).
+        if len(rs.objects) >= 2 and rs.cross_cal is not None:
+            rs.cross_cal.add(
+                float(focus_measure(frame, rs.objects[0].roi)),
+                float(focus_measure(frame, rs.objects[1].roi)),
+            )
+
+        # Normalise the primary's full-res score onto the anchor object's scale so the
+        # whole climb curve (and the peak compare below) is continuous across handovers.
+        raw = self._score_primary(frame)
+        score = raw * rs.cumulative_scale if raw is not None else None
         if score is not None:
-            rs.climb_samples.append((pos, score))
-            rs.min_score = min(rs.min_score, score)
-            self._sample(pos, score, True)  # full-res / fine metric -> graphs
-            if score > rs.best_score:
-                rs.best_score = score
-                rs.best_pos = pos
-                rs.fell_count = 0
-            elif rs.best_score > 1e-6 and score < rs.best_score * (1 - cfg.peak_fall_frac):
-                rs.fell_count += 1
-            else:
-                rs.fell_count = 0
-            if (
-                len(rs.climb_samples) >= cfg.climb_min_samples
-                and rs.fell_count >= cfg.peak_confirm_samples
-                and rs.best_pos is not None
-            ):
-                self._finish_climb(bracketed=True)
-                return
+            self._sample(pos, score, True)  # every raw frame -> scatter graph (normalized)
+            rs.lucky_scores.append(score)
+        # Lucky imaging: dwell climb_lucky_frames frames at THIS position (the lens is
+        # held -- no step during collection), then take the MAX as the sample. Blur
+        # from turbulence/vibration only ever lowers sharpness, so the sharpest frame
+        # in the burst is the least-corrupted read of focus here. lucky_left counts
+        # frames (not just valid scores) so a stray None score can't stall the climb.
+        rs.lucky_left -= 1
+        if rs.lucky_left > 0:
+            return
+        agg = max(rs.lucky_scores) if rs.lucky_scores else None
+        rs.lucky_scores = []
+        rs.lucky_left = max(1, cfg.climb_lucky_frames)
+        if agg is not None:
+            rs.climb_samples.append((pos, agg))
+            rs.min_score = min(rs.min_score, agg)
+            # Skip the backlash dead-zone at the start of the climb: until the encoder
+            # has advanced ~one lash the optics haven't begun moving, so the score is a
+            # flat blur floor + noise. Latching a "peak" there parks the lens a full lash
+            # below true focus (seen live: started at good focus, climbed 20 pulses,
+            # declared a noise peak 118 pulses low, then parked away from focus). Only
+            # hunt the peak once the optics are actually sweeping through focus.
+            if rs.climb_pulses_done >= cfg.backlash_pulses:
+                if agg > rs.best_score:
+                    rs.best_score = agg
+                    rs.best_pos = pos
+                    rs.fell_count = 0
+                elif rs.best_score > 1e-6 and agg < rs.best_score * (1 - cfg.peak_fall_frac):
+                    rs.fell_count += 1
+                else:
+                    rs.fell_count = 0
+                if (
+                    len(rs.climb_samples) >= cfg.climb_min_samples
+                    and rs.fell_count >= cfg.peak_confirm_samples
+                    and rs.best_pos is not None
+                ):
+                    self._finish_climb(bracketed=True)
+                    return
         # Safety cap: climbed the whole range without a clean peak.
         if rs.climb_pulses_done >= cfg.climb_max_pulses:
             self._finish_climb(bracketed=False)
             return
-        # One small step up (open-loop). Measure BEFORE stepping so this frame's
+        # One small step up (open-loop). Measured BEFORE stepping so this sample's
         # score pairs with the position it was actually taken at.
         self._axis.step_pulses(+1, cfg.climb_step_pulses)
         rs.climb_pulses_done += cfg.climb_step_pulses
-        rs.climb_wait = max(0, cfg.climb_settle_frames - 1)  # settle before next sample
 
     def _finish_climb(self, *, bracketed: bool) -> None:
         rs = self._rs
         n = len(rs.climb_samples)
         smax = rs.best_score if rs.best_score > -1e29 else 0.0
         contrast = ((smax - rs.min_score) / smax) if smax > 1e-6 else 0.0
-        log.info("af2-climb %s n=%d best_pos=%+d best=%.2f contrast=%.2f",
+        # Focus-improvement metric: how much the (normalized) sharpness rose from the
+        # climb's first sample to its peak. With handover the whole curve is on one
+        # scale, so this spans objects -- an actual cross-object improvement figure.
+        start_score = rs.climb_samples[0][1] if rs.climb_samples else 0.0
+        improvement = (smax / start_score) if start_score > 1e-6 else 0.0
+        log.info("af2-climb %s n=%d best_pos=%+d best=%.2f contrast=%.2f "
+                 "handovers=%d improvement=%.2fx",
                  "peak" if bracketed else "cap", n,
-                 rs.best_pos if rs.best_pos is not None else 0, smax, contrast)
+                 rs.best_pos if rs.best_pos is not None else 0, smax, contrast,
+                 rs.handovers, improvement)
+        if rs.handovers:
+            self._status(
+                f"autofocus v2: climbed through {rs.handovers + 1} objects "
+                f"(improvement {improvement:.1f}x)"
+            )
         if rs.best_pos is None or contrast < self.cfg.min_contrast:
             self._fail(
                 f"no focus peak found (contrast={contrast:.2f} < {self.cfg.min_contrast})"
             )
             return
         best = int(rs.best_pos)
+        # Refine the peak with a local parabola fit: the argmax is one noisy sample,
+        # the vertex uses the whole shoulder so it doesn't chase a single spike.
+        if self.cfg.peak_curve_fit:
+            xv = _fit_peak(rs.climb_samples, self.cfg.peak_fit_window,
+                           log_domain=self.cfg.peak_fit_log)
+            if xv is not None:
+                fit = int(round(xv))
+                log.info("af2-climb peak refine argmax=%+d fit=%+d", best, fit)
+                best = fit
         self._gate("climb", "PARK-descend", lambda: self._begin_park(best))
 
     # %% park + hold %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -741,7 +1043,10 @@ class AutoFocusEngineV2:
 
                 def _enter_settle() -> None:
                     rs.park_phase = "settle"
-                    rs.park_since = time.monotonic()
+                    now2 = time.monotonic()
+                    rs.park_since = now2
+                    rs.park_settle_since = now2  # hard-cap clock (jitter never resets it)
+                    rs.park_last_pos = float(pos)  # seed so the first tick's diff is ~0
 
                 self._gate(f"park-creep arrived (pos={pos:+d} target={rs.best_pos:+d})",
                            "PARK-settle+measure", _enter_settle)
@@ -765,17 +1070,29 @@ class AutoFocusEngineV2:
         pos = int(round(self._axis.position))
         moved = abs(pos - rs.park_last_pos)
         rs.park_last_pos = pos
-        if moved > cfg.park_stable_pulses:
-            rs.park_since = now  # still moving; restart the dwell
-            return
-        if (now - rs.park_since) < cfg.park_settle_s:
-            return
-        score = self._score_primary(frame)
-        if score is not None:
-            rs.park_scores.append(score)
-        if len(rs.park_scores) < max(1, self.cfg.settle_frames):
-            return
-        parked = float(np.median(rs.park_scores))
+        # Reuse the score _emit_sample already computed this frame -- re-scoring here
+        # would hit the consume-once full-res latch and always return None (the old
+        # 'parked 0% of peak' phantom). Accumulate every settle frame so the ratio is
+        # real even when the dwell never latches and we exit via the cap.
+        if rs.last_score is not None:
+            rs.park_scores.append(rs.last_score)
+        # Hard cap: the dwell gate below can never latch on a live rig (encoder SPI
+        # jitter under the per-frame full-res crop load keeps `moved` above the
+        # stability band), so past park_settle_max_s we stop waiting and hold at the
+        # climb's best_pos regardless -- that's the position we're already parked on.
+        settle_capped = (now - rs.park_settle_since) >= cfg.park_settle_max_s
+        if not settle_capped:
+            if moved > cfg.park_stable_pulses:
+                rs.park_since = now  # still moving; restart the dwell
+                return
+            if (now - rs.park_since) < cfg.park_settle_s:
+                return
+            if len(rs.park_scores) < max(1, self.cfg.settle_frames):
+                return
+        parked = float(np.median(rs.park_scores)) if rs.park_scores else 0.0
+        if settle_capped:
+            log.info("af2-park settle capped after %.1fs (n=%d scores)",
+                     now - rs.park_settle_since, len(rs.park_scores))
         pos = int(round(self._axis.position))
         ratio = (parked / rs.best_score) if rs.best_score > 1e-6 else 0.0
         log.info("af2-park pos=%+d parked=%.2f peak=%.2f ratio=%.2f",

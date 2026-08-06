@@ -84,7 +84,10 @@ log = logging.getLogger(__name__)
 
 PREVIEW_MAX_EDGE = 1280
 PREVIEW_MIN_INTERVAL_S = 0.1  # cap preview emission to 10 Hz
-FOCUS_TAP_MIN_INTERVAL_S = 0.21  # cap focus tap to ~4.76 Hz (near sensor limit;
+FOCUS_TAP_MIN_INTERVAL_S = 0.18  # cap focus tap to ~5.5 Hz. MUST stay BELOW the M4
+# trigger period (209 ms): a gate >= the frame period skips every other frame (the
+# next frame lands 1 ms early, is rejected, so the tap aliases to ~half rate / ~2.4 Hz).
+# 0.18 clears 209 ms with ~29 ms of jitter margin; conflation still caps GUI backlog.
 # the M4 focus loop need not be human-usable, and a faster tap means more
 # autofocus measurements per run and less scene drift between focus steps).
 
@@ -1165,6 +1168,7 @@ class AcquisitionThread(QThread):
                                 f"{self.label}: focus-tap emit "
                                 f"#{self._focus_tap_emit_count} ({path}, "
                                 f"roi_crops={self._focus_roi_crops_shipped}, "
+                                f"conflated={self._focus_frames_conflated}, "
                                 f"emit={'slot' if is_valid_slot else ('pooldrop' if is_real_pool_drop else 'noemit')}, "
                                 f"roi={'set' if self._focus_roi is not None else 'none'})"
                             )

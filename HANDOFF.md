@@ -12,7 +12,42 @@
 >   tracking servo). The fast/slow servo profile must follow **detected scene motion**,
 >   never the mode label — keying "M4 = static" is WRONG (M4 in flight is moving).
 
-_Last updated: 2026-07-30 — **M6 "Timelapse" mode** (§26): a new recording mode for a
+_Last updated: 2026-08-06 — **OrthoSim GT: the altitude readout was never a measurement**
+(§29): the bench had been reporting **10,000 ft while actually simulating ~2,985 ft**, and
+nothing in the decode could have noticed — speed/distance/GSD are *authored by the display*
+and read back out of the optical bar, and the magnification `M` (camera-px per display-px)
+is a hand-set `--M` defaulting to **1.0** that altitude scales as `1/M`. With stock settings
+the chain lands on 3.505 cm/px = **9,999.8 ft by construction**. New `measure_scale()`
+(`orthosim_decode.py`) measures `M` off the corner fiducials — they sit at *known display-pixel*
+positions (3652 px apart), so panel pitch and focal length cancel — averaging opposite edges
+so tilt cancels; logged once per session as the `--M` the display should have used. Measured
+**M = 3.3553**, independently corroborated by tracker-flow-vs-encoded-speed (3.16–3.36) and
+the geometric ceiling `13400/3840 = 3.49`. Relaunching with `--M 3.3553 --zoom 0.4251` gives a
+**true 10,000 ft @ 100 kn**. Separately fixed the optical bar, which was failing CRC on
+**100 %** of frames: `_sample_bits` used one global `(max+min)/2` while the imaged white level
+**ramps >5:1 across the bar** (~205 → ~43, black flat at ~15), so the dim end's whites read as
+black; now thresholded against a **local min/max envelope** (`_cell_thresholds`) — verified on
+a real saved frame decoding across 38 parameter combinations with identical payload, and
+**~75 %** of live frames now decode. Also: the no-decode diagnostic printed a *tautological*
+`u8 min/max=0/255` (post-normalise) and only dumped debug when fiducials were **found** — the
+opposite of the real failure — both fixed. **Velocity was never wrong** (`M` cancels out of
+ground speed). Object lifetime at the new altitude **2.53 s → 4.26 s (10.1 → 20.4 frames)**,
+and each 5 cm source pixel now spans 1.4 camera px instead of 4.5. Launch traps recorded:
+`OPENCV_IO_MAX_IMAGE_PIXELS` (the ortho is 1.17 gigapixels) and **`--screen 1`** (Qt puts the
+Dell 1920×1080 at index 0). New self-checks in `tools/test_orthosim.py` (19 pass).
+Previous: 2026-08-02 — **AF climb SNR — lucky imaging + curve-fit peak (log-domain)**
+(§27): the dive-then-climb peak search is now hardened against the noisier outdoor/in-flight
+focus signal. Each climb position now **dwells `climb_lucky_frames=3` frames and keeps the
+MAX** (lucky imaging — turbulence/vibration only ever *blur*, so the sharpest frame in a short
+burst is the truest read of focus there); the peak is refined by a local **parabola fit**
+(`_fit_peak`, vertex `-b/2a`) instead of a single noisy argmax; and that fit is done in the
+**log domain** (`peak_fit_log`) because the variance-based metric's noise is **multiplicative**
+(SD ∝ score) — `log` is the variance-stabilising transform and `log(Gaussian)==parabola`. All
+three are flag-gated in `app.py` (revert: `climb_lucky_frames=1`, `peak_curve_fit=False`,
+`peak_fit_log=False`). Also added a **"2-obj track"** preview button (green boxes on the coarse
+preview, no AF) to eyeball leading-edge object flow, and **reverted** the M5 sweep-reversal
+reset in `DualObjectTracker` (a bench-only artifact). New self-check `tools/test_af_peak.py`
+(4/4). Previous: 2026-07-30 — **M6 "Timelapse" mode** (§26): a new recording mode for a
 **side-by-side comparison against the Phase One camera** — mirrors held in the mid
 (Focus/M4) position firing **one trigger per second**, with full-res frames written to
 disk exactly like M0/M1. Added to firmware (`$M6*` → `setMode(6)`, `picsInPlaceDelay =
@@ -1655,3 +1690,293 @@ via the same `.bay14` write path as M0/M1.
 - M6 reuses the M0/M1 file naming, so `SweepCounter` still rolls sweep/frame indices in
   groups of 13 even though the mirrors don't sweep. Acceptable for the comparison
   (frames are contiguous 1 Hz); a flat timelapse counter is a possible later tweak.
+
+## 27. AF climb SNR — lucky imaging + curve-fit peak + two-object test tool (2026-08-02)
+
+**Why.** Shooting outdoors through the window (representative of real flight) the focus
+score is much noisier than indoors: peaks are flatter and the frame-to-frame scatter is
+larger. The dive-then-climb search (§25) picked its focus position from the **argmax of a
+single noisy sample per encoder step**, so a noise spike could define "focus" and a false
+peak could latch. The changes below make the peak estimate robust **without** touching the
+metric or the acquisition (exposure/gain), and every one is flag-gated so it can be A/B'd or
+reverted from `app.py` alone. All live in `host/capture/autofocus_v2.py`.
+
+### 27.1 Lucky-imaging aggregation — max over N frames per position
+
+- `_climb_tick` now **dwells `climb_lucky_frames` frames at each encoder position** (the lens
+  is held — no step during collection) and takes the **max** of those scores as that
+  position's sample. Turbulence, heat-shimmer through the window, and platform vibration only
+  ever *lower* sharpness, so the sharpest frame in a short burst is the least-corrupted read
+  of true focus; the mean is biased low and wobbly. This is the classic long-range/astro
+  "lucky imaging" trick.
+- The scatter graph still receives **every raw frame** (`self._sample(pos, score, True)`);
+  only the peak logic consumes the per-position max. `lucky_left` counts **frames** (not just
+  valid scores) so a stray `None` (no fresh full-res crop that frame) can't stall the climb.
+- `climb_lucky_frames=1` reproduces the old score-every-frame behaviour exactly. Wired to
+  **3** in `app.py` — roughly 3x the climb duration at ~4.8 fps, fine for the static/bench
+  scene, in exchange for a much cleaner curve. **Supersedes the dead `climb_settle_frames`
+  knob** (it was set but never read; kept only for config parity).
+
+### 27.2 Curve-fit peak — parabola vertex, not argmax
+
+- New pure helper `_fit_peak(samples, window, log_domain=True)`: fits a quadratic to the
+  `peak_fit_window` samples on each side of the argmax and returns the vertex `-b/2a`. Using
+  the whole shoulder averages out the per-sample noise that makes a raw argmax jump around.
+  Returns `None` (caller keeps the argmax) when there are `<3` points, the fit isn't concave
+  (`a >= 0` — no real hump), or the vertex lands outside the fitted span (extrapolation is not
+  a measurement).
+- `_finish_climb` applies it when `peak_curve_fit` is on and logs both:
+  `af2-climb peak refine argmax=%+d fit=%+d` — so the correction is visible live.
+
+### 27.3 Log-domain fit — variance stabilisation for the metric's multiplicative noise
+
+- The observation that "the signal gets noisier the higher the score" is **intrinsic**: the
+  metric (`focus_measure_full_res` = `lap.var()/(mean²+1)`) is a **variance estimator**, and a
+  variance estimator's sampling noise scales with its value (`SD ∝ score`). The *relative*
+  scatter is roughly constant; the *absolute* scatter grows near the peak.
+- Consequence: plain least-squares (`np.polyfit`) assumes constant-variance noise, so it
+  **over-weights the noisy high points**. `_fit_peak` now fits **`log(score)`** first
+  (`peak_fit_log=True`): `log` is the variance-stabilising transform for multiplicative noise
+  (→ ~constant additive noise, which OLS wants), and it's a **better-shaped model** too — a
+  near-focus sharpness peak is ~Gaussian and `log(Gaussian)` is exactly a parabola. Degenerate
+  log fit → silent fall-through to the linear fit (also the `peak_fit_log=False` path).
+- **Honest caveat:** at the current `peak_fit_window=3`, if the peak is *broad* the shoulder
+  samples are all near the peak in magnitude, so log vs linear is nearly a tie — the log
+  benefit only becomes material when the fit window spans real dynamic range. Widening
+  `peak_fit_window` (to 4-5) is the lever to actually cash it in on a broad peak. Left at 3;
+  the change is theoretically correct and never does worse.
+
+### 27.4 Revert switches + self-check
+
+- One place, `app.py` `AutoFocusConfigV2(...)`: `climb_lucky_frames=1` /
+  `peak_curve_fit=False` / `peak_fit_log=False` each independently back out one layer.
+- `tools/test_af_peak.py` (4/4): the fit lands near a known vertex, beats raw argmax on
+  averaged noisy trials, returns `None` on degenerate inputs (ramp / too-few / flat), and the
+  **log-domain fit beats the linear fit** on a Gaussian peak with multiplicative noise.
+
+### 27.5 Two-object tracking test tool + M5 sweep-reversal revert
+
+- New **"2-obj track"** button in `focus_panel.py` (`dual_track_toggled` signal): runs the
+  `DualObjectTracker` (`host/capture/dual_tracker.py`) on the coarse frame and outlines each
+  tracked object with a **green box + its object id** on the main preview — **no autofocus,
+  no full-res** — purely to eyeball the leading-edge→trailing-edge object flow across the FOV.
+  In `app.py`, `_feed_dual_track` (green-box overlay) and `_feed_dual_preview` (split-screen
+  crops) are **mutually exclusive** so the shared tracker advances once per frame.
+- A sweep-reversal reset had been added to `DualObjectTracker` so the tracker didn't get
+  confused when the **M5 mirror sweep reverses** direction — but that reversal is a
+  **bench-only artifact** (a real flight/rolling-orthophoto pan is unidirectional), so it was
+  **reverted** to keep the tracker honest for the real use case. Test tweaks in
+  `tools/test_dual_tracker.py` were reverted with it.
+
+### 27.6 Status
+
+- All three AF SNR layers are **on** and were confirmed on the bench ("looking good" — peak
+  refine visibly correcting the argmax; consistent focus). Next: rolling-orthophoto motion
+  test for the two-object tracking/handover path.
+
+## 28. Camera optics — focal lengths + pixel pitch (GSD → altitude) (2026-08-06)
+
+Constants needed to turn the OrthoSim **simulated camera GSD** (cm/cam-px) into a
+physical **altitude**. The link is the imaging system's angular resolution:
+
+```
+altitude = GSD · f / p            (all consistent units)
+altitude_ft = 10 · GSD_cm · f_mm / p_µm · 3.28084
+```
+
+(this is `orthosim_core.simulated_height_hint_m()`, ×3.28084 for feet). GSD is the
+*ground* sample distance; smaller GSD = lower altitude. `f` = lens focal length,
+`p` = sensor pixel pitch.
+
+### 28.1 Sensor pixel pitch — Sony IMX661 (the "661")
+
+- **Pixel pitch: 3.45 µm × 3.45 µm**, resolution 13400 (H) × 9528 (V), 56.7 mm diagonal
+  (Type 3.6"), global-shutter CMOS. Source: KAYA **Iron 661 CoaXPress** datasheet /
+  Sony **IMX661** flyer (the camera name's "661" is the IMX661 sensor).
+- Same sensor on all three rig cameras, so `p = 3.45 µm` is common to all.
+
+### 28.2 Per-camera lens focal lengths
+
+| Camera serial | Focal length |
+| --- | --- |
+| **2439008** | **300 mm** |
+| **2439007** | **400 mm** |
+| **2439006** | **400 mm** |
+
+Worked example (OrthoSim bench, active cam **2439008**, f = 300 mm, p = 3.45 µm):
+`altitude_ft = 10 · GSD_cm · 300 / 3.45 · 3.28084 ≈ 2853 · GSD_cm` — i.e. a decoded
+simulated GSD of 1.0 cm/cam-px ≈ 2853 ft; 0.5 cm/cam-px ≈ 1426 ft.
+
+> The OrthoSim GT status line now shows feet directly — `_feed_orthosim` keys the focal
+> length off the active camera serial (`_CAM_FOCAL_MM`) with the shared 3.45 µm pitch.
+
+---
+
+## 29. OrthoSim GT — the altitude readout was never a measurement (2026-08-06)
+
+**The headline: the bench had been reporting 10,000 ft while actually simulating ~2,985 ft**,
+and nothing in the decode chain could have noticed. Fixed by measuring the magnification
+`M` off the fiducials instead of assuming it. Also fixed the optical-bar decode, which had
+been failing 100 % of the time on the real rig.
+
+### 29.1 Why the readout could not disagree with the display
+
+Speed, distance and GSD are **authored by the display** and read back out of the optical
+bar. The display integrates its own simulated speed into a distance, computes
+`gsd_cm = ortho_gsd_cm / (Z · M)`, and encodes all of it. Even `vel meas=` is only the
+decoded distance differentiated over wall-clock time — it verifies the **clock**, not the
+optics. No wrong lens, screen distance or zoom can show up in any of it.
+
+`M` (camera-px per display-px) is a **hand-set `--M` flag defaulting to 1.0**, and altitude
+scales as `1/M`. With the stock config (`ortho_gsd 5.0`, `Z 1.4264`, `M 1.0`) the chain lands
+on 3.505 cm/px = **9,999.8 ft by construction**. The display was being launched without
+`--M`, so the 10,000 ft readout was the default config restating itself.
+
+**Velocity was never affected** — `M` cancels out of ground speed entirely (verified: `M=1.0`
+and `M=3.3553` both recover exactly 100.0 kn). Only altitude was wrong.
+
+### 29.2 Fiducial metres vs. ground metres (the thing that confuses everyone)
+
+Inverting `altitude = X·f/(N·p)` on the **fiducials** gives the *distance to the screen*
+(~8 m of bench), not the simulated altitude — the markers are furniture on the bezel, not
+features on the simulated ground. The formula is right; it needs a line whose length is known
+in **ground** metres.
+
+Two equivalent routes, both now confirmed to agree:
+
+- **Pixel domain (what `measure_scale` does).** The imagery carries 5 cm of ground per ortho
+  pixel painted at `Z` screen-px per ortho-px, so every screen pixel holds `5/Z` cm of ground
+  *regardless of panel size*. Only `M` is unknown. The fiducials sit at known display-pixel
+  positions (`screen_w − 2·margin − fiducial_px` = **3652 px** at 3840 wide), so their imaged
+  separation gives `M` directly. Panel pitch and focal length **cancel**.
+- **Ground-metre domain.** Any known ground length works. The scroll supplies one free: at
+  100 kn, 51.44 m of ground per second. `GSD = ground_speed / camera_flow`. The `--scale`
+  ruler (**G**) is the static equivalent — at 10,000 ft, 100 m of ground spans 2,853 px.
+
+> Sanity phrasing that settles it in one line: *at 10,000 ft the ground drifts across the
+> sensor at 783 camera px/s.* Measure the actual drift and divide.
+
+### 29.3 `measure_scale()` — M from the fiducials (`orthosim_decode.py`)
+
+New pure function taking the id 0..3 centres from `detect_fiducials`. Averages **opposite
+edges** per axis so a modest perspective tilt cancels instead of biasing one side. Returns
+camera-px per display-px at the detection resolution; `app.py` multiplies by
+`KyfgCamera.SUBSAMPLE_FACTOR` (decode runs on the 4× coarse tap). Logged **once per session**
+on the first good decode (`_measure_ortho_scale`), reporting the `--M` the display should
+have been launched with. Tests: recovers deliberately anisotropic known scales; unbiased
+under a keystone warp.
+
+### 29.4 Optical bar — local-envelope thresholding (the 100 % CRC failure)
+
+`_sample_bits` thresholded all 120 cells against one global `(max+min)/2`. On the real rig
+the imaged white level **ramps better than 5:1 across the bar** (measured ~205 at one end vs
+~43 at the other) while black stays flat near 15, so the dim end's whites fell under the
+global midpoint and read as black. **Every frame failed CRC** with the screen fully visible
+and in focus.
+
+`_cell_thresholds()` now thresholds each cell against the midpoint of its local min/max
+envelope (`_ENVELOPE_CELLS = 15`), which follows the ramp. Verified on the real saved frame:
+decodes across 38 different parameter combinations (window fraction 0.2–0.4, vertical offset
+±8, envelope 9–21) with **byte-identical payload** — an 8-bit CRC does not pass 38 times by
+chance.
+
+> ponytail ceiling: a run of ≥15 identical cells collapses the envelope, so those windows
+> fall back to the global midpoint. A long run in a badly lit stretch can still misread; the
+> CRC catches it and the next frame (1 Hz) is used. Upgrade = run-length-limited encoding,
+> or fit a smooth illumination model over the whole bar.
+
+Live result: **~75 % of frames decode** (52/69, then 35/47), up from **zero all session**.
+The residual failures are likely the exposure straddling a display refresh and catching the
+bar mid-update — untested.
+
+### 29.5 Diagnostics that were lying
+
+- `u8 min/max` in the no-decode log was **tautological**: `_to_gray_u8` min-max normalises,
+  so it always printed `0/255`. Now reports the **sensor's** range (`raw min/max=1445/16383`
+  — note 16383 is the 14-bit ceiling, i.e. some saturation).
+- The one-shot debug dump only fired when fiducials were **found** and the bar failed — the
+  opposite of the actual failure mode, so nothing was ever saved. `_dump_ortho_frame_debug`
+  now saves the coarse frame on **fiducial failure** (`ortho_dbg_frame.png`), which is what
+  finally showed the framing.
+
+### 29.6 Bench calibration — measured values (2026-08-06)
+
+| Quantity | Value |
+| --- | --- |
+| **M measured** | **3.3047 x / 3.4060 y → mean 3.3553** (anisotropy 0.970 = slight screen tilt) |
+| 4K panel | Qt name `AAA`, 3840×2160, physical **1016 × 572 mm** |
+| Panel pixel pitch | **0.2646 mm** (1016 / 3840) |
+| Fiducial separation | 3652 screen px = **966 mm** |
+| Before calibration | reported 10,014 ft / **actual 2,985 ft** (GSD 1.046 cm/px) |
+| After (`--M 3.3553 --zoom 0.4251`) | GSD 3.5052 cm/px = **true 10,000 ft** |
+
+Cross-check: `M` was independently estimated at **3.16–3.36** from tracker flow vs. encoded
+speed *before* the fiducial measurement, and the geometric ceiling is `13400/3840 = 3.49`
+(the screen must fit the sensor width). All three agree.
+
+**`M` is a property of the rig** (camera distance, lens, panel pitch) — it does **not** change
+with zoom, so measure once and it holds until the camera or lens moves.
+
+### 29.7 Launch recipe (both apps)
+
+```powershell
+# OrthoSim display — note the pixel-limit env var and --screen 1
+$env:QT_QPA_PLATFORM = "windows"; $env:OPENCV_IO_MAX_IMAGE_PIXELS = "10000000000"
+py -3 tools/orthosim_gui.py "Running TIF\Bnei_brak.tif" `
+    --gsd 5.0 --screen 1 --scale --M 3.3553 --zoom 0.4251 --speed 51.44
+
+# Capture app
+$env:QT_QPA_PLATFORM = "windows"; py -3 host/main_capture.py
+```
+
+Two launch traps cost time today:
+
+- **`OPENCV_IO_MAX_IMAGE_PIXELS`** — `Bnei_brak.tif` is 15021×77786 ≈ **1.17 gigapixels**,
+  over OpenCV's 2³⁰ default. Without it: `(-215:Assertion failed) pixels <= CV_IO_MAX_IMAGE_PIXELS`.
+- **`--screen 1`, not 0.** Qt enumerates the **Dell U2417H (1920×1080) as screen 0** and the
+  4K panel as **screen 1**; this order has changed at least once. Landing on the small screen
+  silently renders at 1920×1080 and every layout-dependent decode fails. Check the
+  `window shown, geometry=...` line — it must read `3840, 2160`.
+
+To retarget the altitude: `zoom = 5.0 / (GSD_target_cm · M)`, where
+`GSD_target_cm = altitude_ft / 2853` for the 300 mm cam. Or dial `-`/`+` live and watch
+`sim camera GSD` on the HUD (**H**) reach **3.5052** for 10,000 ft. **S** saves to
+`orthosim_config.json`.
+
+### 29.8 Two-object tracking at 10,000 ft
+
+Measured by **Little's Law** (mean live objects ÷ creation rate — assumes no tile geometry),
+over a 181 s window with 74 transitions:
+
+| | this morning (~3,000 ft, 53 kn) | now (10,000 ft, 100 kn) |
+| --- | --- | --- |
+| Object lifetime | 2.53 s | **4.26 s** |
+| In frames | 10.1 | **20.4** |
+| Flow | 617 coarse px/s | 378 coarse px/s |
+| Delivered rate | 4.46 fps | 4.78 fps |
+| Mean live objects | 1.97 / 2 | **1.98 / 2** |
+
+Higher altitude means *less* angular motion for the same ground speed, so lifetime nearly
+doubled despite the speed going 53 → 100 kn. The two-object relay holds both patches alive
+essentially always, so a handover has continuous overlap (~40 frames of tracked texture
+across one).
+
+Resolution improved too: each 5 cm source pixel now spans **1.4 camera px** instead of 4.5,
+so the imagery carries real high-frequency detail rather than interpolation — materially
+better for a sharpness metric. **Natural ceiling: 5.00 cm/px (1 ortho px = 1 camera px) at
+14,265 ft** — below that the bench is upsampling the source.
+
+### 29.9 Status / open items
+
+- ✅ M measured, altitude honest, 10,000 ft @ 100 kn verified end to end.
+- ✅ Bar decode fixed (0 % → ~75 %).
+- ⬜ **Residual ~25 % CRC failures** — suspect exposure straddling a display refresh. Untested.
+- ⬜ **Whether an AF dive-then-climb completes in 20 frames** — the climb dwells
+  `climb_lucky_frames=3` per position at `climb_step_pulses=2`, so it depends on how many
+  positions it walks. Watch `af2-climb begin` and the handover lines on the next run.
+- ⬜ AF's **first** target is picked with no motion history (`leading_edge_from_motion(0,0)`
+  → `None`), so it starts mid-frame with roughly half the travel. The handover has to fire
+  almost immediately.
+- ⬜ The AF ROI overlay only draws the **primary** object; the on-deck handover patch is
+  tracked and cross-calibrated but never rendered, so an AF run shows one box even when the
+  handover is working correctly.

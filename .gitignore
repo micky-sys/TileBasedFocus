@@ -34,6 +34,7 @@ _backups/
 *.zip
 *.7z
 *_debug_frame.png
+ortho_dbg_*.png
 Iron661_session_*.txt
 log.sbf*.txt
 gps_correlation*.csv

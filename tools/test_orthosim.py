@@ -25,9 +25,17 @@ from orthosim_core import (  # noqa: E402
 from tile_geometry import TileGrid  # noqa: E402
 
 
+def test_codec_v2_layout() -> None:
+    # v2 added the 16-bit gsd field in place of the 8-bit reserved pad.
+    assert codec.FORMAT_VERSION == 2
+    assert codec.PAYLOAD_BITS == 96
+    assert codec.TOTAL_CELLS == 120
+
+
 def test_codec_roundtrip_basic() -> None:
     gt = codec.GroundTruth(
-        distance_mm=123456, tick=7777, velocity_mmps=40000, flags=codec.FLAG_SEAM
+        distance_mm=123456, tick=7777, velocity_mmps=40000, gsd_cm_e2=250,
+        flags=codec.FLAG_SEAM,
     )
     cells = codec.encode(gt)
     assert len(cells) == codec.TOTAL_CELLS
@@ -36,24 +44,29 @@ def test_codec_roundtrip_basic() -> None:
     assert out.distance_mm == 123456
     assert out.tick == 7777
     assert out.velocity_mmps == 40000
+    assert out.gsd_cm_e2 == 250
     assert out.seam is True
     assert out.paused is False
     assert abs(out.distance_m - 123.456) < 1e-9
     assert abs(out.velocity_mps - 40.0) < 1e-9
+    assert abs(out.gsd_cm - 2.5) < 1e-9
 
 
 def test_codec_roundtrip_extremes() -> None:
-    for dist, tick, vel, flags in [
-        (0, 0, 0, 0),
-        ((1 << 32) - 1, (1 << 20) - 1, (1 << 20) - 1, 0x7),
-        (999_999_999, 5, 250_000, codec.FLAG_PAUSED | codec.FLAG_CALIBRATION),
+    for dist, tick, vel, gsd, flags in [
+        (0, 0, 0, 0, 0),
+        ((1 << 32) - 1, (1 << 20) - 1, (1 << 20) - 1, (1 << 16) - 1, 0x7),
+        (999_999_999, 5, 250_000, 12345, codec.FLAG_PAUSED | codec.FLAG_CALIBRATION),
     ]:
-        gt = codec.GroundTruth(distance_mm=dist, tick=tick, velocity_mmps=vel, flags=flags)
+        gt = codec.GroundTruth(
+            distance_mm=dist, tick=tick, velocity_mmps=vel, gsd_cm_e2=gsd, flags=flags
+        )
         out = codec.decode(codec.encode(gt))
         assert out is not None
         assert out.distance_mm == dist
         assert out.tick == tick
         assert out.velocity_mmps == vel
+        assert out.gsd_cm_e2 == gsd
         assert out.flags == flags
 
 
@@ -132,6 +145,77 @@ def test_tilegrid_interior_excludes_bezel_and_strip() -> None:
         assert t.y1 <= fh - iy_bezel
 
 
+def _interior_lead_cfg(exclude_edge=None):
+    """AF config as the OrthoSim toggle arms it: interior masking on, optionally
+    with the optical-strip band excluded."""
+    from capture.autofocus import AutoFocusConfig
+
+    cfg = AutoFocusConfig()
+    cfg.restrict_interior = True
+    cfg.exclude_edge = exclude_edge
+    return cfg
+
+
+def _graded_frame(fw: int, fh: int) -> np.ndarray:
+    """Textured frame whose detail fades toward the bottom, so a selector that
+    ignores the leading edge would pick near the TOP. Lets us prove the leading-edge
+    band actually constrains the choice rather than coinciding with it."""
+    rng = np.random.default_rng(3)
+    noise = rng.integers(0, 4096, size=(fh, fw)).astype(np.float32)
+    fade = np.linspace(1.0, 0.02, fh, dtype=np.float32)[:, None]
+    return (noise * fade + 200).astype(np.uint16)
+
+
+def test_interior_masking_composes_with_leading_edge() -> None:
+    """Interior masking and leading-edge preference must BOTH apply on a moving bench
+    scene: off the bezel AND at the incoming edge. Masking used to win outright, which
+    handed back tiles already part-way across the usable area (short dwell)."""
+    pytest.importorskip("cv2")
+    from capture.autofocus import select_leading_edge_roi
+
+    fw, fh = 3200, 2400
+    cfg = _interior_lead_cfg()
+    frame = _graded_frame(fw, fh)
+    inset_x = round(fw * cfg.interior_inset)
+
+    # Control: texture fades downward, so with no lead edge the pick goes up top.
+    (_, ny0, _, ny1), _ = select_leading_edge_roi(frame, None, cfg)
+    top_centre = (ny0 + ny1) / 2
+
+    # lead_edge="bottom" must drag the pick to the lowest usable row despite that row
+    # having the LEAST texture -- proof the preference overrides the texture argmax.
+    (x0, y0, x1, y1), score = select_leading_edge_roi(frame, "bottom", cfg)
+    bottom_centre = (y0 + y1) / 2
+    assert bottom_centre > top_centre, (
+        f"leading-edge pick {bottom_centre:.0f} no lower than untargeted {top_centre:.0f}"
+    )
+    assert score > 0.0
+    assert x0 >= inset_x and x1 <= fw - inset_x, "tile drifted onto the side bezel"
+    assert y1 <= fh - round(fh * cfg.interior_inset), "tile drifted onto the bottom bezel"
+
+    # And the opposite edge resolves the other way, so this tracks lead_edge rather
+    # than just always returning an extreme.
+    (_, ty0, _, ty1), _ = select_leading_edge_roi(frame, "top", cfg)
+    assert (ty0 + ty1) / 2 < bottom_centre
+
+
+def test_interior_lead_band_still_respects_excluded_strip() -> None:
+    """Leading-edge preference must not drag a tile into the excluded optical-strip
+    band -- that band is exactly the 'false readings from the surrounding area' case.
+    Worst case: the strip and the leading edge are the SAME edge."""
+    pytest.importorskip("cv2")
+    from capture.autofocus import select_leading_edge_roi
+
+    fw, fh = 3200, 2400
+    cfg = _interior_lead_cfg(exclude_edge="bottom")
+    frame = _graded_frame(fw, fh)
+
+    (x0, y0, x1, y1), score = select_leading_edge_roi(frame, "bottom", cfg)
+    assert x1 > x0 and y1 > y0, "degenerate ROI"
+    assert score > 0.0
+    assert y1 <= fh - round(fh * cfg.edge_band), "tile sits in the excluded strip"
+
+
 # ── Optical decode pipeline (synthetic rendered screen) ──────────────────────
 def _render_screen(gt: codec.GroundTruth, layout) -> np.ndarray:
     """Render a synthetic OrthoSim display frame (grayscale) for decode tests."""
@@ -145,12 +229,18 @@ def _render_screen(gt: codec.GroundTruth, layout) -> np.ndarray:
     for mid, (x, y) in enumerate(positions):
         canvas[y - 6:y + s + 6, x - 6:x + s + 6] = 255
         canvas[y:y + s, x:x + s] = cv2.aruco.generateImageMarker(dic, mid, s)
-    # optical bar
+    # optical bar -- MUST mirror tools/orthosim_gui.py::_draw_bar so this test
+    # exercises the real display geometry (the bar shares the fiducial row and is
+    # inset to clear the corner markers), not a stale layout that only agrees with
+    # itself. If this drifts from _draw_bar, decode fails on the real rig.
     cells = codec.encode(gt)
     n = len(cells)
-    top = s + m + 12 if layout.bar_edge == "top" else h - layout.bar_height_px
-    x0 = layout.bar_margin_px
-    band_w = (w - layout.bar_margin_px) - x0
+    bh = layout.bar_height_px
+    band_top = m if layout.bar_edge == "top" else h - m - s
+    top = band_top + max(0, (s - bh) // 2)
+    clear = m + s + 6 + layout.bar_margin_px
+    x0 = clear
+    band_w = (w - clear) - x0
     cell_w = band_w / n
     for i, bit in enumerate(cells):
         cx0 = int(x0 + i * cell_w)
@@ -192,15 +282,96 @@ def test_decode_with_perspective() -> None:
     assert out.seam is True
 
 
+def test_decode_survives_uneven_bar_illumination() -> None:
+    """The rig images the bar with a strong left-to-right falloff (white ~205 at one
+    end vs ~43 at the other, black ~15 throughout), which puts the dim end's white
+    cells under a single global midpoint. Reproduce that ramp and require a decode --
+    and check the old global threshold really does fail on it, so this test would
+    notice if the local-envelope thresholding were reverted."""
+    pytest.importorskip("cv2")
+    from capture.orthosim_decode import ScreenLayout, _sample_bits, decode_rectified
+
+    layout = ScreenLayout(screen_w=1600, screen_h=1000)
+    gt = codec.GroundTruth(distance_mm=543620833, tick=725578, velocity_mmps=27440,
+                           gsd_cm_e2=351, flags=0)
+    screen = _render_screen(gt, layout).astype(np.float32)
+    ramp = np.linspace(1.0, 0.21, screen.shape[1], dtype=np.float32)  # measured falloff
+    dim = np.clip(screen * ramp[None, :], 0, 255).astype(np.uint8)
+
+    out = decode_rectified(dim, layout)
+    assert out is not None, "uneven illumination defeated the decode"
+    assert out.distance_mm == 543620833
+    assert out.velocity_mmps == 27440
+    assert out.gsd_cm_e2 == 351
+
+    # Same cell levels, old global (max+min)/2 rule -> should not survive CRC.
+    centers, cell_w = layout.bar_cell_centers()
+    win = max(1, int(cell_w * 0.3))
+    lv = np.array([dim[int(cy) - win:int(cy) + win + 1,
+                       int(cx) - win:int(cx) + win + 1].mean() for cx, cy in centers])
+    thr = (lv.max() + lv.min()) / 2.0
+    assert codec.decode([1 if v >= thr else 0 for v in lv]) is None, \
+        "global threshold coped, so this frame does not exercise the fix"
+    assert _sample_bits(dim, layout) == list(codec.encode(gt))
+
+
+def test_measure_scale_recovers_known_magnification() -> None:
+    """``measure_scale`` must recover the camera-px/display-px M that the altitude
+    readout otherwise assumes from a hand-set ``--M``. Image the same screen at
+    known, deliberately anisotropic scales and check both axes come back."""
+    cv2 = pytest.importorskip("cv2")
+    from capture.orthosim_decode import (
+        ScreenLayout, _to_gray_u8, detect_fiducials, measure_scale,
+    )
+
+    layout = ScreenLayout(screen_w=1600, screen_h=1000)
+    screen = _render_screen(codec.GroundTruth(distance_mm=1), layout)
+    for fx, fy in ((1.0, 1.0), (0.75, 0.75), (1.5, 1.25)):
+        h, w = screen.shape
+        imaged = cv2.resize(screen, (int(w * fx), int(h * fy)),
+                            interpolation=cv2.INTER_AREA)
+        src = detect_fiducials(_to_gray_u8(imaged), layout.aruco_dict)
+        assert src is not None, f"markers not detected at {fx}x{fy}"
+        mx, my = measure_scale(src, layout)
+        assert mx == pytest.approx(fx, rel=0.02), f"x scale {mx} != {fx}"
+        assert my == pytest.approx(fy, rel=0.02), f"y scale {my} != {fy}"
+
+
+def test_measure_scale_is_not_fooled_by_tilt() -> None:
+    """A modest perspective tilt must not bias M: averaging opposite edges is the
+    whole reason the two-edge mean is there rather than a single edge."""
+    cv2 = pytest.importorskip("cv2")
+    from capture.orthosim_decode import (
+        ScreenLayout, _to_gray_u8, detect_fiducials, measure_scale,
+    )
+
+    layout = ScreenLayout(screen_w=1600, screen_h=1000)
+    screen = _render_screen(codec.GroundTruth(distance_mm=1), layout)
+    h, w = screen.shape
+    # Keystone: top edge squeezed, bottom stretched by the same amount.
+    src_q = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst_q = np.float32([[30, 0], [w - 30, 0], [w, h], [0, h]])
+    warped = cv2.warpPerspective(
+        screen, cv2.getPerspectiveTransform(src_q, dst_q), (w, h), borderValue=127
+    )
+    src = detect_fiducials(_to_gray_u8(warped), layout.aruco_dict)
+    assert src is not None
+    mx, _ = measure_scale(src, layout)
+    assert mx == pytest.approx(1.0, rel=0.05), f"tilt biased M to {mx}"
+
+
 def test_speed_distance_tracker() -> None:
     pytest.importorskip("cv2")
     from capture.orthosim_decode import SpeedDistanceTracker
 
     tr = SpeedDistanceTracker(ema=1.0)  # no smoothing for a clean check
-    # 40 m/s: distance advances 40 m each 1.0 s tick
-    tr.update(codec.GroundTruth(distance_mm=0, velocity_mmps=40000), now=100.0)
-    m = tr.update(codec.GroundTruth(distance_mm=40000, velocity_mmps=40000), now=101.0)
+    # 40 m/s: distance advances 40 m each 1.0 s tick; gsd 2.5 cm/px flows through
+    tr.update(codec.GroundTruth(distance_mm=0, velocity_mmps=40000, gsd_cm_e2=250), now=100.0)
+    m = tr.update(
+        codec.GroundTruth(distance_mm=40000, velocity_mmps=40000, gsd_cm_e2=250), now=101.0
+    )
     assert m is not None
     assert abs(m.velocity_mps - 40.0) < 1e-6
     assert abs(m.distance_m - 40.0) < 1e-6
     assert abs(m.encoded_velocity_mps - 40.0) < 1e-6
+    assert abs(m.gsd_cm - 2.5) < 1e-6

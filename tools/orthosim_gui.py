@@ -370,10 +370,17 @@ class OrthoView(QOpenGLWidget):
                 )
 
     def _draw_bar(self, p: QPainter) -> None:
+        # Simulated camera GSD (cm/cam-px) is the optics-independent "altitude"
+        # proxy; encode it in 0.01 cm units. Returns 0 when M is uncalibrated, which
+        # the decoder surfaces as "GSD unset".
+        gsd_cm = simulated_gsd_cm(
+            self.cfg.ortho_gsd_cm, self._zoom, self.cfg.magnification
+        )
         gt = codec.GroundTruth(
             distance_mm=int(round(self._distance_m * 1000.0)),
             tick=self._tick,
             velocity_mmps=int(round(self._speed * 1000.0)),
+            gsd_cm_e2=int(round(max(0.0, gsd_cm) * 100.0)),
             flags=self._current_flags(),
         )
         cells = codec.encode(gt)
@@ -582,6 +589,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                          "RAM for gigapixel files); GSD is scaled by N so "
                          "calibration is unchanged")
     ap.add_argument("--windowed", action="store_true", help="windowed (not full-screen)")
+    ap.add_argument("--screen", type=int, default=None,
+                    help="monitor index for full-screen (QApplication.screens() order)")
     return ap.parse_args(argv)
 
 
@@ -639,7 +648,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         win.raise_()
         win.activateWindow()
     else:
-        win.showFullScreen()
+        screens = app.screens()
+        if args.screen is not None and 0 <= args.screen < len(screens):
+            # Move onto the target monitor BEFORE going full-screen so Qt picks
+            # that screen; setScreen pins it on platforms that otherwise
+            # full-screen on the window's original screen.
+            scr = screens[args.screen]
+            win.move(scr.geometry().topLeft())
+            win.showFullScreen()
+            wh = win.windowHandle()
+            if wh is not None:
+                wh.setScreen(scr)
+        else:
+            win.showFullScreen()
         win.setCursor(Qt.CursorShape.BlankCursor)
     print(f"[OrthoSim] window shown, geometry={win.geometry().getRect()}, "
           f"visible={win.isVisible()}", flush=True)
