@@ -12,7 +12,7 @@
 >   tracking servo). The fast/slow servo profile must follow **detected scene motion**,
 >   never the mode label — keying "M4 = static" is WRONG (M4 in flight is moving).
 
-_Last updated: 2026-08-06 — **OrthoSim GT: the altitude readout was never a measurement**
+_Last updated: 2026-08-09 — **OrthoSim GT: the altitude readout was never a measurement**
 (§29): the bench had been reporting **10,000 ft while actually simulating ~2,985 ft**, and
 nothing in the decode could have noticed — speed/distance/GSD are *authored by the display*
 and read back out of the optical bar, and the magnification `M` (camera-px per display-px)
@@ -35,6 +35,17 @@ ground speed). Object lifetime at the new altitude **2.53 s → 4.26 s (10.1 →
 and each 5 cm source pixel now spans 1.4 camera px instead of 4.5. Launch traps recorded:
 `OPENCV_IO_MAX_IMAGE_PIXELS` (the ortho is 1.17 gigapixels) and **`--screen 1`** (Qt puts the
 Dell 1920×1080 at index 0). New self-checks in `tools/test_orthosim.py` (19 pass).
+**2026-08-09 addendum (§29.9): the bench models neither flight case.** In flight the 300 mm
+shoots **long edge forward** (objects traverse 13400 px) and the 400 mm **short edge forward**
+(9528 px); the bench scrolls vertically, so it traverses the short axis. At 10,000 ft / 100 kn
+that makes it **1.41× pessimistic for the 300 mm** (flight = 28.6 frames) and **1.33× optimistic
+for the 400 mm** (flight = 15.3 frames). The 400 mm loses twice over — short axis (0.711) **and**
+faster ground flow from the longer focal length, since `GSD = h·p/f` (0.750) — for **0.533, i.e.
+half the 300 mm's object lifetime**. So a dive-then-climb must fit **~15 frames**, not 20, and
+the cross-object handover is **mandatory** for the 400 mm rather than an optimisation. Bench the
+worst case by scaling ground speed by 400/300: **`--speed 68.59`** (133.33 kn) → 15.3 frames.
+Orientation needs no code change (`leading_edge_from_motion` resolves the edge from measured
+`dx`/`dy`).
 Previous: 2026-08-02 — **AF climb SNR — lucky imaging + curve-fit peak (log-domain)**
 (§27): the dive-then-climb peak search is now hardened against the noisier outdoor/in-flight
 focus signal. Each climb position now **dwells `climb_lucky_frames=3` frames and keeps the
@@ -1966,14 +1977,74 @@ so the imagery carries real high-frequency detail rather than interpolation — 
 better for a sharpness metric. **Natural ceiling: 5.00 cm/px (1 ortho px = 1 camera px) at
 14,265 ft** — below that the bench is upsampling the source.
 
-### 29.9 Status / open items
+### 29.9 Sensor orientation vs. flight direction — the bench flatters the 300 mm
+
+**The bench does not model either flight case, and errs in opposite directions for the two
+lenses.** Which sensor axis an object traverses depends on how the sensor is clocked relative
+to the direction of travel:
+
+| Setup | forward axis | object traverses | leading edge |
+| --- | --- | --- | --- |
+| **Flight, 300 mm** | long edge forward | **13400 px** (long) | short edge |
+| **Flight, 400 mm** | short edge forward | **9528 px** (short) | long edge |
+| **Bench (today)** | — (vertical scroll) | **9528 px** (short) | long edge |
+
+Scaling from the measured 4.26 s / 20.4 frames (§29.8), at 10,000 ft and 100 kn:
+
+| | traverse | flow | lifetime |
+| --- | --- | --- | --- |
+| Bench now (300 mm, short axis) | 2382 coarse px | 378 px/s | 4.26 s — **20.4 frames** |
+| Flight 300 mm (long edge fwd) | 3350 coarse px | 378 px/s | 5.99 s — **28.6 frames** |
+| Flight 400 mm (short edge fwd) | 2382 coarse px | 504 px/s | 3.19 s — **15.3 frames** |
+
+The 400 mm is worse than its narrower FOV alone implies, because **two factors multiply**: it
+traverses the short axis (0.711) *and* its longer focal length speeds up ground flow at the
+same altitude, since `GSD = h·p/f` (0.750). Together **0.533 — the 400 mm gets about half the
+300 mm's object lifetime.**
+
+> **Consequence for AF.** 15.3 frames is the binding constraint, and it is *below* what the
+> bench shows. If a dive-then-climb needs more than ~15 frames (with `climb_lucky_frames=3`
+> per position it plausibly does), the cross-object handover is **mandatory** for the 400 mm,
+> not an optimisation. Validating a sweep on the 300 mm bench geometry flatters it by ~1.9×.
+
+No code change is needed for orientation: `leading_edge_from_motion` resolves the leading edge
+from measured `dx`/`dy` every frame (today's run reported `lead=bottom` without being told).
+
+**Benching the 400 mm worst case (chosen approach).** The bench already traverses the short
+axis, i.e. the 400 mm's flight orientation, so the *only* discrepancy is flow — and flow scales
+with focal length. Multiply the ground speed by **400/300**:
+
+```powershell
+--speed 68.59      # 133.33 kn = 100 kn x 4/3 ; keep --zoom 0.4251 --M 3.3553
+```
+
+→ 3.19 s / **15.3 frames**, an exact match for the 400 mm's flight image motion. GSD stays at
+the 300 mm's 3.505 cm/px, so scene *detail* is still the 300 mm's — only the motion is the
+400 mm's.
+
+*Alternative if scene detail matters too:* match the 400 mm's actual GSD at 10,000 ft
+(2.629 cm/px) with `--zoom 0.5668` at a real 100 kn → 3.29 s / 15.7 frames, and both flow and
+detail are right. Caveat: the app would label it **7,500 ft**, because `_feed_orthosim` derives
+feet from the *physical* 300 mm lens. GSD is what the AF actually sees; the altitude label is
+lens-dependent annotation.
+
+**Benching the 300 mm flight case** would need the long axis traversed, i.e. horizontal scroll
+(`--dir left|right`). Not practical with `Bnei_brak.tif` as-is: it is 15021 × 77786 (tall and
+narrow), so horizontally it is only ~1.7 screen widths at `--zoom 0.4251` and would seam every
+~15 s against ~6 s object lifetimes. Would need the ortho rotated 90° offline (→ 77786 × 15021,
+seams ~75 s apart) or the camera rotated on the rig.
+
+### 29.10 Status / open items
 
 - ✅ M measured, altitude honest, 10,000 ft @ 100 kn verified end to end.
 - ✅ Bar decode fixed (0 % → ~75 %).
 - ⬜ **Residual ~25 % CRC failures** — suspect exposure straddling a display refresh. Untested.
-- ⬜ **Whether an AF dive-then-climb completes in 20 frames** — the climb dwells
+- ⬜ **Whether an AF dive-then-climb completes in 15 frames** (the 400 mm worst case — see
+  §29.9; 20 frames is the bench figure and 28 the 300 mm flight figure). The climb dwells
   `climb_lucky_frames=3` per position at `climb_step_pulses=2`, so it depends on how many
   positions it walks. Watch `af2-climb begin` and the handover lines on the next run.
+- ⬜ **Run the 400 mm worst case** (`--speed 68.59`) before trusting any sweep result; the
+  default bench geometry is ~1.9× optimistic for that lens.
 - ⬜ AF's **first** target is picked with no motion history (`leading_edge_from_motion(0,0)`
   → `None`), so it starts mid-frame with roughly half the travel. The handover has to fire
   almost immediately.
