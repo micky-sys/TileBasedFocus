@@ -607,6 +607,30 @@ def focus_measure(frame: np.ndarray, roi: Roi) -> float:
     return float(lap.var())
 
 
+def focus_measure_normalized(frame: np.ndarray, roi: Roi) -> float:
+    """:func:`focus_measure` carrying the same mean^2 normalisation as
+    :func:`focus_measure_full_res`, so a ratio measured with one is valid for the other.
+
+    The cross-object handover measures its A/B ratio on the coarse frame but applies it
+    to climb samples produced by ``focus_measure_full_res``, which divides brightness
+    out. Raw Laplacian variance instead scales *with* brightness^2, so mixing the two
+    transfers a ratio wrong by a factor of (mean_B/mean_A)^2 -- and the sign is fixed,
+    not random: the on-deck patch is always freshly argmax-picked in the leading-edge
+    band near frame centre, while the outgoing primary has drifted to a dim, vignetted
+    frame edge. So mean_A < mean_B on every single handover. Live, that read as 13
+    consecutive ratios in 0.40-0.64 (never once above 1), compounding cum_scale down to
+    3e-4, crushing every late sample and parking the lens at the dive floor.
+    """
+    x0, y0, x1, y1 = roi
+    region = frame[y0:y1, x0:x1]
+    if region.size == 0:
+        return 0.0
+    mean = float(region.mean())
+    if region.dtype == np.uint16:
+        mean /= 64.0  # focus_measure shifts uint16 >> 6 before differencing
+    return focus_measure(frame, roi) / (mean * mean + 1.0) * 1e4
+
+
 def focus_measure_full_res(crop: np.ndarray) -> float:
     """Laplacian-variance focus score for a FULL-RES *raw-Bayer* ROI crop.
 

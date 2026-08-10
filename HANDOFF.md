@@ -2051,3 +2051,131 @@ seams ~75 s apart) or the camera rotated on the rig.
 - ⬜ The AF ROI overlay only draws the **primary** object; the on-deck handover patch is
   tracked and cross-calibrated but never rendered, so an AF run shows one box even when the
   handover is working correctly.
+
+---
+
+## 30. AF cross-object handover — three fixes, one failed redesign, and a way to measure truth (2026-08-10)
+
+Fifteen AF runs at the 400 mm worst case (`--speed 68.59`, 133.3 kn, GT-verified at
+10,014 ft). The headline is methodological: **freezing the scene gives an absolute focus
+reference**, and it immediately overturned a redesign that a page of simulations had
+justified. Read §30.4 before trusting any AF accuracy claim in this document.
+
+### 30.1 The bug that made the parked position meaningless
+
+The climb spans ~20 objects (an object lives ~8–15 frames; the climb needs ~170–240), and
+each patch has its own unknown brightness/texture scale `k`. AF v2 recovered `k` by
+measuring an A/B ratio at each handover and multiplying it into a running
+`cumulative_scale`. Sorting six consecutive runs by final `cum_scale` exposed the problem:
+
+| `cum_scale` | 7.8e−05 | 0.030 | 0.050 | 0.270 | 0.433 | 3.974 |
+|---|---|---|---|---|---|---|
+| **parked at** | −122 | −122 | −56 | −27 | +0 | +12 |
+
+Rank correlation **1.00**, six for six. The parked position was a pure function of stitch
+drift with no discernible dependence on focus. A decayed stitch tilts the reconstructed
+curve downward, which pushes the parabola vertex off the left end and parks the lens at the
+dive floor. Run 5 shows why tuning could never fix it: its per-link ratio averaged 0.922 —
+only 8 % off unity, a genuinely good content ratio — and 0.922¹⁶ = 0.272, matching its
+logged `cum_scale` of 0.2702 to three digits. **Error in a product compounds**; landing
+within ~5 pulses would have needed every one of 16 links accurate to ~1.4 %.
+
+### 30.2 Three fixes that survived
+
+1. **Handover ordering** (`_advance_objects`, `autofocus_v2.py`). On the promotion frame the
+   on-deck slot was refilled *before* `_handle_handover` ran, clobbering `ondeck_oid` and
+   resetting `_CrossCal`. Every run logged "no stitchable cross-cal → re-anchor" and
+   `handovers=0`. A `not promoted` guard defers the refill by one frame.
+2. **Metric mismatch** (`_coarse_pair_score` + `focus_measure_normalized`). The ratio was
+   measured as raw Laplacian variance on coarse frames while the curve used mean²-normalised
+   full-res scores — so the ratio was dimensionally wrong and biased by brightness. Live
+   effect: per-link geometric mean went **0.48–0.92 → ~1.07**, and `cum_scale` stopped
+   collapsing (2.2–7.4 instead of 1e−05).
+3. **Park diagnostic** (`best_oid` in `_RunState`). On a moving scene the object under the
+   park is rarely the one the peak was measured on, so `parked/peak` compared different
+   patches and cried "parked but soft" spuriously. It now reports
+   `peak was oid=N, parked on oid=M -> NOT comparable` and withholds the warning.
+
+### 30.3 The redesign that lost on hardware
+
+`_fit_peak_scale_free()` locates the peak from **per-segment log-slopes**: `k` cancels
+exactly, since `d/dp log(k·S) = d/dp log S`, and for a ~Gaussian response the log-slope is
+`-(p-p0)/σ²` — linear, crossing zero at focus, for *any* σ. No ratio, no chain, nothing to
+compound. Simulation strongly favoured it (median 4.0 vs 11.3 pulses against the measured
+run-7 structure; flat at 4.0 as scene heterogeneity rose while the parabola degraded past
+35). Two real defects were found and fixed along the way — `min_seg_points` had to drop to
+2 because live objects only survive ~2.8 samples, and the tail noise floor levered the
+crossing to the sweep edge (a 2 % floor reproduced the live +9-pulse bias exactly).
+
+**It still lost, by 3×.** Against a frozen-scene reference it put focus 54 pulses out where
+the raw argmax was ~13 (§30.4). Cause: real segments are 2–3 samples at 2-pulse spacing, so
+per-segment slopes are mostly noise, and with only 1–2 segments past the peak the zero
+crossing extrapolates instead of interpolating. The simulated noise model was too kind.
+
+⛔ **The parabola is primary again.** `_fit_peak_scale_free` and `_segment` remain in
+`autofocus_v2.py` **unused**, with the hardware numbers recorded at the call site, plus 7
+self-checks in `tools/test_af_segment_peak.py`. The scale-invariance argument is still
+sound and would matter if stitch drift ever returns — but it needs far more samples per
+object to be usable. Do not re-enable it on the simulation argument alone.
+
+`climb_samples` keeps its `(pos, score, oid)` shape from that work; the oid is a useful
+segment marker and one self-check pins the 3-tuple plumbing.
+
+### 30.4 Freeze the scene to get ground truth ⭐
+
+Every AF quality metric we had was self-referential (`contrast`, `improvement`,
+`parked/peak`, and the last is invalid across objects). **Pause OrthoSim with `SPACE` and
+re-run AF**: one object for the whole climb, so `handovers=0`, a clean single curve, the
+scale problem cannot arise, and `parked/peak` becomes a *valid* number. The difference
+between the moving and frozen park positions is the moving-AF error, in pulses.
+
+Rules for a valid comparison:
+
+- **One session, no relaunch, stay in M4.** The axis homes at bring-up, so each launch has
+  its own encoder zero and cross-session positions are not comparable. (This also explains
+  an apparent 20-pulse "focus drift" between runs 7 and 8 — different zeros, not drift.)
+- Both runs dive below focus and climb up, so backlash cancels. Preserve that.
+- `SPACE` is safe: `step_gate` defaults `False`, so it cannot advance an AF phase.
+- If a supposedly frozen run logs `handovers>0`, the scene wasn't frozen — discard it.
+
+Measured (argmax, the estimator-independent quantity):
+
+| session | static argmax | moving argmax | offset |
+|---|---|---|---|
+| 328754 | +8, +0 | −9 | **−13** |
+| 328755 | −2 | +11, +7, +0 | **+8** |
+
+**The offset flips sign, so there is no detectable moving-vs-static bias** — just a common
+~±10-pulse random error, the same magnitude as the static reference's own repeatability
+(+8, +0). An earlier "13-pulse bias" inferred from a single reference was scatter.
+
+**±10 pulses is cheap.** Run 15 parked 7 pulses off its own argmax and still measured
+`ratio=0.96` — 96 % of peak sharpness. That is a *measurement* of the tolerance, not a
+guess, and it matches the operator's naked-eye view that recent runs looked sharp.
+
+### 30.5 Status / open items
+
+- ✅ Handover stitches (`handovers=13–21` per run, was 0). Ratios cluster near 1.
+- ✅ Park diagnostic no longer lies about softness on moving scenes.
+- ✅ Moving AF is within ~±10 pulses ⇒ ≥96 % of peak sharpness. Good enough as it stands.
+- ✅ Frozen-scene reference is the tool for any future AF accuracy claim (~1 min per pair).
+- ⬜ **Park undershoots its target by 3–4 pulses, 7/7 observations, always short, never
+  over** (`target -6 → arrived -10`, `-7 → -11`, `+15 → +11`, `+41 → +37`, `-122 → -126`,
+  `-50 → -53`). A consistent directional error in the creep-up approach — the only clean
+  systematic left, and free to correct.
+- ⬜ **The parabola may be *adding* scatter on moving scenes.** Argmax spanned 11 pulses
+  (+11, +7, +0) but post-fit targets spanned 22 (+15, +6, −7), the fit moving +4, −1, −7 —
+  inconsistent in direction and size. On frozen runs it barely moves anything (+8→+12,
+  +0→+2), as expected for a clean local shape. If it holds up, skipping the refinement when
+  `handovers>0` halves the spread for a one-line change. **3 runs only — hypothesis.**
+- ⬜ 8 of 20 object changes were re-anchors in one run (2 of 24 in another). Re-anchors
+  apply no scale correction at all, leaving uncorrected steps in the displayed curve.
+- ⬜ `min_texture_score` is used for two unrelated metrics (tile sharpness and intensity
+  SD). Latent hazard, not an active bug.
+
+### 30.6 Lesson
+
+A simulation justified a redesign; one hardware measurement killed it in a single run. The
+simulated noise model was optimistic in exactly the way that mattered, and a *smooth* drift
+model earlier had also given the opposite answer to a *random-walk* one drawn from the
+measured ratios. When a bench measurement is an option, take it before writing the code.

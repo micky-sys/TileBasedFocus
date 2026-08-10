@@ -66,6 +66,7 @@ from .autofocus import (
     _roi_pinned_against_flow,
     _smooth3,
     focus_measure,
+    focus_measure_normalized,
     leading_edge_from_motion,
     select_leading_edge_roi,
 )
@@ -77,6 +78,101 @@ from .focus_axis import FocusAxis, OpenLoopAxis
 log = logging.getLogger(__name__)
 
 Roi = tuple[int, int, int, int]  # (x0, y0, x1, y1)
+
+
+def _segment(samples: list) -> list:
+    """Split ``[(pos, score, oid)]`` into runs of consecutive samples sharing an oid."""
+    segs: list = []
+    for pos, score, oid in samples:
+        if not segs or segs[-1][0] != oid:
+            segs.append((oid, []))
+        segs[-1][1].append((pos, score))
+    return [pts for _oid, pts in segs]
+
+
+def _fit_peak_scale_free(
+    samples: list, min_seg_points: int = 2, min_segments: int = 3,
+) -> Optional[float]:
+    """Peak position from per-object segments, with NO cross-object scale factor at all.
+
+    ``samples`` is ``[(pos, score, oid)]`` in climb order. Every tracked patch carries its
+    own unknown brightness/texture scale ``k``, so absolute scores are not comparable
+    between objects. The previous approach measured an A/B ratio per handover and
+    multiplied it into a running ``cumulative_scale``, but a climb spans ~16 objects (~237
+    frames of stepping against a ~15-frame object life at 400 mm), so per-link error
+    compounded rather than averaged: a geometric-mean ratio of 0.922 -- only 8% off unity,
+    a genuinely good content ratio -- became a 3.7x scale drift and a 27-pulse park error.
+    Across six live runs the parked position tracked ``cum_scale`` in perfect monotonic
+    order (rank correlation 1.00) and showed no discernible dependence on focus at all.
+
+    ``k`` cancels exactly in the LOG-SLOPE, since d/dp log(k*S(p)) = d/dp log S(p). And a
+    near-focus sharpness peak is ~Gaussian, so log S = -(p-p0)^2/(2*sigma^2) + c and that
+    slope is -(p-p0)/sigma^2 -- LINEAR in position, crossing zero exactly at the peak. So
+    take one log-slope per segment (each scale-free), fit a straight line through them,
+    and solve for the zero crossing. No ratio, no chain, nothing to compound: a segment
+    with a wildly wrong ``k`` contributes the same slope as one with k=1.
+
+    Measured against the structure of live run 7 (57 samples over 20 objects, of which 8
+    changes were re-anchors carrying NO scale correction at all, patch ln-scale spread
+    0.157) this lands 4.0 pulses from truth at the median vs 11.3 for the single-curve
+    parabola, and it stays at 4.0 as scene heterogeneity rises while the parabola degrades
+    past 35. ``min_seg_points=2`` because live objects only survive ~2.8 samples; a 2-point
+    log-slope is noisy but unbiased, and ~20 of them feed one line fit.
+
+    ponytail: slopes are fitted unweighted, so a 2-point segment counts as much as a
+    6-point one -- that is what leaves the 90th-percentile error at ~19 pulses while the
+    median is 4. Upgrade path if the tail matters: weight each slope by its segment's
+    point count and position span (its inverse slope variance).
+
+    Returns None when there are too few usable segments, or when the slopes *increase*
+    with position (that implies a minimum, not a peak) -- caller falls back.
+    """
+    centres: list[float] = []
+    slopes: list[float] = []
+    for pts in _segment(samples):
+        if len(pts) < min_seg_points:
+            continue
+        xs = np.asarray([p for p, _ in pts], dtype=np.float64)
+        ys = np.asarray([s for _, s in pts], dtype=np.float64)
+        if np.ptp(xs) <= 0 or not np.all(np.isfinite(ys)) or ys.min() <= 0:
+            continue
+        slopes.append(float(np.polyfit(xs, np.log(ys), 1)[0]))
+        centres.append(float(xs.mean()))
+    if len(slopes) < min_segments:
+        return None
+    cx_all = np.asarray(centres)
+    cy_all = np.asarray(slopes)
+    if np.ptp(cx_all) <= 0:
+        return None
+    # Refit locally, twice. Far from focus the sharpness metric does not keep falling --
+    # it bottoms out on a sensor/scene noise floor -- so those segments report ~flat
+    # slopes where a Gaussian predicts steep ones. They sit at the longest lever arm from
+    # the crossing, so a handful of them dominates the fitted gradient: live run 8, and a
+    # 2%-floor simulation of it, both put the crossing +9 pulses out, pinned to the clamp.
+    # The window comes from the fit itself (its gradient is -1/sigma^2), so no absolute
+    # scale or hand-tuned width enters and the estimate stays scale-free.
+    cx, cy = cx_all, cy_all
+    xv: Optional[float] = None
+    for _ in range(3):
+        if np.ptp(cx) <= 0:
+            break
+        m, b = np.polyfit(cx, cy, 1)
+        if m >= 0:  # log-slope rising with position => a trough, not a peak
+            if xv is None:
+                return None
+            break
+        xv = float(-b / m)
+        sigma = 1.0 / np.sqrt(-m)
+        keep = np.abs(cx_all - xv) <= 2.0 * sigma
+        if int(keep.sum()) < min_segments or int(keep.sum()) == cx.size:
+            break  # too few to refit, or the set stopped shrinking
+        cx, cy = cx_all[keep], cy_all[keep]
+    if xv is None:
+        return None
+    # Clamp into the swept range: beyond it the linear-slope model is extrapolating.
+    lo = min(p for p, _, _ in samples)
+    hi = max(p for p, _, _ in samples)
+    return float(min(max(xv, lo), hi))
 
 
 def _fit_peak(samples: list, window: int, log_domain: bool = True) -> Optional[float]:
@@ -425,11 +521,14 @@ class _RunState:
     dive_bursts_left: int = 0
     dive_last_t: float = 0.0
     # climb
-    climb_samples: list = field(default_factory=list)  # [(pos:int, score:float)]
+    # [(pos:int, score:float, oid:int)] -- the oid marks segment boundaries so the peak
+    # can be located per-object (scale-free) instead of on one stitched absolute curve.
+    climb_samples: list = field(default_factory=list)
     climb_pulses_done: int = 0
     best_score: float = -1e30
     min_score: float = 1e30
     best_pos: Optional[int] = None
+    best_oid: Optional[int] = None  # object the peak was measured on; park compares to it
     fell_count: int = 0
     # climb
     climb_start_pos: float = 0.0
@@ -719,10 +818,23 @@ class AutoFocusEngineV2:
         # already cross-calibrated against -- rather than a cold fresh patch on an
         # unknown score scale. Staggered so the pair doesn't march through the FOV in
         # lockstep (which would give ~no overlap to calibrate on).
+        # ...but NOT on a frame where the cull above just promoted the on-deck object
+        # into objects[0]. Refilling here would overwrite `ondeck_oid` and reset the
+        # `cross_cal` that `_handle_handover` -- which runs later this same frame -- needs
+        # to recognise the promotion and stitch it. Since the refill triggers at
+        # `handover_stagger_frames` (8) but the stitch needs only `xcal_min_overlap_frames`
+        # (6), clobbering left a 2-frame-wide window as the ONLY stitchable overlap: live
+        # runs logged 38 "no stitchable cross-cal" re-anchors and handovers=0, so the climb
+        # curve mixed patches of differing intrinsic texture. Two runs on a static bench
+        # then disagreed by 38 pulses and parked at 0.36/0.52 of their own declared peak.
+        # Deferring the refill by one frame costs nothing: the promoted object was picked
+        # at the leading edge and has most of the FOV still to cross.
+        promoted = rs.primary_oid is not None and rs.objects[0].oid != rs.primary_oid
         if (
             self.cfg.enable_handover
             and self.state == AFStateV2.CLIMB
             and len(rs.objects) == 1
+            and not promoted
             and response >= self.cfg.min_track_response
             and (rs.frames - rs.last_acquire_frame) >= self.cfg.handover_stagger_frames
         ):
@@ -876,11 +988,14 @@ class AutoFocusEngineV2:
         # While BOTH objects are visible, sample their SAME-frame coarse scores to build
         # the A/B calibration the next handover uses. Coarse (not full-res) because the
         # pipeline taps only one full-res crop/frame (the primary's); the ratio is a
-        # content-scale constant that survives the resolution drop (module notes).
+        # content-scale constant that survives the resolution drop (module notes) -- but
+        # only if measured in the curve's own units, hence _coarse_pair_score rather than
+        # a bare focus_measure. It does NOT survive a change of metric definition: the
+        # raw variance scales with brightness^2 where the full-res metric divides it out.
         if len(rs.objects) >= 2 and rs.cross_cal is not None:
             rs.cross_cal.add(
-                float(focus_measure(frame, rs.objects[0].roi)),
-                float(focus_measure(frame, rs.objects[1].roi)),
+                self._coarse_pair_score(frame, rs.objects[0].roi),
+                self._coarse_pair_score(frame, rs.objects[1].roi),
             )
 
         # Normalise the primary's full-res score onto the anchor object's scale so the
@@ -902,7 +1017,11 @@ class AutoFocusEngineV2:
         rs.lucky_scores = []
         rs.lucky_left = max(1, cfg.climb_lucky_frames)
         if agg is not None:
-            rs.climb_samples.append((pos, agg))
+            # Tag the segment. cumulative_scale only ever changes at a handover, which is
+            # exactly when primary_oid changes, so it is constant within a segment -- and a
+            # log-slope kills any constant factor. That makes these stored values usable
+            # by _fit_peak_scale_free untouched, whether or not the stitch drifted.
+            rs.climb_samples.append((pos, agg, rs.primary_oid))
             rs.min_score = min(rs.min_score, agg)
             # Skip the backlash dead-zone at the start of the climb: until the encoder
             # has advanced ~one lash the optics haven't begun moving, so the score is a
@@ -914,6 +1033,7 @@ class AutoFocusEngineV2:
                 if agg > rs.best_score:
                     rs.best_score = agg
                     rs.best_pos = pos
+                    rs.best_oid = rs.primary_oid
                     rs.fell_count = 0
                 elif rs.best_score > 1e-6 and agg < rs.best_score * (1 - cfg.peak_fall_frac):
                     rs.fell_count += 1
@@ -963,8 +1083,21 @@ class AutoFocusEngineV2:
         best = int(rs.best_pos)
         # Refine the peak with a local parabola fit: the argmax is one noisy sample,
         # the vertex uses the whole shoulder so it doesn't chase a single spike.
+        #
+        # _fit_peak_scale_free() was tried here and LOST on hardware, decisively. Measured
+        # against a frozen-scene reference in one session (so one encoder zero): static AF
+        # put focus at +9 and -1 (handovers=0, a clean single curve, so ~+/-5 pulses of
+        # reference scatter), the moving argmax landed at -9, and the scale-free estimate
+        # at -50 -- about 54 pulses out, three times worse than the argmax it replaced. The
+        # simulations that justified it were too kind about noise: real segments are only
+        # 2-3 samples at 2-pulse spacing, so per-segment log-slopes are mostly noise, and
+        # with just 1-2 segments past the peak its zero crossing extrapolates rather than
+        # interpolates. Kept (unused) with its self-checks in tools/test_af_segment_peak.py
+        # because the scale-invariance argument is still sound and would matter if the
+        # cross-cal drift ever returns; it needs many more samples per object to be usable.
         if self.cfg.peak_curve_fit:
-            xv = _fit_peak(rs.climb_samples, self.cfg.peak_fit_window,
+            xv = _fit_peak([(p, s) for p, s, _ in rs.climb_samples],
+                           self.cfg.peak_fit_window,
                            log_domain=self.cfg.peak_fit_log)
             if xv is not None:
                 fit = int(round(xv))
@@ -1095,10 +1228,25 @@ class AutoFocusEngineV2:
                      now - rs.park_settle_since, len(rs.park_scores))
         pos = int(round(self._axis.position))
         ratio = (parked / rs.best_score) if rs.best_score > 1e-6 else 0.0
-        log.info("af2-park pos=%+d parked=%.2f peak=%.2f ratio=%.2f",
-                 pos, parked, rs.best_score, ratio)
+        # parked-vs-peak only means something if BOTH were measured on the same patch.
+        # _advance_objects keeps running through PARK, and the park (descend + creep +
+        # settle: 4-11 s live) routinely outlasts one object (~3.2 s at 400 mm), so on a
+        # moving scene the parked score is usually a DIFFERENT patch -- and scaled by a
+        # cumulative_scale calibrated for yet another one, since handovers only fold in
+        # during CLIMB. Reporting that as "parked but soft" invents a focus problem out of
+        # a content difference; the ratios 0.36 / 0.52 / 0.04 seen live were mostly this.
+        comparable = (
+            rs.best_oid is not None
+            and bool(rs.objects)
+            and rs.objects[0].oid == rs.best_oid
+        )
+        log.info("af2-park pos=%+d parked=%.2f peak=%.2f ratio=%.2f%s",
+                 pos, parked, rs.best_score, ratio,
+                 "" if comparable else
+                 f" (peak was oid={rs.best_oid}, parked on "
+                 f"oid={rs.objects[0].oid if rs.objects else None} -> NOT comparable)")
         self._sample(pos, parked, True)
-        if ratio < (1.0 - 2.0 * self.cfg.peak_fall_frac):
+        if comparable and ratio < (1.0 - 2.0 * self.cfg.peak_fall_frac):
             # Parked notably softer than the measured peak -- surface it, but still
             # hold here (best available); a repeat AF can re-seek.
             self._status(
@@ -1129,6 +1277,17 @@ class AutoFocusEngineV2:
             self._begin_dive()
 
     # %% scoring %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    def _coarse_pair_score(self, frame, roi: Roi) -> float:
+        """Coarse score for one half of a cross-cal pair, in the SAME units the climb
+        curve is measured in -- a ratio is only transferable between identical metrics.
+        Mirrors the branch in :meth:`_score_primary`: mean^2-normalised when the curve
+        comes from ``focus_measure_full_res``, raw variance when we fall back to scoring
+        the coarse frame (sim / encoderless bench), where brightness is part of the
+        metric and dividing it out would introduce the mismatch in the other direction."""
+        if self._full_res_score is not None:
+            return float(focus_measure_normalized(frame, roi))
+        return float(focus_measure(frame, roi))
 
     def _score_primary(self, frame) -> Optional[float]:
         """Sharpness of the tracked target patch, ALWAYS on the sensor-native full-res

@@ -10,7 +10,15 @@ span a handover. These asserts drive it directly:
       segment, multiplying that segment by the recovered ratio moves the combined
       argmax onto the true peak, whereas the UN-stitched curve peaks at the seam
       (the bug this feature fixes);
-  (c) overlap gate -- valid() is False until min_overlap pairs are seen.
+  (c) overlap gate -- valid() is False until min_overlap pairs are seen;
+  (d) promotion-frame ordering -- _advance_objects must NOT refill the on-deck slot on
+      the same frame it promotes the old on-deck into objects[0], because that would
+      overwrite ondeck_oid / cross_cal before _handle_handover (later that frame) can
+      recognise and stitch the promotion. (a)-(c) all passed while this was broken: they
+      drive _CrossCal directly and never run the engine, so the ratio was always fine and
+      simply never reached. Live symptom was handovers=0 with 38 re-anchors, a climb curve
+      mixing patches of differing texture, two static-bench runs disagreeing by 38 pulses,
+      and parks landing at 0.36/0.52 of their own declared peak.
 
 Run: py -3 tools/test_af_handover.py
 """
@@ -18,6 +26,7 @@ Run: py -3 tools/test_af_handover.py
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -27,7 +36,12 @@ sys.path.insert(0, str(HOST))
 
 import numpy as np  # noqa: E402
 
-from capture.autofocus_v2 import _CrossCal  # noqa: E402
+from capture.autofocus_v2 import (  # noqa: E402
+    AFStateV2,
+    AutoFocusConfigV2,
+    AutoFocusEngineV2,
+    _CrossCal,
+)
 
 # Object B reads this fraction of object A at the same focus (B is less textured),
 # so the ratio the calibration must recover is 1 / B_FRAC.
@@ -103,11 +117,158 @@ def test_overlap_gate() -> None:
     assert not dead.valid(), dead.count
 
 
+# --- (d) engine-level: the promotion frame must stay stitchable ---------------
+
+# Content drifts UP the frame, so the leading edge is the bottom and a patch pinned
+# against y=0 has left the FOV.
+DY = -12.0
+FRAME_HW = (480, 640)
+
+
+def _climbing_engine() -> AutoFocusEngineV2:
+    cfg = AutoFocusConfigV2()
+    cfg.enable_handover = True
+    cfg.full_frame_target = False   # use the motion-derived leading edge
+    cfg.restrict_interior = False   # plain edge-band grid; no bench bezel masking
+    cfg.min_texture_score = 0.0     # random noise always qualifies
+    cfg.xcal_min_overlap_frames = 6
+    cfg.handover_stagger_frames = 8
+    af = AutoFocusEngineV2(pulse=lambda *_a, **_k: None, config=cfg)
+    af.state = AFStateV2.CLIMB
+    rs = af._rs
+    rs.motion_dy = DY
+    # 15 frames since the last acquire: past the stagger, so the on-deck refill is armed.
+    rs.frames, rs.last_acquire_frame = 20, 5
+    return af
+
+
+def _noise_frame() -> np.ndarray:
+    return (np.random.default_rng(11).random(FRAME_HW) * 255.0).astype(np.uint8)
+
+
+def test_promotion_frame_preserves_cross_cal_and_stitches() -> None:
+    af = _climbing_engine()
+    rs = af._rs
+    primary = af._add_object((100, 2, 200, 100))    # hugs y=0 -> pans off this frame
+    ondeck = af._add_object((300, 200, 400, 300))   # mid-frame -> survives
+    rs.primary_oid, rs.ondeck_oid = primary.oid, ondeck.oid
+    rs.cross_cal = _CrossCal(cfg_min := af.cfg.xcal_min_overlap_frames)
+    for _ in range(8):                              # 8 >= 6 -> already trustworthy
+        rs.cross_cal.add(100.0, 40.0)               # ratio 2.5
+    assert rs.cross_cal.valid() and cfg_min == 6
+
+    af._advance_objects(_noise_frame(), 0.0, DY, 0.5)
+
+    # The primary is gone and the on-deck has been promoted...
+    assert [o.oid for o in rs.objects] == [ondeck.oid], rs.objects
+    # ...and crucially the evidence _handle_handover needs is intact: no same-frame refill
+    # clobbered ondeck_oid, and the 8 accumulated overlap pairs were not reset.
+    assert rs.ondeck_oid == ondeck.oid, rs.ondeck_oid
+    assert rs.cross_cal.count == 8, rs.cross_cal.count
+
+    assert af._handle_handover() is False            # continues the climb, doesn't end it
+    assert rs.handovers == 1, rs.handovers           # the stitch actually happened
+    assert abs(rs.cumulative_scale - 2.5) < 1e-6, rs.cumulative_scale
+    assert rs.primary_oid == ondeck.oid
+
+
+def test_ordinary_frame_still_refills_the_ondeck_slot() -> None:
+    # The guard must only DEFER the refill by one frame, not disable handover prep: with
+    # no promotion pending, a lone primary past the stagger still gets a partner.
+    af = _climbing_engine()
+    rs = af._rs
+    primary = af._add_object((300, 200, 400, 300))   # mid-frame -> survives, stays primary
+    rs.primary_oid = primary.oid
+
+    af._advance_objects(_noise_frame(), 0.0, DY, 0.5)
+
+    assert len(rs.objects) == 2, rs.objects
+    assert rs.objects[0].oid == primary.oid          # primary unchanged -> no promotion
+    assert rs.ondeck_oid == rs.objects[1].oid
+    assert rs.ondeck_oid != primary.oid
+
+
+# --- (e) the ratio must be measured in the curve's own units ------------------
+
+
+def test_ratio_metric_is_brightness_invariant() -> None:
+    """The A/B ratio is applied to samples from focus_measure_full_res, which divides
+    mean^2 out. Measuring it with raw Laplacian variance instead makes it track the two
+    patches' *brightness* as well as their texture -- and since the on-deck patch is
+    always freshly picked near frame centre while the outgoing primary has drifted to a
+    vignetted edge, that error has a fixed sign and compounds over every handover."""
+    from capture.autofocus import focus_measure, focus_measure_normalized
+
+    rng = np.random.default_rng(5)
+    # Same texture, different illumination: B is the identical patch 1.6x brighter, so
+    # an honest same-focus ratio is 1.0 -- the patches are equally sharp.
+    texture = rng.random((120, 160)).astype(np.float32) * 40.0
+    a = (texture + 60.0).astype(np.uint8)
+    b = (texture * 1.6 + 96.0).astype(np.uint8)
+    frame = np.hstack([a, b])
+    roi_a, roi_b = (0, 0, 160, 120), (160, 0, 320, 120)
+
+    raw = focus_measure(frame, roi_a) / focus_measure(frame, roi_b)
+    norm = focus_measure_normalized(frame, roi_a) / focus_measure_normalized(frame, roi_b)
+
+    # Raw variance is fooled by the brightness difference -- biased well below 1...
+    assert raw < 0.75, raw
+    # ...while the normalised metric recovers the honest ~1.0 the curve needs.
+    assert 0.85 < norm < 1.18, norm
+    # And the bias is what compounds: unchecked over 13 handovers it is catastrophic.
+    assert raw ** 13 < 1e-3, raw ** 13
+
+
+# --- (f) the park verdict must know when it cannot compare --------------------
+
+
+def _parking_engine(msgs: list) -> AutoFocusEngineV2:
+    """An engine sitting in PARK's settle phase with the hard cap already tripped, so
+    _park_tick goes straight to the parked-vs-peak verdict."""
+    cfg = AutoFocusConfigV2()
+    af = AutoFocusEngineV2(pulse=lambda *_a, **_k: None, config=cfg, status=msgs.append)
+    rs = af._rs
+    rs.continuous = True                 # park -> HOLD (skips the _report() path)
+    af.state = AFStateV2.PARK
+    rs.park_phase = "settle"
+    rs.best_score, rs.best_pos = 1000.0, -11
+    rs.park_scores = [40.0] * 5          # 4% of peak: would trip "parked but soft"
+    rs.park_settle_since = time.monotonic() - (cfg.park_settle_max_s + 1.0)
+    rs.park_last_pos = 0.0
+    return af
+
+
+def test_park_does_not_cry_soft_when_the_object_changed() -> None:
+    msgs: list = []
+    af = _parking_engine(msgs)
+    rs = af._rs
+    obj = af._add_object((100, 100, 200, 200))
+    rs.best_oid = obj.oid + 1            # peak was measured on a patch since panned off
+    af._park_tick(np.zeros((240, 320), dtype=np.uint8))
+    # 4% of peak, but on a different patch -- that is a content difference, not defocus.
+    assert not any("soft" in m for m in msgs), msgs
+
+
+def test_park_still_warns_on_the_same_object() -> None:
+    msgs: list = []
+    af = _parking_engine(msgs)
+    rs = af._rs
+    obj = af._add_object((100, 100, 200, 200))
+    rs.best_oid = obj.oid                # same patch -> the comparison is meaningful
+    af._park_tick(np.zeros((240, 320), dtype=np.uint8))
+    assert any("soft" in m for m in msgs), msgs
+
+
 def main() -> int:
     tests = [
         test_ratio_recovery,
         test_stitched_peak_lands_on_true_peak,
         test_overlap_gate,
+        test_promotion_frame_preserves_cross_cal_and_stitches,
+        test_ordinary_frame_still_refills_the_ondeck_slot,
+        test_ratio_metric_is_brightness_invariant,
+        test_park_does_not_cry_soft_when_the_object_changed,
+        test_park_still_warns_on_the_same_object,
     ]
     for t in tests:
         t()
