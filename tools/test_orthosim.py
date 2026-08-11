@@ -375,3 +375,33 @@ def test_speed_distance_tracker() -> None:
     assert abs(m.distance_m - 40.0) < 1e-6
     assert abs(m.encoded_velocity_mps - 40.0) < 1e-6
     assert abs(m.gsd_cm - 2.5) < 1e-6
+
+
+def test_gt_logger_survives_a_failing_sink(tmp_path) -> None:
+    """A CSV write failure must not escape maybe_log, and must disable the log.
+
+    orthosim_gui._on_tick() calls self.update() AFTER the logger, so an exception here
+    skips the repaint: the display stops animating while the internal scroll keeps
+    advancing, which a bench run reads as a *frozen scene* with no visible signal that
+    anything broke. Seen live 2026-08-10 -- the default CSV path sits next to the .tif on
+    the Google Drive stream, which threw Errno 22 on every flush for 12.5 h straight.
+    """
+    from orthosim_core import GroundTruthLogger
+
+    log = GroundTruthLogger(tmp_path / "gt.csv", sample_hz=1000.0)
+    log.open()
+
+    class _ExplodingSink:
+        def flush(self) -> None:
+            raise OSError(22, "Invalid argument")
+
+    log._fh = _ExplodingSink()  # csv.writer still holds the real file; the flush blows up
+
+    kw = dict(tick=1, distance_m=1.0, velocity_mps=2.0, screen_gsd_cm_value=3.0,
+              simulated_gsd_cm_value=4.0, zoom=1.0, flags=0)
+
+    log.maybe_log(**kw)                     # must swallow the OSError
+    assert log._writer is None, "logger should disable itself after a write failure"
+
+    log._last_perf = 0.0                    # defeat the rate limit
+    log.maybe_log(**kw)                     # and stay quiet forever after

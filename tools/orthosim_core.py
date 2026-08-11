@@ -239,20 +239,34 @@ class GroundTruthLogger:
         if self._last_perf and (now - self._last_perf) < self._min_dt:
             return
         self._last_perf = now
-        self._writer.writerow(
-            [
-                time.strftime("%Y-%m-%dT%H:%M:%S"),
-                f"{now:.6f}",
-                tick,
-                f"{distance_m:.4f}",
-                f"{velocity_mps:.4f}",
-                f"{screen_gsd_cm_value:.5f}",
-                f"{simulated_gsd_cm_value:.5f}",
-                f"{zoom:.5f}",
-                flags,
-            ]
-        )
-        self._fh.flush()
+        try:
+            self._writer.writerow(
+                [
+                    time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    f"{now:.6f}",
+                    tick,
+                    f"{distance_m:.4f}",
+                    f"{velocity_mps:.4f}",
+                    f"{screen_gsd_cm_value:.5f}",
+                    f"{simulated_gsd_cm_value:.5f}",
+                    f"{zoom:.5f}",
+                    flags,
+                ]
+            )
+            self._fh.flush()
+        except OSError as exc:
+            # GT logging is a nice-to-have; the scrolling display is the experiment. The
+            # caller (_on_tick) calls self.update() AFTER us, so letting this propagate
+            # skips the repaint -- the screen stops animating while the internal scroll
+            # keeps advancing, which a bench run reads as a *frozen scene* with no visible
+            # signal that anything broke. Seen live: a CSV on the Google Drive stream threw
+            # Errno 22 on every flush for 12.5 h. Disable the log, keep the picture moving.
+            print(f"[OrthoSim] ground-truth CSV disabled after write error: {exc}\n"
+                  f"[OrthoSim]   path: {self._path}\n"
+                  f"[OrthoSim]   (network/virtual drives can reject flush; the default "
+                  f"path sits next to the .tif, so pass --log with a local path)",
+                  flush=True)
+            self._writer = None
 
     def close(self) -> None:
         if self._fh is not None:

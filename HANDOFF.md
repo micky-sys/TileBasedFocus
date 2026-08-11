@@ -2172,6 +2172,16 @@ guess, and it matches the operator's naked-eye view that recent runs looked shar
   apply no scale correction at all, leaving uncorrected steps in the displayed curve.
 - ⬜ `min_texture_score` is used for two unrelated metrics (tile sharpness and intensity
   SD). Latent hazard, not an active bug.
+- ✅ **OrthoSim GT CSV can silently freeze the display** (fixed). The default log path sits
+  next to the `.tif` — on the Google Drive stream — and `flush()` threw `Errno 22` on every
+  write for 12.5 h, i.e. through every run above. `_on_tick()` calls `self.update()` *after*
+  the logger, so each failure skipped a repaint while `self._scroll` kept advancing: at a
+  higher failure rate the screen would stop animating and a bench run would read it as a
+  **frozen scene**, with no visible signal — which would quietly invalidate the §30.4
+  method. `GroundTruthLogger.maybe_log` now swallows `OSError`, prints the path once and
+  disables itself; the picture keeps moving. Pass `--log <local path>` if you need the CSV.
+  Only the CSV was lost — the capture-side GT decode reads the optical bar, not this file,
+  so the altitude/velocity readouts in the logs above are unaffected.
 
 ### 30.6 Lesson
 
