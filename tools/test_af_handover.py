@@ -42,6 +42,7 @@ from capture.autofocus_v2 import (  # noqa: E402
     AutoFocusEngineV2,
     _CrossCal,
 )
+from capture.focus_axis import EncoderAxis  # noqa: E402
 
 # Object B reads this fraction of object A at the same focus (B is less textured),
 # so the ratio the calibration must recover is 1 / B_FRAC.
@@ -259,6 +260,65 @@ def test_park_still_warns_on_the_same_object() -> None:
     assert any("soft" in m for m in msgs), msgs
 
 
+class _FakeShaft:
+    """Minimal motor: one pulse moves the shaft by ``counts_per_pulse`` counts."""
+
+    def __init__(self, counts_per_pulse: float = 24.0, start: float = 0.0) -> None:
+        self.cpp = float(counts_per_pulse)
+        self.count = float(start)
+
+    def pulse(self, sym: str, n: int) -> None:
+        self.count += (int(n) if sym == "+" else -int(n)) * self.cpp
+
+    def read(self) -> float:
+        return self.count
+
+
+def test_park_creep_lands_centred_on_the_target_not_below() -> None:
+    """The creep must stop at the CLOSEST reachable point to best_pos.
+
+    It only ever moves UP, so any tolerance subtracted from the target is a pure
+    one-directional bias rather than a tolerance. The old exit test was
+    ``pos >= best_pos - park_tolerance_pulses`` with a tolerance of 4 PULSES, i.e.
+    96 counts on this rig, so it quit the instant it crossed the BOTTOM edge of the
+    band and never closed the gap: all 14 park runs in the 2026-08 bench logs landed
+    2-4 pulses BELOW target, not once above (target +15 -> arrived +11, +6 -> +2,
+    -7 -> -11, -14 -> -18...). That offset sat underneath every AF measurement we
+    were using to compare peak estimators. Half a pulse is the honest bound -- it is
+    the finest step the hardware has, so anything wider is a systematic error.
+    """
+    cpp = 24.0
+    frame = np.zeros((240, 320), dtype=np.uint8)
+    # Deliberately not pulse-aligned, and spanning all three creep speeds (single
+    # pulse / climb pace / coarse bulk) so the landing is checked after each.
+    for target in (7, 100, 313, 1000, 2401):
+        shaft = _FakeShaft(counts_per_pulse=cpp, start=-5000.0)
+        axis = EncoderAxis(shaft.pulse, shaft.read, counts_per_pulse=cpp,
+                           backlash_pulses=2)
+        axis.reset()  # position 0 == shaft -5000; every target below is ABOVE us
+        cfg = AutoFocusConfigV2(
+            encoder_counts_per_pulse=cpp,
+            park_slow_band_counts=12 * cpp,
+            park_climb_band_counts=36 * cpp,
+        )
+        af = AutoFocusEngineV2(pulse=lambda *_a, **_k: None, axis=axis, config=cfg)
+        af.state = AFStateV2.PARK
+        rs = af._rs
+        rs.park_phase = "creep"
+        rs.best_pos = target
+        rs.park_move_since = time.monotonic()
+        for _ in range(4000):
+            af._park_tick(frame)
+            if rs.park_phase != "creep":
+                break
+        assert rs.park_phase == "settle", f"creep never finished for target {target}"
+        err = axis.position - target
+        assert abs(err) <= cpp / 2.0 + 1e-9, (
+            f"target {target}: landed {err:+.1f} counts away, more than the half-pulse "
+            f"({cpp / 2.0:.0f}) that is actually reachable -- a one-way creep stopped "
+            f"at a band edge again")
+
+
 def main() -> int:
     tests = [
         test_ratio_recovery,
@@ -267,6 +327,7 @@ def main() -> int:
         test_promotion_frame_preserves_cross_cal_and_stitches,
         test_ordinary_frame_still_refills_the_ondeck_slot,
         test_ratio_metric_is_brightness_invariant,
+        test_park_creep_lands_centred_on_the_target_not_below,
         test_park_does_not_cry_soft_when_the_object_changed,
         test_park_still_warns_on_the_same_object,
     ]

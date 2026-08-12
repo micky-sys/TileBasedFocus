@@ -54,7 +54,7 @@ def _cfg(**kw) -> AutoFocusConfigV2:
         dive_bursts=4,
         dive_burst_pulses=12,       # 4 x 12 = 48 pulses down (start is +24 above focus)
         dive_burst_interval_s=0.0,  # no wall-clock wait in the tight test loop
-        dive_min_drop_pulses=10,
+        dive_min_drop_counts=10,    # counts == pulses here (cpp defaults to 1.0)
         strength=0,
         climb_step_pulses=4,
         climb_max_pulses=200,
@@ -187,13 +187,21 @@ def test_v2_encoder_static_lands_from_below() -> None:
         sim.apply_pulse(sym, n)
         tracker.update_raw(int(round(sim.carrier_pulses * cpp)) % 4096)
 
-    cfg = _cfg(encoder_counts_per_pulse=cpp, backlash_pulses=lash_pulses)
+    # The *_counts defaults in _cfg are sized for the encoderless axis (1 count ==
+    # 1 pulse), so scale them by cpp to keep the same PHYSICAL distances once a count
+    # is 1/24 of a pulse -- the same scaling app.py does off its measured calibration.
+    cfg = _cfg(
+        encoder_counts_per_pulse=cpp, backlash_pulses=lash_pulses,
+        dive_min_drop_counts=10 * cpp, park_stable_counts=2 * cpp,
+        park_slow_band_counts=12 * cpp, park_climb_band_counts=36 * cpp,
+        park_descend_margin_counts=20 * cpp,
+    )
     axis = EncoderAxis(
         pulse, lambda: tracker.position,
         counts_per_pulse=cfg.encoder_counts_per_pulse,
         backlash_pulses=cfg.backlash_pulses,
     )
-    assert axis._cpp == cpp and axis.backlash_pulses == lash_pulses
+    assert axis.counts_per_pulse == cpp and axis.backlash_pulses == lash_pulses
 
     engine = AutoFocusEngineV2(
         pulse=lambda *_a: None, axis=axis,

@@ -1509,7 +1509,7 @@ Phases (`ACQUIRE → DIVE → CLIMB → PARK → HOLD/DONE`):
 
 1. **Dive** — str3, `dive_bursts=4` × 1 pulse down, seating the gear lash from below.
    Separate bursts (encoder re-read between) so a stalled motor / end stop is caught
-   early (`dive_min_drop_pulses`).
+   early (`dive_min_drop_counts`).
 2. **Climb** — str0, `climb_step_pulses=2` up per frame, one **(encoder, score)** sample
    per frame; peak-detect on "score rose then fell" (`peak_fall_frac`,
    `peak_confirm_samples`). One-way, so the lash stays seated and every sample shares
@@ -2189,3 +2189,120 @@ A simulation justified a redesign; one hardware measurement killed it in a singl
 simulated noise model was optimistic in exactly the way that mattered, and a *smooth* drift
 model earlier had also given the opposite answer to a *random-walk* one drawn from the
 measured ratios. When a bench measurement is an option, take it before writing the code.
+
+---
+
+## 31. Counts, park bias, and the field map (2026-08-11)
+
+Continuing §30. Chasing the last systematic errors out of AF closed two of them, then ran
+into one that AF cannot measure about itself — **best focus is not in the same place
+everywhere in the frame** — which is what the field-map tool exists to quantify.
+
+### 31.1 Units: positions are COUNTS, drive amounts are PULSES
+
+Positions used to be carried in "pulse-equivalent units" (`counts / 24`), rounded to `int`
+on every read. That threw away 24× of the encoder's resolution — up to **±12 counts of
+quantisation noise** fed straight into the parabola fit — and made thresholds read tighter
+than they were: `park_tolerance_pulses = 4` looks small and is really 96 counts.
+
+The rule now, stated at the top of `focus_axis.py`: **anything measured, compared, or
+thresholded is in encoder counts; only actual motor commands are in pulses.** A pulse is a
+fixed-duration H-bridge burst whose size depends on drive strength (~24 counts at str0, ~34×
+that at str3), so it is not a unit of distance. A count is, and it means the same thing at
+every strength.
+
+`FocusAxis.position` is now a float in counts, `pulses_for()` converts a wanted move into
+whole pulses, and the count-denominated config fields (`dive_min_drop_counts`,
+`park_stable_counts`, `park_slow_band_counts`, `park_climb_band_counts`,
+`park_descend_margin_counts`) are scaled in `app.py` by the measured `af_counts_per_pulse`
+so the physical distances the rig was tuned with are preserved. `*_pulses` fields are drive
+amounts and stayed as they were.
+
+### 31.2 Park bias — supersedes the open item in §30.5
+
+The 3–4 pulse undershoot, 7/7 observations, was an **asymmetric exit condition**. The creep
+only ever moves up, and it stopped at `pos >= best_pos - park_tolerance_pulses`, i.e. at the
+*bottom edge* of a 96-count band. A one-directional approach turns a tolerance band into a
+systematic offset of its full width. The exit is now centred on half a pulse (12 counts, the
+finest move that exists), and `af2-park arrived` logs `miss=` so the error is visible rather
+than inferred. `tools/test_af_handover.py` gained a check that fails under the old rule.
+
+Removing it uncovered a second, smaller bias it had been masking: **post-arrival drain
+drift** of +16…+81 counts (mean ~+36, about 1.5 pulses) — the shaft keeps moving after
+"arrived" is logged. Still open, but it is now the largest remaining mechanical systematic
+rather than the second largest.
+
+### 31.3 Cross-run comparison needs `raw` — `tools/af_rebase_runs.py`
+
+`EncoderAxis.reset()` runs on **every AF press**, so `best_pos` and park positions are
+relative to wherever the lens happened to be when the button was hit. Comparing them across
+runs is meaningless, and doing so had already produced wrong conclusions once. The only
+position that survives a reset is `raw_count`, now logged in both the dive and park lines.
+`tools/af_rebase_runs.py` parses a session log, rebases every run onto that common frame,
+and reports start/argmax/fit/landed, the park miss, the drain, and the gap between one run's
+landing and the next run's start.
+
+### 31.4 The finding that motivated the tool
+
+Rebasing the frozen-scene runs split the scatter cleanly in two:
+
+| comparison | spread |
+|---|---|
+| static AF, repeated on the **same** tile | **1.6 pulses** |
+| static AF, across **different** tiles | **7.8 pulses** |
+
+The estimator is fine. What moves is *where in the frame* it looked. Moving AF rides patches
+near y≈2000 in the coarse frame while the static runs picked tiles near y≈1000, so the
+moving-vs-static difference was substantially a comparison between two regions of a non-flat
+field — screen tilt, lens field curvature, or both. **Until that is measured, no AF accuracy
+number that compares runs targeting different regions means anything.**
+
+AF cannot answer this about itself: it scores exactly one tile for the whole climb (the
+multi-tile scan happens once, during acquire, only to *choose* that tile).
+
+### 31.5 The field map — `host/capture/field_map.py`
+
+**Field map** button, next to Stop AF in the M4 panel. One dive-and-climb; five tiles pinned
+at fixed sensor coordinates — centre plus the four mid-edges — scored on **every** frame.
+
+Why one sweep rather than one AF run per region: every AF run re-zeros the encoder, re-seats
+the lash, parks, and lands minutes apart, and all of that is difference that is not optics.
+Tiles scored from the same held frame at the same encoder position share their positions,
+their frames, and their mechanical state exactly, so what is left between their vertices is
+optics. It is also ~40 s instead of ~20 minutes.
+
+- **Centre + mid-edges, not corners.** Tilt is linear (top and bottom fall on opposite sides
+  of centre); curvature is symmetric (both move the same way). Corners confound them.
+- **Full-res, not the coarse tap.** Coarse aliases away the high frequencies focus lives in
+  and peaks in the wrong place. `set_preview_rois` already crops an arbitrary list of ROIs
+  from one held slot (built for the two-object preview, never limited to two), so this
+  needed **no pipeline changes** — and reuses `focus_measure_full_res` and `_fit_peak`.
+- **Tiles are 600 px full-res**, ~3.6 MB/frame for five. AF-sized ROIs (~2820×2004) would
+  copy 56 MB/frame.
+- **It never parks.** Dive ~3400 counts, climb 260 str0 pulses (~6240 counts) sampling every
+  ~48, then a **paced return to the start** so a field map costs nothing to run — a single
+  absolute `move_to` of that size is what used to yank the lens around on AF stop, so the
+  return steps down 6 pulses/frame like everything else. The whole park-bias question stays
+  out of the measurement.
+- **The climb does not stop at the first peak.** Tiles crest at different positions; halting
+  on the earliest would truncate exactly the curves being compared.
+- Reports each tile's vertex in counts, its offset from centre, and the spread; writes every
+  sample to `Iron661_fieldmap_<stamp>.csv` in the session-log folder (one write at the end,
+  not a flush per row — see the OrthoSim `Errno 22` lesson in §30.5). Stop AF aborts and
+  keeps what it collected.
+
+⚠️ **Freeze the scene first.** The tiles are pinned to sensor pixels, so the content under
+them must hold still. No loss: field curvature belongs to the optics, not the picture.
+
+`tools/test_field_map.py` gives five synthetic tiles their own true focus positions and
+checks the recovery. A genuinely flat field reports a **0-count** spread — so any spread
+seen on the rig is real and not the tool's own noise — and an 800-count tilt reads back as
+789. Also checks Bayer alignment of the ROIs, that an abort keeps its samples, and that the
+sweep ends where it started.
+
+### 31.6 Next
+
+Run one sweep on the frozen bench. Expect a spread near the ~7.8 pulses (~190 counts) the
+across-tile AF scatter implies; substantially more would mean the moving-vs-static
+discrepancy of §30.4 was mostly geometry rather than the estimator, and that AF's tile
+choice — not its peak finder — is the thing worth constraining.

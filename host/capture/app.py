@@ -68,6 +68,8 @@ from .kyfg_backend import KyfgCamera
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
 from .file_naming import sanitize_project_name
+from .field_map import FieldMapConfig, FieldMapSweep, five_tile_rois
+from .focus_axis import EncoderAxis
 from .focus_csv_log import FocusCsvLogger
 from .focus_panel import FocusPanel, _crop_pixmap_center
 from .gps_correlator import GpsCorrelator
@@ -2160,15 +2162,16 @@ class MainWindow(QMainWindow):
         # Calibrated on-rig (HANDOFF 23.6): str0 moves ~24 encoder counts per 3 ms
         # pulse and the motor->lens gear lash is ~1290 counts. Feed both to the v2
         # sweep-and-hold engine so the EncoderAxis lands in real motor units instead
-        # of the 1.0 counts/pulse + 3-pulse placeholders it defaults to. Units below
-        # are pulse-equivalent (1 unit = |counts_per_pulse| counts). The SIGN encodes
+        # of the 1.0 counts/pulse + 3-pulse placeholders it defaults to. Positions and
+        # tolerances below are ENCODER COUNTS; only *_pulses are drive amounts, which
+        # have to stay in pulses because that is the hardware quantum. The SIGN encodes
         # polarity. Measured clean on-rig (discrete-pulse firmware, non-aliased
         # $ENC): a run commanded DOWN to the sweep floor (target=-120) drove the
         # encoder UP (+37..+1128) into the end stop -- i.e. a '-' pulse raises the
         # count, so a '+' pulse LOWERS it, so counts_per_pulse is NEGATIVE. With
-        # -24, ``position = (raw-origin)/cpp`` increases on a '+' drive as move_to /
-        # park_upward assume; the earlier +24 inverted that and made every "move
-        # down" run away upward into the stop ("how is this in focus?").
+        # -24, ``position = (raw-origin)*sign(cpp)`` increases on a '+' drive as
+        # move_to / park_upward assume; the earlier +24 inverted that and made every
+        # "move down" run away upward into the stop ("how is this in focus?").
         # reverify=0 => land and hold (atmospheric lens is static for hours); the
         # trigger runs it one-shot (see _on_autofocus_requested).
         af_counts_per_pulse = -24.0
@@ -2184,7 +2187,17 @@ class MainWindow(QMainWindow):
             dive_strength=3,        # str3: fast dive below focus
             dive_bursts=4,          # 4 individual str3 pulses down (encoder re-checked between)
             dive_burst_pulses=1,    # ONE str3 pulse per burst -> the dive is 4 str3 pulses total
-            dive_min_drop_pulses=3, # just confirm the 4-pulse dive actually moved down
+            # Just confirm the 4-pulse str3 dive actually moved down. Deliberately
+            # loose: a str3 pulse is ~850 counts, so a working dive drops ~2500, and
+            # this only has to clear encoder noise.
+            dive_min_drop_counts=3 * abs(af_counts_per_pulse),
+            # Park distances, in COUNTS. The config defaults are sized for the
+            # encoderless axis (1 count == 1 pulse), so scale them by the measured
+            # counts/pulse to keep the physical distances the rig was tuned with.
+            park_stable_counts=2 * abs(af_counts_per_pulse),
+            park_slow_band_counts=12 * abs(af_counts_per_pulse),
+            park_climb_band_counts=36 * abs(af_counts_per_pulse),
+            park_descend_margin_counts=20 * abs(af_counts_per_pulse),
             climb_step_pulses=2,    # str0 pulses/frame on the way up (fine)
             climb_settle_frames=1,  # (superseded by climb_lucky_frames; kept for config parity)
             # SNR: lucky-imaging + curve-fit peak (revert with climb_lucky_frames=1,
@@ -2243,7 +2256,7 @@ class MainWindow(QMainWindow):
             self._focus_panel.autofocus_all_requested.connect(
                 self._on_autofocus_all_requested
             )
-            self._focus_panel.autofocus_stop_requested.connect(self._autofocus.stop)
+            self._focus_panel.autofocus_stop_requested.connect(self._on_af_stop_requested)
             self._focus_panel.autofocus_algorithm_changed.connect(
                 self._autofocus.set_algorithm
             )
@@ -2257,6 +2270,13 @@ class MainWindow(QMainWindow):
             self._af_step_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
             self._af_step_shortcut.setContext(Qt.ApplicationShortcut)
             self._af_step_shortcut.activated.connect(self._autofocus.step)
+        # Field map: an optical diagnostic, not an AF algorithm. It drives the same
+        # motor and reuses the same EncoderAxis + config, but needs no AF controller,
+        # so it's wired outside the block above.
+        self._field_map: Optional[FieldMapSweep] = None
+        self._field_map_cfg = FieldMapConfig()
+        self._last_coarse_shape: Optional[tuple[int, int]] = None
+        self._focus_panel.field_map_requested.connect(self._on_field_map_requested)
         focus_host = QWidget()
         focus_layout = QVBoxLayout(focus_host)
         focus_layout.setContentsMargins(0, 0, 0, 0)
@@ -3306,6 +3326,8 @@ class MainWindow(QMainWindow):
         af = getattr(self, "_autofocus", None)
         if af is not None and af.is_running():
             return
+        if self._field_map_running():
+            return
         now = time.monotonic()
         if now - self._ortho_last_t < 1.0:
             return
@@ -3525,6 +3547,12 @@ class MainWindow(QMainWindow):
                 p.note_preview_crops_consumed()
             except Exception:
                 pass
+        fm = self._field_map
+        if fm is not None and fm.running:
+            # A sweep owns the ROI slots; this batch is its per-tile measurement,
+            # and it also paces the motor, so it must not also go to the panes.
+            fm.feed(crops or [])
+            return
         gray = []
         for crop in (crops or []):
             if crop is None or getattr(crop, "size", 0) == 0:
@@ -3721,6 +3749,94 @@ class MainWindow(QMainWindow):
         self._af_fresh_ct += 1
         return af_full_res_measure(crop)
 
+    # ── field map (M4 optical diagnostic) ────────────────────────────────
+
+    def _field_map_running(self) -> bool:
+        fm = getattr(self, "_field_map", None)
+        return fm is not None and fm.running
+
+    @Slot()
+    def _on_af_stop_requested(self) -> None:
+        """One Stop button for whatever is currently driving the focus motor."""
+        fm = self._field_map
+        if fm is not None and fm.running:
+            fm.stop("operator")
+            return
+        if self._autofocus is not None:
+            self._autofocus.stop()
+
+    @Slot()
+    def _on_field_map_requested(self) -> None:
+        """Sweep the motor once while scoring five fixed tiles every frame, to measure
+        how best focus varies ACROSS the frame -- screen tilt / lens field curvature --
+        in encoder counts.
+
+        Measuring this by running AF once per region instead would compare runs that
+        each re-zero the encoder, re-seat the lash and park minutes apart; one sweep
+        gives every tile identical positions, frames and mechanical state, so what's
+        left between their vertices is optics.
+
+        Requires a FROZEN scene: the tiles are pinned to sensor pixels."""
+        if self._field_map_running():
+            return
+        if not self._modes.is_af_mode():
+            self._log("Field map: switch to M4/M5 first.")
+            return
+        if self._autofocus is not None and self._autofocus.is_running():
+            self._log("Field map: stop autofocus first -- both drive the motor.")
+            return
+        p = self._active_pipeline()
+        shape = self._last_coarse_shape
+        if p is None or shape is None:
+            self._log("Field map: no focus frames yet; wait for the M4 preview.")
+            return
+        if not getattr(self._serial, "encoder_present", False):
+            self._log("Field map: encoder absent ($ENC=-1) -- the sweep needs it.")
+            return
+        scale = KyfgCamera.SUBSAMPLE_FACTOR
+        rois = five_tile_rois(shape[1] * scale, shape[0] * scale, self._field_map_cfg)
+        sweep = FieldMapSweep(
+            axis=EncoderAxis(
+                self._serial.focus_step,
+                lambda: self._serial.encoder_position,
+                counts_per_pulse=self._af_cfg.encoder_counts_per_pulse,
+                backlash_pulses=self._af_cfg.backlash_pulses,
+            ),
+            set_strength=self._serial.set_strength,
+            status=self._focus_panel.set_autofocus_status,
+            finished=self._on_field_map_finished,
+            config=self._field_map_cfg,
+        )
+        # Same full-res tap AF uses; the pipeline crops all five ROIs out of the one
+        # held slot, so every tile is scored on the very same frame.
+        self._af_enable_full_res(True)
+        try:
+            p.set_preview_rois(rois)
+        except Exception as exc:
+            self._log(f"Field map: set_preview_rois failed: {exc}")
+            self._af_enable_full_res(False)
+            return
+        self._field_map = sweep
+        self._focus_panel.set_autofocus_running(True)
+        self._log("Field map: sweeping -- keep the scene FROZEN until it finishes.")
+        sweep.start(rois)
+
+    def _on_field_map_finished(self, ok: bool, report: dict) -> None:
+        for line in report.get("lines", []):
+            self._log(line)
+        self._field_map = None
+        p = self._active_pipeline()
+        if p is not None:
+            try:
+                p.set_preview_rois([])
+            except Exception:
+                pass
+        self._af_enable_full_res(False)
+        self._focus_panel.set_autofocus_running(False)
+        self._focus_panel.set_autofocus_status(
+            "field map: done" if ok else "field map: stopped"
+        )
+
     @Slot(bool)
     def _on_csv_log_toggled(self, on: bool) -> None:
         """Open/close the focus-telemetry CSV logger from the 'Log CSV' toggle."""
@@ -3749,14 +3865,14 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _on_af_sample(self, pulses: int, score: float, fine: bool = False) -> None:
+    def _on_af_sample(self, pos_counts: int, score: float, fine: bool = False) -> None:
         """One settled AF measurement -> both overlay graphs. The telemetry graph
-        (bottom-right) plots the read-back ENCODER COUNT (falling back to commanded
-        pulses only when no encoder streams); the score-vs-encoder scatter
-        (top-right) gets the same point so it stays live during an AF run, not just
-        during the manual creep workflow."""
+        (bottom-right) plots the read-back ABSOLUTE encoder count, falling back to the
+        engine's own position (run-relative counts) only when no encoder streams; the
+        score-vs-encoder scatter (top-right) gets the same point so it stays live
+        during an AF run, not just during the manual creep workflow."""
         enc = self._encoder_now()
-        x = enc if enc is not None else int(pulses)
+        x = enc if enc is not None else int(pos_counts)
         self._focus_panel.af_graph_add_sample(x, float(score), bool(fine))
         if enc is not None:
             self._focus_panel.focus_scatter_add_point(enc, float(score))
@@ -4010,7 +4126,12 @@ class MainWindow(QMainWindow):
         # fed from the raw coarse frame up front. Mutually exclusive so the shared
         # tracker only advances once per frame -- the green-box overlay (main preview)
         # takes priority over the split-screen crop preview.
-        if self._focus_panel.track_active():
+        self._last_coarse_shape = tuple(raw.shape[:2])
+        if self._field_map_running():
+            # The sweep has pinned its own ROIs on the pipeline; letting the tracker
+            # repoint them mid-sweep would move the tiles it is measuring.
+            pass
+        elif self._focus_panel.track_active():
             self._feed_dual_track(raw)
         elif self._focus_panel.preview_active():
             self._feed_dual_preview(raw)

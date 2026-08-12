@@ -293,25 +293,33 @@ class AutoFocusConfigV2:
     dive_burst_interval_s: float = 0.7
     """Wall-clock wait between dive bursts so a burst fully executes and the ~10 Hz
     encoder registers it before the next burst / the downward-motion check."""
-    dive_min_drop_pulses: int = 20
-    """The dive must move the position DOWN by at least this many pulse-units total,
-    else we fail ('motor stuck') rather than climbing from nowhere."""
+    dive_min_drop_counts: float = 20.0
+    """The dive must move the position DOWN by at least this many encoder COUNTS in
+    total, else we fail ('motor stuck') rather than climbing from nowhere.
+
+    NOTE on every ``*_counts`` default in this config: they are sized for the
+    encoderless ``OpenLoopAxis``, where ``encoder_counts_per_pulse`` is 1.0 and a
+    count IS a pulse. A rig with a real encoder must scale them by its measured
+    counts/pulse -- see the ``AutoFocusConfigV2(...)`` block in app.py, which does
+    exactly that off ``af_counts_per_pulse``."""
 
     # %% Search: climb (fine, one sample per frame) %%%%%%%%%%%%%%%%%%%%%%
     strength: int = 0
     """Focus strength for the fine climb (str0 = finest 3 ms pulse). Named
     ``strength`` for parity with the legacy config / app wiring."""
     climb_step_pulses: int = 2
-    """Upward step (str0 pulses) taken once per frame during the climb. Small = finer
-    peak localisation but a longer climb. ~1 str0 pulse == 1 position unit."""
+    """Upward step (str0 PULSES -- a drive command, so it cannot be in counts) taken
+    once per frame during the climb. Small = finer peak localisation but a longer
+    climb. On the rig one str0 pulse is ~24 counts, so this samples every ~48."""
     climb_settle_frames: int = 1
     """Frames to take after each climb step, scoring ONLY the last one. 1 = score
     every frame (fastest). >1 lets the shaft + the ~10 Hz encoder settle before the
     (pos, score) sample so the climb reads an un-lagged position -- slower, but removes
     the motion-lag offset that leaves the park a few counts below the true peak."""
     climb_max_pulses: int = 400
-    """Safety cap on total upward climb (pulse-units) before giving up if no peak is
-    bracketed -- must exceed the dive depth plus the worst start-to-focus gap."""
+    """Safety cap on total upward climb, in PULSES COMMANDED (not counts measured --
+    the whole point is to stop climbing even if a stalled motor reports no counts).
+    Must exceed the dive depth plus the worst start-to-focus gap."""
     peak_fall_frac: float = 0.15
     """The climb stops once the score has fallen this fraction below its best AND
     stayed there for ``peak_confirm_samples`` frames -- i.e. we've climbed through
@@ -339,15 +347,12 @@ class AutoFocusConfigV2:
     multiplicative noise; log(Gaussian)==parabola). Off -> plain linear fit."""
 
     # %% Park + hold %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    park_tolerance_pulses: int = 4
-    """The park move (down-by-lash then up-by-lash, ~100+ discrete str0 pulses on this
-    rig) is only DONE once the encoder is within this many pulse-units of ``best_pos``.
-    Measuring on a fixed dwell instead landed the lens mid-move, below focus."""
-    park_stable_pulses: int = 2
-    """...AND the encoder has stopped moving (frame-to-frame change <= this). Being
-    'within tolerance' alone latched too early: park_upward passes DOWN through
-    best_pos on its way to (best_pos - lash), so we'd measure mid-move. Requiring the
-    shaft to be at rest waits out the full down-then-up pulse train."""
+    park_stable_counts: float = 2.0
+    """The park is only DONE once the encoder has stopped moving (frame-to-frame
+    change <= this many COUNTS). Reaching the target alone latched too early: the
+    park passes DOWN through best_pos on its way to (best_pos - lash), so we'd
+    measure mid-move. Requiring the shaft to be at rest waits out the full
+    down-then-up pulse train."""
     park_stable_frames: int = 2
     """Consecutive at-target-and-stable frames required before the park is DONE."""
     park_max_wait_s: float = 45.0
@@ -367,56 +372,49 @@ class AutoFocusConfigV2:
     operator read the encoder / inspect the image between moves to confirm where the
     motor actually goes -- e.g. whether the post-climb descend flings it to end-of-
     travel. No motor moves while paused."""
-    park_creep_step_pulses: int = 3
-    """The final approach onto the peak is a SLOW creep from below in steps this size
-    (str0 pulses), paced one per ``park_creep_interval_s`` so the shaft coasts to rest
-    between them and can't overshoot the peak (operator asked for a gentle landing)."""
-    park_creep_interval_s: float = 0.2
-    """Wall-clock gap between creep steps -- long enough for the discrete pulse to run
-    and the shaft to settle before the next, so no momentum accumulates."""
-    park_slow_band_pulses: int = 12
-    """Within this many pulse-units of best_pos the creep drops to single-pulse steps so
+    park_slow_band_counts: float = 12.0
+    """Within this many COUNTS of best_pos the creep drops to single-pulse steps so
     the lens is seated onto the peak gently (operator saw the final move overshoot when
     it arrived fast)."""
-    park_climb_band_pulses: int = 36
-    """Between park_slow_band_pulses and this, the creep slows from the coarse bulk step
+    park_climb_band_counts: float = 36.0
+    """Between park_slow_band_counts and this, the creep slows from the coarse bulk step
     to the CLIMB's own pace (climb_step_pulses/frame) -- so the final approach onto the
     peak mirrors the climb that found it, decelerating well before the seat instead of
     blasting in at the coarse step and stopping abruptly. Must exceed
-    park_slow_band_pulses."""
+    park_slow_band_counts."""
     park_coarse_step_pulses: int = 6
-    """str0 pulses/frame for the DESCEND and the far-from-peak part of the creep. AF is
+    """str0 PULSES/frame for the DESCEND and the far-from-peak part of the creep. AF is
     frame-gated at ~1-2 fps, so the fine climb step (2/frame) can't traverse the deep
     lash-clearing excursion within the time budget -- it timed out short and left the
     lash un-reversed. Precision doesn't matter out here (we're below focus, not
-    measuring); the gentle single-pulse seat inside park_slow_band_pulses still lands
+    measuring); the gentle single-pulse seat inside park_slow_band_counts still lands
     the peak without aliasing, so this only speeds the bulk travel."""
-    park_descend_margin_pulses: int = 20
-    """The park first descends to best_pos - lash - THIS, and waits until the encoder
-    actually REACHES that depth, so the gear lash is fully reversed (the lens really
-    moves below focus) before the creep back up. Descending only ~to the lash -- or
-    stopping short on a stability guess -- left the slack un-reversed, so the lens
-    stayed at the climb's overshoot (past focus) and parked soft."""
+    park_descend_margin_counts: float = 20.0
+    """The park first descends to best_pos - lash - THIS many COUNTS, and waits until
+    the encoder actually REACHES that depth, so the gear lash is fully reversed (the
+    lens really moves below focus) before the creep back up. Descending only ~to the
+    lash -- or stopping short on a stability guess -- left the slack un-reversed, so the
+    lens stayed at the climb's overshoot (past focus) and parked soft."""
     park_settle_s: float = 1.2
     """Wall-clock dwell AFTER the encoder has arrived at best_pos (lets the shaft ring
     down) before the parked-score sanity check + hold."""
     park_settle_max_s: float = 8.0
     """HARD cap on the whole settle sub-phase. The dwell above wants the encoder to sit
-    still within park_stable_pulses, but full-res crops stream every frame during park
+    still within park_stable_counts, but full-res crops stream every frame during park
     and jitter the encoder SPI read, so on a live rig that dwell can never latch and the
     park hangs at 'parking at focus' forever. We already KNOW best_pos from the climb, so
     when this cap trips we measure once (best effort) and hold there anyway."""
     settle_frames: int = 3
     """Frames averaged for the parked-focus sanity measurement."""
     backlash_pulses: int = 3
-    """Gear/spur lash take-up (pulse-units) for the upward park. Must be >= the
-    mechanism's lash band so ``park_upward`` reliably seats focus from below."""
+    """Gear/spur lash take-up, in PULSES (a drive amount), for the upward park. Must
+    be >= the mechanism's lash band so the park reliably seats focus from below."""
     encoder_counts_per_pulse: float = 1.0
-    """Only used when the closed-loop EncoderAxis is active: AMT203S motor counts per
-    focus pulse, used to express the measured position in the pulse-sized units the
-    rest of this config assumes. Its SIGN encodes polarity -- make it NEGATIVE when a
-    '+' focus pulse drives the encoder DOWN, so "drive '+'" maps to "position
-    increases" (a wrong sign makes the axis walk off instead of tracking focus).
+    """AMT203S motor counts per str0 focus pulse. Its SIGN encodes polarity -- make it
+    NEGATIVE when a '+' focus pulse drives the raw encoder count DOWN, so "drive '+'"
+    maps to "position increases" (a wrong sign makes the axis walk off instead of
+    tracking focus). Its MAGNITUDE converts a wanted move in counts into whole pulses,
+    and sets the park's landing tolerance (half a pulse -- the finest step there is).
     ponytail: CALIBRATE ON-RIG (drive a known pulse burst, read the signed encoder
     delta); 1.0 is only a self-check placeholder."""
     min_contrast: float = 0.15
@@ -611,6 +609,20 @@ class AutoFocusEngineV2:
         rs = self._rs
         return rs.objects[0].roi if rs.objects else None
 
+    @property
+    def _counts_per_pulse(self) -> float:
+        """Encoder counts in one str0 pulse, as a positive magnitude. Taken from the
+        axis when it knows (the open-loop fallback defines a count AS a pulse)."""
+        return getattr(self._axis, "counts_per_pulse_mag", None) or abs(
+            float(self.cfg.encoder_counts_per_pulse)) or 1.0
+
+    @property
+    def _land_tolerance(self) -> float:
+        """How close to a target position counts as arrived: half a pulse, because that
+        is the finest move the hardware can make. Anything larger, on a one-directional
+        approach, is a systematic offset rather than a tolerance -- see the creep."""
+        return self._counts_per_pulse / 2.0
+
     def start(
         self,
         *,
@@ -648,7 +660,7 @@ class AutoFocusEngineV2:
         self._set_strength_safe(self.cfg.strength)
         if rs.best_pos is not None:
             self.state = AFStateV2.DONE
-            self._status(f"autofocus v2: stopped (holding centre={rs.best_pos:+d})")
+            self._status(f"autofocus v2: stopped (holding centre={rs.best_pos:+d}c)")
             self._finished(True, self._report(ok=True, stopped=True))
             return
         self._fail(reason)
@@ -669,9 +681,9 @@ class AutoFocusEngineV2:
         pos = int(round(self._axis.position))
         raw = getattr(self._axis, "raw_count", None)
         rawtxt = "" if raw is None else f" raw={int(round(raw))}"
-        self._status(f"PAUSED after {done_label} @ pos={pos:+d}{rawtxt}"
+        self._status(f"PAUSED after {done_label} @ pos={pos:+d}c{rawtxt}"
                      f" -- press SPACE for {next_label}")
-        log.info("af2-gate paused after %s pos=%+d%s -- awaiting SPACE",
+        log.info("af2-gate paused after %s pos=%+dc%s -- awaiting SPACE",
                  done_label, pos, rawtxt)
 
     def step(self) -> None:
@@ -860,7 +872,7 @@ class AutoFocusEngineV2:
         rs.dive_last_t = 0.0  # 0 => first burst fires on the next tick
         self.state = AFStateV2.DIVE
         self._status("autofocus v2: diving below focus")
-        log.info("af2-dive begin start=%+d bursts=%d x%d pulses",
+        log.info("af2-dive begin start=%+dc bursts=%d x%d pulses",
                  int(round(rs.dive_start_pos)), self.cfg.dive_bursts,
                  self.cfg.dive_burst_pulses)
 
@@ -874,12 +886,12 @@ class AutoFocusEngineV2:
         if rs.dive_bursts_left <= 0:
             dropped = rs.dive_start_pos - pos  # +ve if we moved DOWN
             raw = getattr(self._axis, "raw_count", None)
-            log.info("af2-dive done pos=%+d dropped=%+d raw=%s", int(round(pos)),
+            log.info("af2-dive done pos=%+dc dropped=%+dc raw=%s", int(round(pos)),
                      int(round(dropped)),
                      "n/a" if raw is None else int(round(raw)))
-            if dropped < self.cfg.dive_min_drop_pulses:
+            if dropped < self.cfg.dive_min_drop_counts:
                 self._fail(
-                    f"dive moved down only {int(round(dropped))} units "
+                    f"dive moved down only {int(round(dropped))} counts "
                     f"(motor stuck / wrong direction?)"
                 )
                 return
@@ -890,7 +902,7 @@ class AutoFocusEngineV2:
         rs.dive_bursts_left -= 1
         rs.dive_last_t = now
         raw = getattr(self._axis, "raw_count", None)
-        log.info("af2-dive burst left=%d pos=%+d raw=%s", rs.dive_bursts_left,
+        log.info("af2-dive burst left=%d pos=%+dc raw=%s", rs.dive_bursts_left,
                  int(round(pos)), "n/a" if raw is None else int(round(raw)))
 
     # %% climb (fine, lucky-imaging max over climb_lucky_frames per position) %%%
@@ -918,7 +930,7 @@ class AutoFocusEngineV2:
         rs.last_acquire_frame = rs.frames
         self.state = AFStateV2.CLIMB
         self._status("autofocus v2: climbing to focus")
-        log.info("af2-climb begin from pos=%+d step=%d lucky=%d handover=%s",
+        log.info("af2-climb begin from pos=%+dc step=%dp lucky=%d handover=%s",
                  int(round(rs.climb_start_pos)), self.cfg.climb_step_pulses,
                  self.cfg.climb_lucky_frames, self.cfg.enable_handover)
 
@@ -951,7 +963,7 @@ class AutoFocusEngineV2:
             rs.handovers += 1
             pos = int(round(self._axis.position))
             rs.seam_positions.append(pos)
-            log.info("af2-climb handover #%d @pos=%+d ratio=%.3f cum_scale=%.4g "
+            log.info("af2-climb handover #%d @pos=%+dc ratio=%.3f cum_scale=%.4g "
                      "(overlap n=%d)", rs.handovers, pos, r, rs.cumulative_scale,
                      rs.cross_cal.count)
             rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
@@ -1065,7 +1077,7 @@ class AutoFocusEngineV2:
         # scale, so this spans objects -- an actual cross-object improvement figure.
         start_score = rs.climb_samples[0][1] if rs.climb_samples else 0.0
         improvement = (smax / start_score) if start_score > 1e-6 else 0.0
-        log.info("af2-climb %s n=%d best_pos=%+d best=%.2f contrast=%.2f "
+        log.info("af2-climb %s n=%d best_pos=%+dc best=%.2f contrast=%.2f "
                  "handovers=%d improvement=%.2fx",
                  "peak" if bracketed else "cap", n,
                  rs.best_pos if rs.best_pos is not None else 0, smax, contrast,
@@ -1084,24 +1096,26 @@ class AutoFocusEngineV2:
         # Refine the peak with a local parabola fit: the argmax is one noisy sample,
         # the vertex uses the whole shoulder so it doesn't chase a single spike.
         #
-        # _fit_peak_scale_free() was tried here and LOST on hardware, decisively. Measured
-        # against a frozen-scene reference in one session (so one encoder zero): static AF
-        # put focus at +9 and -1 (handovers=0, a clean single curve, so ~+/-5 pulses of
-        # reference scatter), the moving argmax landed at -9, and the scale-free estimate
-        # at -50 -- about 54 pulses out, three times worse than the argmax it replaced. The
-        # simulations that justified it were too kind about noise: real segments are only
-        # 2-3 samples at 2-pulse spacing, so per-segment log-slopes are mostly noise, and
-        # with just 1-2 segments past the peak its zero crossing extrapolates rather than
-        # interpolates. Kept (unused) with its self-checks in tools/test_af_segment_peak.py
-        # because the scale-invariance argument is still sound and would matter if the
-        # cross-cal drift ever returns; it needs many more samples per object to be usable.
+        # _fit_peak_scale_free() sits unused (with its self-checks in
+        # tools/test_af_segment_peak.py) -- NOT because it was shown to be worse. It was
+        # dropped from this path on a freeze-test reading that turned out to be invalid:
+        # the two runs were compared as if they shared a zero, when start() re-zeros the
+        # axis on every AF press, so each run's positions are measured from the previous
+        # run's parked position. Rebased onto raw_count (the only cross-run frame) the
+        # same session says the opposite -- scale-free landed ~6 counts-worth off the
+        # frozen-scene reference and the argmax it replaced ~35. That is n=1, and it was
+        # taken while the park still had the systematic ~96-count undershoot fixed above,
+        # so it settles nothing either way. Deciding this needs repeated moving/static
+        # pairs read the way the operator framed it: a static run started from where a
+        # moving run parked should report best_pos ~= 0, and whatever it reports instead
+        # IS that moving run's signed error, no rebasing required.
         if self.cfg.peak_curve_fit:
             xv = _fit_peak([(p, s) for p, s, _ in rs.climb_samples],
                            self.cfg.peak_fit_window,
                            log_domain=self.cfg.peak_fit_log)
             if xv is not None:
                 fit = int(round(xv))
-                log.info("af2-climb peak refine argmax=%+d fit=%+d", best, fit)
+                log.info("af2-climb peak refine argmax=%+dc fit=%+dc", best, fit)
                 best = fit
         self._gate("climb", "PARK-descend", lambda: self._begin_park(best))
 
@@ -1116,7 +1130,7 @@ class AutoFocusEngineV2:
         # (never the coarse str3, which jumped ~34 counts/pulse and aliased the ~10 Hz
         # encoder), but move in COARSE park_coarse_step_pulses bursts until near the
         # peak -- AF is only ~1-2 fps, so a fine 2/frame step can't cover the deep
-        # lash-clearing excursion in time. The final seat inside park_slow_band_pulses
+        # lash-clearing excursion in time. The final seat inside park_slow_band_counts
         # drops to single str0 pulses, so the lens still lands the peak alias-free.
         self._set_strength_safe(self.cfg.strength)
         # Descend far enough below the peak to fully REVERSE the gear lash before
@@ -1127,9 +1141,10 @@ class AutoFocusEngineV2:
         # doesn't take up the slack and the lens parks soft ("doesn't go far enough
         # back to clear the backlash"). So descend to whichever is DEEPER: the dive
         # bottom, or a full lash + margin below the peak.
-        margin = self.cfg.park_descend_margin_pulses
-        by_climb = int(round(rs.climb_start_pos)) - margin
-        by_lash = int(rs.best_pos) - self.cfg.backlash_pulses - margin
+        margin = self.cfg.park_descend_margin_counts
+        lash_counts = self.cfg.backlash_pulses * self._counts_per_pulse
+        by_climb = rs.climb_start_pos - margin
+        by_lash = rs.best_pos - lash_counts - margin
         rs.park_descend_target = min(by_climb, by_lash)
         rs.park_phase = "descend"
         rs.park_move_since = time.monotonic()
@@ -1137,7 +1152,7 @@ class AutoFocusEngineV2:
         rs.park_creep_last_t = 0.0
         rs.park_scores = []
         self.state = AFStateV2.PARK
-        self._status(f"autofocus v2: parking at focus (centre={rs.best_pos:+d})")
+        self._status(f"autofocus v2: parking at focus (centre={rs.best_pos:+d}c)")
 
     def _park_tick(self, frame: np.ndarray) -> None:
         rs = self._rs
@@ -1147,19 +1162,21 @@ class AutoFocusEngineV2:
         # (park_coarse_step_pulses/frame) until the encoder reaches it. Own time budget
         # so a slow descend can't starve the creep.
         if rs.park_phase == "descend":
-            pos = int(round(self._axis.position))
-            reached = pos <= int(round(rs.park_descend_target)) + cfg.park_tolerance_pulses
+            pos = float(self._axis.position)
+            reached = pos <= rs.park_descend_target + self._land_tolerance
             descend_timed_out = (now - rs.park_move_since) >= cfg.park_descend_max_s
             if reached or descend_timed_out:
-                log.info("af2-park descended pos=%+d (target %+d), creeping up to %+d%s",
-                         pos, int(round(rs.park_descend_target)), int(rs.best_pos),
+                log.info("af2-park descended pos=%+dc (target %+dc), creeping up to %+dc%s",
+                         int(round(pos)), int(round(rs.park_descend_target)),
+                         int(round(rs.best_pos)),
                          "" if reached else " (DESCEND-TIMEOUT)")
 
                 def _enter_creep() -> None:
                     rs.park_phase = "creep"
                     rs.park_move_since = time.monotonic()  # creep gets its own budget
 
-                self._gate(f"park-descend (pos={pos:+d})", "PARK-creep", _enter_creep)
+                self._gate(f"park-descend (pos={int(round(pos)):+d}c)", "PARK-creep",
+                           _enter_creep)
                 return
             self._axis.step_pulses(-1, cfg.park_coarse_step_pulses)  # coarse: just get below
             return
@@ -1168,10 +1185,20 @@ class AutoFocusEngineV2:
         # bursts until near the peak, then single pulses inside the slow band so the lens
         # seats gently instead of overshooting. Stop when the encoder reaches the peak.
         if rs.park_phase == "creep":
-            pos = int(round(self._axis.position))
-            if pos >= int(rs.best_pos) - cfg.park_tolerance_pulses or timed_out:
-                log.info("af2-park arrived pos=%+d target=%+d after=%.1fs%s",
-                         pos, int(rs.best_pos), now - rs.park_move_since,
+            pos = float(self._axis.position)
+            # Stop at the CLOSEST reachable point to best_pos, not the first point
+            # that is merely "close enough". The creep only ever moves UP, so any
+            # tolerance subtracted here is a pure one-directional bias: the old
+            # `pos >= best - park_tolerance_pulses` (4 pulses = 96 counts) exited the
+            # instant it crossed the BOTTOM edge of the band and never closed the gap,
+            # so all 14 logged runs parked 2-4 pulses BELOW target, every time, never
+            # above. Half a pulse is the honest tolerance -- it's the finest step the
+            # hardware has, so stopping within it means the next step would overshoot
+            # by more than staying put undershoots. Residual is now centred on 0.
+            if pos >= rs.best_pos - self._land_tolerance or timed_out:
+                log.info("af2-park arrived pos=%+dc target=%+dc miss=%+dc after=%.1fs%s",
+                         int(round(pos)), int(round(rs.best_pos)),
+                         int(round(pos - rs.best_pos)), now - rs.park_move_since,
                          "" if not timed_out else " (TIMEOUT)")
 
                 def _enter_settle() -> None:
@@ -1181,16 +1208,18 @@ class AutoFocusEngineV2:
                     rs.park_settle_since = now2  # hard-cap clock (jitter never resets it)
                     rs.park_last_pos = float(pos)  # seed so the first tick's diff is ~0
 
-                self._gate(f"park-creep arrived (pos={pos:+d} target={rs.best_pos:+d})",
-                           "PARK-settle+measure", _enter_settle)
+                self._gate(
+                    f"park-creep arrived (pos={int(round(pos)):+d}c "
+                    f"target={int(round(rs.best_pos)):+d}c)",
+                    "PARK-settle+measure", _enter_settle)
                 return
-            remaining = int(rs.best_pos) - pos
+            remaining = rs.best_pos - pos
             # Three-speed approach: coarse bulk travel far out, decelerate to the
             # CLIMB's own pace as we near the peak (so the approach mirrors the climb
             # that located focus), then single pulses for the gentle, alias-free seat.
-            if remaining <= cfg.park_slow_band_pulses:
+            if remaining <= cfg.park_slow_band_counts:
                 step = 1
-            elif remaining <= cfg.park_climb_band_pulses:
+            elif remaining <= cfg.park_climb_band_counts:
                 step = cfg.climb_step_pulses
             else:
                 step = cfg.park_coarse_step_pulses
@@ -1200,7 +1229,7 @@ class AutoFocusEngineV2:
         # Phase 3: measure only once the shaft has actually STOPPED (the last creep
         # step's pulses are still draining right after arrival -> the '-19 then -13'
         # drift) and then sat still for the settle dwell.
-        pos = int(round(self._axis.position))
+        pos = float(self._axis.position)
         moved = abs(pos - rs.park_last_pos)
         rs.park_last_pos = pos
         # Reuse the score _emit_sample already computed this frame -- re-scoring here
@@ -1215,7 +1244,7 @@ class AutoFocusEngineV2:
         # climb's best_pos regardless -- that's the position we're already parked on.
         settle_capped = (now - rs.park_settle_since) >= cfg.park_settle_max_s
         if not settle_capped:
-            if moved > cfg.park_stable_pulses:
+            if moved > cfg.park_stable_counts:
                 rs.park_since = now  # still moving; restart the dwell
                 return
             if (now - rs.park_since) < cfg.park_settle_s:
@@ -1227,6 +1256,7 @@ class AutoFocusEngineV2:
             log.info("af2-park settle capped after %.1fs (n=%d scores)",
                      now - rs.park_settle_since, len(rs.park_scores))
         pos = int(round(self._axis.position))
+        raw = getattr(self._axis, "raw_count", None)
         ratio = (parked / rs.best_score) if rs.best_score > 1e-6 else 0.0
         # parked-vs-peak only means something if BOTH were measured on the same patch.
         # _advance_objects keeps running through PARK, and the park (descend + creep +
@@ -1240,8 +1270,13 @@ class AutoFocusEngineV2:
             and bool(rs.objects)
             and rs.objects[0].oid == rs.best_oid
         )
-        log.info("af2-park pos=%+d parked=%.2f peak=%.2f ratio=%.2f%s",
-                 pos, parked, rs.best_score, ratio,
+        # `raw` is the only number here comparable ACROSS runs: pos is relative to this
+        # run's start (the axis re-zeros on every AF press), so two runs' pos values
+        # share no frame. Logging both is what lets a moving run be scored against a
+        # frozen-scene reference without reconstructing the chain from the dive lines.
+        log.info("af2-park pos=%+dc raw=%s parked=%.2f peak=%.2f ratio=%.2f%s",
+                 pos, "n/a" if raw is None else int(round(raw)),
+                 parked, rs.best_score, ratio,
                  "" if comparable else
                  f" (peak was oid={rs.best_oid}, parked on "
                  f"oid={rs.objects[0].oid if rs.objects else None} -> NOT comparable)")
@@ -1260,14 +1295,14 @@ class AutoFocusEngineV2:
         rs.best_pos = int(best_pos)
         if not rs.continuous:
             self.state = AFStateV2.DONE
-            self._status(f"autofocus v2: done (in focus, centre={best_pos:+d})")
+            self._status(f"autofocus v2: done (in focus, centre={best_pos:+d}c)")
             self._finished(True, self._report(ok=True))
             return
         # Flight/continuous: hold at focus. The atmospheric lens is static for
         # ~hours, so we sit still (no dithering) and optionally re-verify slowly.
         self.state = AFStateV2.HOLD
         rs.hold_since = time.monotonic()
-        self._status(f"autofocus v2: in focus, holding (centre={best_pos:+d})")
+        self._status(f"autofocus v2: in focus, holding (centre={best_pos:+d}c)")
 
     def _hold_tick(self, frame: np.ndarray) -> None:
         rs = self._rs

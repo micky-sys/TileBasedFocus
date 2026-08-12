@@ -103,14 +103,27 @@ def test_encoder_axis_tracks_true_position_across_wrap() -> None:
 
 
 def test_encoder_axis_counts_per_pulse_scaling() -> None:
-    # 4 encoder counts per pulse: a move expressed in pulse units must still land,
-    # i.e. the axis sizes the pulse burst by counts_per_pulse under the hood.
+    """Positions are COUNTS; the axis converts to whole pulses to command the move.
+
+    4 encoder counts per pulse, so a 48-count move must be sent as 12 pulses -- not
+    48. Positions were once carried in "pulse-equivalent units" (counts/cpp), which
+    threw away cpp-1 of every cpp counts to rounding on each read and let distances
+    that looked tight (a park tolerance of "4") really be 96 counts wide.
+    """
     m = _FakeMotor(start=0, counts_per_pulse=4)
     axis = EncoderAxis(m.pulse, m.read, counts_per_pulse=4.0)
     axis.reset()
-    axis.move_to(12)  # 12 pulse-units -> 12 pulses -> 48 counts
+    axis.move_to(48)  # 48 counts / 4 counts-per-pulse -> 12 pulses
+    assert m.sent[-1] == ("+", 12), m.sent
     assert m.shaft == 48
-    assert abs(axis.position - 12) < 1e-6, axis.position
+    assert abs(axis.position - 48) < 1e-6, axis.position
+
+    # Sub-pulse requests round rather than pretending: 5 counts is closer to 1 pulse
+    # (4 counts) than to 0, but 1 count is closer to standing still.
+    axis.move_to(53)
+    assert m.shaft == 52, m.shaft
+    axis.move_to(53)
+    assert axis.moved_last is False, "a sub-half-pulse request must be a no-op"
 
 
 def test_encoder_axis_inverted_polarity_tracks_and_reports() -> None:
@@ -123,13 +136,14 @@ def test_encoder_axis_inverted_polarity_tracks_and_reports() -> None:
     axis.reset()
     assert axis.position == 0.0 and axis.total_pulses == 0
 
-    axis.move_to(10)  # want position +10, sent as '+' pulses though the shaft falls
-    assert m.sent[-1][0] == "+", m.sent
-    assert abs(axis.position - 10) < 1e-6, axis.position
+    # +240 COUNTS == 10 '+' pulses at 24 counts each, sent '+' though the shaft falls.
+    axis.move_to(240)
+    assert m.sent[-1] == ("+", 10), m.sent
+    assert abs(axis.position - 240) < 1e-6, axis.position
     assert axis.total_pulses == 10
 
-    axis.park_upward(-5)  # land below start on a strictly upward final leg
-    assert abs(axis.position - (-5)) < 1e-6, axis.position
+    axis.park_upward(-120)  # land below start on a strictly upward final leg
+    assert abs(axis.position - (-120)) < 1e-6, axis.position
     assert m.sent[-1][0] == "+", f"final leg not upward: {m.sent[-1]}"
 
 
@@ -150,7 +164,7 @@ def _cfg(**kw) -> AutoFocusConfigV2:
     # Dive-then-climb config for the sim; wall-clock gates zeroed for the fast loop.
     base = dict(
         dive_strength=3, dive_bursts=4, dive_burst_pulses=12,
-        dive_burst_interval_s=0.0, dive_min_drop_pulses=10,
+        dive_burst_interval_s=0.0, dive_min_drop_counts=10,
         strength=0, climb_step_pulses=4, climb_max_pulses=200,
         peak_fall_frac=0.10, peak_confirm_samples=2, climb_min_samples=4,
         park_settle_s=0.0, settle_frames=2, backlash_pulses=2, min_contrast=0.05,

@@ -430,6 +430,7 @@ class FocusPanel(QWidget):
     autofocus_requested = Signal()       # continuous servo on the active camera
     autofocus_all_requested = Signal()   # focus cam1..3 once, in sequence
     autofocus_stop_requested = Signal()
+    field_map_requested = Signal()       # one sweep, fixed tiles, a vertex per tile
     autofocus_algorithm_changed = Signal(str)  # "legacy" | "sweep_and_hold"
     fine_lock_changed = Signal(bool)     # freeze the tracked Fine tile (no re-pick)
     csv_log_toggled = Signal(bool)       # start/stop focus-telemetry CSV logging
@@ -968,6 +969,18 @@ class FocusPanel(QWidget):
         self._af_stop_button.clicked.connect(self._on_af_stop_clicked)
         row.addWidget(self._af_stop_button)
 
+        self._field_map_button = QPushButton("Field map")
+        self._field_map_button.setToolTip(
+            "Measure how best-focus varies ACROSS the frame. One motor sweep scores "
+            "five fixed tiles (centre + the four mid-edges) on every frame, then "
+            "reports each tile's focus vertex in encoder counts and their spread -- "
+            "screen tilt / field curvature. FREEZE THE SCENE FIRST: the tiles are "
+            "pinned to sensor pixels, so the content under them must hold still. "
+            "Stop AF aborts it."
+        )
+        self._field_map_button.clicked.connect(self.field_map_requested.emit)
+        row.addWidget(self._field_map_button)
+
         self._lock_tile_chk = QCheckBox("Lock tile")
         self._lock_tile_chk.setToolTip(
             "Freeze the tracked Fine tile so it stops re-picking. Sensor noise on a "
@@ -1119,9 +1132,12 @@ class FocusPanel(QWidget):
         return self._af_lead_combo.currentData()
 
     def set_autofocus_running(self, running: bool) -> None:
-        """Lock start buttons / unlock Stop while an AF run is in progress."""
+        """Lock start buttons / unlock Stop while an AF run (or a field-map sweep --
+        both drive the same motor, so neither may start on top of the other) is in
+        progress."""
         self._af_button.setEnabled(not running)
         self._af_all_button.setEnabled(not running)
+        self._field_map_button.setEnabled(not running)
         self._af_lead_combo.setEnabled(not running)
         self._af_algo_combo.setEnabled(not running)
         # Lock the Coarse/Fine toggle too: a run forces the Coarse full-res tap it
