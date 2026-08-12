@@ -2306,3 +2306,168 @@ Run one sweep on the frozen bench. Expect a spread near the ~7.8 pulses (~190 co
 across-tile AF scatter implies; substantially more would mean the moving-vs-static
 discrepancy of §30.4 was mostly geometry rather than the estimator, and that AF's tile
 choice — not its peak finder — is the thing worth constraining.
+
+→ Answered in **§32**. The spread is real and geometric, but the early sweeps that measured
+it were wrong in five different ways; §32.1 is the list.
+
+## 32. Making the field map trustworthy — and what it measured (2026-08-12)
+
+The tool of §31 worked on the first try and gave a wrong answer with a straight face, five
+separate times, before it gave a right one. Every failure produced a *plausible, tight*
+number. That is the theme worth carrying forward: on this rig, a diagnostic that cannot
+refuse is worse than no diagnostic.
+
+### 32.1 Five confident wrong answers, and what each needed
+
+**1. Tiles off the screen.** Tiles were laid out by frame fraction. The screen fills 96% of
+frame width but only ~76% of height, so the bottom tile sat on the wall behind the display —
+metres away, focusing somewhere else entirely, and reported as "vertical tilt +223c". The
+operator spotted it on the preview before the numbers did.
+
+`five_tile_rois` now takes a `region` and lays the tiles inside it. `MainWindow._field_map_region`
+finds that region from the ArUco fiducials (largest axis-aligned box inside the quad), which
+on this rig reads **92% × 67% of the frame** — and the tiles are drawn on the coarse preview
+before the sweep so the operator can see where they landed.
+
+**2. …and then the fiducials were never consulted.** The first "bounded" sweep silently fell
+back to the whole frame. `detect_fiducials` needs only the ArUco *dictionary name*, but the
+code required the whole `ScreenLayout`, which only exists once the OrthoSim decode is armed.
+Toggle off → search skipped → inset 0.00 → identical tiles to before. Now it falls back to
+`ScreenLayout.aruco_dict` and always looks.
+
+**3. Refusing was right, then wrong.** With no fiducials and no interior inset, the sweep now
+**refuses**: an unbounded sweep measures the wall and calls it lens tilt. But ten seconds
+after a successful sweep it refused again, because one marker had dropped out. A bare `None`
+from `detect_fiducials` cannot tell a blank display from an obscured corner, so it now takes
+an `ids_out` list, and the field map **reuses the last box measured this session** when
+markers are momentarily lost, warning that this holds only if nothing has moved.
+
+**4. An abort stranded the lens, and the next sweep clipped.** `stop()` halted the motor where
+it stood. Each abort left the lens partway down the dive; the next sweep zeroed *there*. The
+start position walked `raw=0 → 325 → 1465 → 4770`, and since dive and climb are fixed lengths
+sized to start near focus, the third sweep ran out **158 counts short** of the peak. Every
+tile's argmax landed on the last sample, four of them on the *same* last sample, reporting
+`SPREAD 20c (0.8 pulses)` — the best-looking result of the day and pure artifact.
+
+Two fixes. An abort now **walks the lens home before reporting** (bidirectionally — stopping
+during the dive leaves it *below* the start, and the old descend-only return called that
+"arrived"). And a peak sitting on either end of the swept range is **clipped**: flagged,
+excluded, and the sweep prints `SWEEP DID NOT BRACKET FOCUS` instead of a spread. Clipping is
+only tested when the tile has real contrast, so a blank tile still gets the honest "no hump".
+
+**5. Test data in the production log folder.** `FieldMapSweep(csv_dir=None)` meant "the real
+session-log folder", and a test that forgot the argument dropped six synthetic sweeps in among
+the rig data — where `fieldmap_report.py` cheerfully averaged them in (one with a 2c spread,
+one with 3577c). `csv_dir` is now a **required** argument; `app.py` passes `default_log_dir()`
+explicitly. Synthetic files are identifiable by their 192 px test tiles versus the rig's 600 px.
+
+### 32.2 The fit window was the precision limit — 3 → 20
+
+`fit_window=3` fits seven points across the flattest part of the hump, which is exactly where
+the curve says least about its own centre. The peak here is ~1400 counts wide at half max,
+about 21 samples, and `log(Gaussian)` is a parabola over that whole span, so the flanks were
+being thrown away for nothing.
+
+Checked offline against two good sweeps: at window 3 their tilt/curvature terms disagreed by
+**600c** in total and 3 of 10 fits failed outright; from window **15 to 30** the disagreement
+plateaus near **135c** with no failures. A broad plateau rather than a tuned point, so 20 —
+roughly the half-width — is the honest middle. This single change is what turned an incoherent
+measurement into a coherent one: at window 3 the horizontal curvature term flipped sign
+between runs, so that signal simply was not visible.
+
+### 32.3 Trust checks, and why the obvious one was backwards
+
+A tile is trusted only if it has a real hump (`contrast ≥ 5`), was bracketed (not clipped), and
+its vertex sits near a **model-free** peak locator.
+
+The first version compared the vertex to the **argmax** — reasonable at window 3, backwards at
+window 20, where the fit is *more* reliable than a noisy argmax on a broad flat top. It now
+compares against the **midpoint of the above-half-max span**, which averages both flanks.
+Measured on real sweeps, the wide-window vertex sits within **9%** of the curve width of the
+midpoint every time, while the argmax strays to 16%. Tolerance is 20% of the half-width.
+
+The log also prints a second, fit-free **argmax spread** beside the fit spread. If the two
+disagree badly, the model is doing the talking rather than the optics.
+
+`tools/fieldmap_report.py` had its own copy of the peak fit that *clamped* an out-of-span
+vertex where the engine *rejects* it, so the tool quietly contradicted the log it was
+explaining — by 200c on one sweep. It now imports the engine's `_fit_peak`.
+
+### 32.4 What the rig actually measures
+
+Nine sweeps, three per frozen scene, plus four earlier ones (`--groups`, §32.5):
+
+| term | value | meaning |
+|---|---|---|
+| horizontal tilt | **+165c** (~7 pulses) | screen yawed; right and left disagree by 330c |
+| vertical tilt | +60c | small |
+| horizontal curvature | +20…+110c | drifting, see §32.6 |
+| vertical curvature | −70…0c | drifting, see §32.6 |
+| total spread | ~350c | |
+
+**The field is dominated by bench yaw, not by the lens.** Four clean scene groups spanning an
+app restart *and* an OrthoSim restart give horizontal tilt of 175, 183, 168 and 146c — mean
+**168c, scatter 16c**, well inside the instrument noise. For scale, the lens moves ~1400 counts
+and still looks sharp, so the two sides of the screen disagree by about a quarter of that
+window. This is an alignment error that does not exist in flight over flat ground.
+
+⚠️ The 10:07/10:25 pair reads 267c and should **not** carry equal weight: those two sweeps were
+17 minutes apart with aborts and manual focus jogging between them, so they were never a
+controlled replicate pair.
+
+`left` has the broadest curve in every single sweep (1512–2466c at half max, against 1100–1670
+elsewhere) — genuinely softer there, consistent with being the far end of a yawed screen — and
+it anchors the horizontal tilt, so that term carries the most uncertainty of the four.
+
+### 32.5 Error budget — and the retraction of the "100c scene effect"
+
+`py -3 tools/fieldmap_report.py --stats --groups=3,3,3` splits the scatter into a pooled
+within-scene component (deviations from each scene's *own* mean, so a genuine scene shift
+cannot masquerade as instrument noise) and a between-scene component with the instrument's
+share `within²/n` subtracted off.
+
+| term | within-scene (instrument) | scene effect |
+|---|---|---|
+| horizontal tilt | ±38c | not detectable |
+| vertical tilt | ±25c | not detectable |
+| horizontal curvature | ±35c | ~42c |
+| vertical curvature | ±24c | ~27c |
+| spread | ±57c | not detectable |
+
+**The tool repeats to about ±40c — under two pulses.** Scene content does not measurably move
+either tilt term and moves curvature by ~30c.
+
+⚠️ **This retracts the estimate made earlier the same day.** From two runs per scene it looked
+like content shifted the answer by ~100c. With n=2, noise alone manufactures apparent scene
+differences of exactly that size — the two-run comparison cannot separate them, and did not.
+The correction matters well beyond this tool: a 100c content floor would have capped what *any*
+contrast-detection AF could achieve at ~4 pulses. The real figure is nearer 30c, one pulse, so
+the ceiling on AF accuracy is much higher than §30/§31 assumed.
+
+**Grouping must be explicit.** Sweeps here run 39–50 s apart and refreezing a scene takes about
+as long as pausing between repeats, so a gap-based rule silently merges or splits scenes and
+returns a confident wrong variance. `--groups=3,3,3` is given by the operator; `--gap` remains
+only as a guess, and says so.
+
+### 32.6 Open items
+
+- **Scene and time are confounded.** Both curvature terms drift monotonically across the three
+  scenes — horizontal +19 → +85 → +109, vertical −66 → −37 → −5 — over six minutes. Two
+  independent terms moving in step and in order looks more like drift (thermal, or the mount
+  settling) than scene content. The design ran scenes in sequential blocks, so the two cannot
+  be separated. **Interleave A/B/A/B** to settle it. Until then the ~30c attributed to content
+  in §32.5 may be neither content nor real.
+- Curvature is the term that would follow the camera into flight, so it is the one worth
+  pinning down; tilt is a bench artifact.
+- **Shimming the yaw** is well justified: at 165c against ±38c noise, removing even a third of
+  it will show clearly. Measure before and after **within one session and one frozen scene** —
+  comparing across scenes costs three times the precision.
+- AF's own `fit_window` was left alone. The field map's climb is long and evenly sampled; AF's
+  is short and adaptive, so the window finding here does not transfer without its own check.
+
+### 32.7 Lesson
+
+Every one of the five failures in §32.1 produced a number that looked *better* than the truth —
+tighter spreads, cleaner curves, fewer flagged tiles. A measurement that cannot say "I could
+not measure this" will always be beaten by one that can, because the failure modes are quiet
+and the wrong answers are the pretty ones.

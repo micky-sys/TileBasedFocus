@@ -100,25 +100,63 @@ class FieldMapConfig:
     """Give up returning after this many frames, so a stalled motor ends the sweep
     instead of stepping down forever."""
 
-    fit_window: int = 3
-    """Samples each side of the argmax used for the per-tile parabola fit."""
+    fit_window: int = 20
+    """Samples each side of the argmax used for the per-tile parabola fit.
+
+    Was 3, which fits seven points across the flattest part of the hump -- exactly
+    where the curve carries least information about its own centre. The peak here is
+    ~1400 counts wide at half max, about 21 samples, and log(Gaussian) is a parabola
+    over that whole span, so there is no reason to throw the flanks away.
+
+    Checked against the two good sweeps of 2026-08-12: at window 3 their tilt and
+    curvature terms disagreed by 600c in total and 3 of 10 fits failed outright; from
+    15 to 30 the disagreement plateaus near 135c with no failures. A broad plateau,
+    not a tuned point, so 20 (roughly the half-width) is the honest middle."""
+    min_contrast: float = 5.0
+    """Peak/floor below which a tile is reported as having no usable hump. A tile on
+    real texture reads 25-50; one on blank sky, a blown highlight or off-screen wall
+    reads a few, and its "vertex" is noise dressed as a measurement."""
+    max_fit_offset_frac: float = 0.20
+    """How far the vertex may sit from the half-max MIDPOINT, as a fraction of the
+    curve's half-max width, before the fit is called untrustworthy.
+
+    The midpoint -- centre of the region scoring above half max -- is a model-free
+    peak locator that averages both flanks, so unlike the argmax it is not thrown by
+    noise on a broad flat top. Measured across the two good sweeps, the wide-window
+    vertex sits within 9% of the width of it every time, while the argmax strays to
+    16%; checking against the argmax would therefore flag good fits as suspect."""
 
 
 def five_tile_rois(
-    full_w: int, full_h: int, cfg: Optional[FieldMapConfig] = None
+    full_w: int,
+    full_h: int,
+    cfg: Optional[FieldMapConfig] = None,
+    region: Optional[Roi] = None,
 ) -> list[Roi]:
     """Centre + the four mid-edge tiles, in FULL-RES sensor pixels.
 
     Centre-plus-mid-edges rather than corners because it separates the two failure
-    modes: a TILTED screen makes focus vary linearly, so top and bottom sit on
-    opposite sides of centre, while a CURVED field is symmetric, so top and bottom
-    move the same way. Corners confound the two.
+    modes: a TILTED subject plane makes focus vary linearly, so top and bottom sit
+    on opposite sides of centre, while a CURVED field is symmetric, so top and
+    bottom move the same way. Corners confound the two.
+
+    ``region`` is the box the tiles are laid out inside, defaulting to the whole
+    frame. **On the bench it must be the screen, not the frame.** At this rig's
+    magnification the panel fills ~96 % of the frame width but only ~76 % of its
+    height, so tiles placed by frame fraction hang off the top and bottom onto
+    whatever is behind the screen — at a completely different focus distance, which
+    would come back as a large and entirely fictitious vertical tilt. The caller
+    passes the fiducial quad.
 
     Origins are forced even so ``crop[0::2, 1::2]`` (the green sub-grid every score
     is taken on) lands on the same Bayer colour in every tile.
     """
     cfg = cfg or FieldMapConfig()
-    side = max(8, min(int(cfg.tile_px), full_w, full_h))
+    rx0, ry0, rx1, ry1 = region if region else (0, 0, full_w, full_h)
+    rx0, ry0 = max(0, int(rx0)), max(0, int(ry0))
+    rx1, ry1 = min(int(full_w), int(rx1)), min(int(full_h), int(ry1))
+    rw, rh = max(2, rx1 - rx0), max(2, ry1 - ry0)
+    side = max(8, min(int(cfg.tile_px), rw, rh))
     ins = min(max(float(cfg.inset), 0.0), 0.49)
     centres = {
         "centre": (0.5, 0.5),
@@ -130,10 +168,8 @@ def five_tile_rois(
     rois: list[Roi] = []
     for name in TILE_NAMES:
         fx, fy = centres[name]
-        x0 = int(round(fx * full_w - side / 2.0)) & ~1
-        y0 = int(round(fy * full_h - side / 2.0)) & ~1
-        x0 = max(0, min(x0, full_w - side)) & ~1
-        y0 = max(0, min(y0, full_h - side)) & ~1
+        x0 = max(rx0, min(int(round(rx0 + fx * rw - side / 2.0)), rx1 - side)) & ~1
+        y0 = max(ry0, min(int(round(ry0 + fy * rh - side / 2.0)), ry1 - side)) & ~1
         rois.append((x0, y0, x0 + side, y0 + side))
     return rois
 
@@ -146,6 +182,12 @@ class TileResult:
     argmax: Optional[float]   # highest-scoring sampled position, counts
     peak_score: float
     n: int
+    contrast: float = 0.0     # peak/floor -- was there a focus hump at all?
+    halfwidth: float = 0.0    # counts spanned above half max -- how sharp the hump is
+    midpoint: float = 0.0     # centre of the above-half-max span, model-free locator
+    fitted: bool = False      # False = the parabola failed, vertex IS the argmax
+    clipped: bool = False     # peak sits on the edge: focus was never bracketed
+    trusted: bool = False     # survived the contrast + fit-shift + clipping checks
 
 
 class FieldMapSweep:
@@ -165,8 +207,11 @@ class FieldMapSweep:
         finished: Optional[Callable[[bool, dict], None]] = None,
         config: Optional[FieldMapConfig] = None,
         names: Sequence[str] = TILE_NAMES,
-        csv_dir: Optional[str] = None,
+        csv_dir: Optional[str],
     ) -> None:
+        # No default on csv_dir: it used to fall back to the real session-log folder,
+        # so a test that forgot it dropped synthetic sweeps in among the rig data,
+        # where the analysis tools happily averaged them in. Callers must say where.
         self.cfg = config or FieldMapConfig()
         self._axis = axis
         self._set_strength = set_strength
@@ -182,6 +227,7 @@ class FieldMapSweep:
         self._climb_done = 0
         self._return_frames = 0
         self._start_raw = 0.0
+        self._stop_reason = ""
 
     @property
     def running(self) -> bool:
@@ -193,6 +239,7 @@ class FieldMapSweep:
         self._samples = []
         self._climb_done = 0
         self._return_frames = 0
+        self._stop_reason = ""
         self._axis.reset()
         self._start_raw = float(getattr(self._axis, "raw_count", 0.0))
         self._set_strength_safe(self.cfg.dive_strength)
@@ -207,11 +254,20 @@ class FieldMapSweep:
         )
 
     def stop(self, reason: str = "stopped") -> None:
-        """Halt where we are -- no motor move. Whatever was collected is reported."""
-        if not self.running:
+        """Abort, but walk the lens home first.
+
+        Stopping where we stand strands the lens up to a full dive away from where
+        it started, and the NEXT sweep zeroes there: its fixed dive+climb is sized
+        to start near focus, so it silently runs out of travel before reaching the
+        peak and reports a tight, confident, meaningless spread. An abort has to
+        undo itself, not just stop."""
+        if not self.running or self.state == "return":
             return
-        log.info("fieldmap %s at %d samples", reason, len(self._samples))
-        self._finish(reason)
+        log.info("fieldmap %s at %d samples -- returning to start",
+                 reason, len(self._samples))
+        self._stop_reason = reason
+        self.state = "return"
+        self._status("field map: aborted, returning to start")
 
     def feed(self, crops: Sequence) -> None:
         """One frame's worth of full-res tile crops. Paces the motor and samples."""
@@ -264,16 +320,18 @@ class FieldMapSweep:
     def _return_tick(self) -> None:
         pos = float(self._axis.position)
         step = max(1, int(self.cfg.return_step_pulses))
-        if pos <= step * self._cpp():
-            self._finish("complete")
+        # Bidirectional: an abort during the dive leaves us BELOW the start, and a
+        # download-only return would call that "arrived" and strand it there.
+        if abs(pos) <= step * self._cpp():
+            self._finish(self._stop_reason or "complete")
             return
         if self._return_frames >= self.cfg.return_max_frames:
             log.warning("fieldmap return gave up at %+dc (motor stalled?)",
                         int(round(pos)))
-            self._finish("complete")
+            self._finish(self._stop_reason or "complete")
             return
         self._return_frames += 1
-        self._axis.step_pulses(-1, step)
+        self._axis.step_pulses(-1 if pos > 0 else 1, step)
 
     def _cpp(self) -> float:
         return float(getattr(self._axis, "counts_per_pulse_mag", 1.0)) or 1.0
@@ -298,7 +356,9 @@ class FieldMapSweep:
         self._finished(reason == "complete", report)
 
     def results(self) -> list[TileResult]:
-        """Fit one vertex per tile from the shared sweep."""
+        """One vertex per tile from the shared sweep, each with enough about the
+        curve it came from to tell a measurement from a guess."""
+        step = self._step()
         out: list[TileResult] = []
         for i, roi in enumerate(self.rois):
             curve = [(p, s[i]) for p, _raw, s in self._samples if i < len(s)]
@@ -306,12 +366,45 @@ class FieldMapSweep:
             if not curve:
                 out.append(TileResult(name, roi, None, None, 0.0, 0))
                 continue
-            best = max(curve, key=lambda ps: ps[1])
-            vertex = _fit_peak(curve, self.cfg.fit_window)
-            out.append(
-                TileResult(name, roi, vertex, best[0], best[1], len(curve))
+            j = max(range(len(curve)), key=lambda k: curve[k][1])
+            best = curve[j]
+            lo = min(s for _p, s in curve)
+            contrast = best[1] / max(lo, 1e-12)
+            # Still rising at the first or last sample: the true peak is outside the
+            # range we swept, so this tile has no vertex -- only a lower bound. Left
+            # unflagged, five such tiles all pinned to the same end sample report a
+            # tight spread that looks like a superb result and means nothing.
+            # Only meaningful with a real curve; on a flat tile the argmax lands
+            # wherever the noise puts it, and "no hump" is the honest diagnosis.
+            clipped = (j == 0 or j == len(curve) - 1) \
+                and contrast >= self.cfg.min_contrast
+            half = (best[1] + lo) / 2.0
+            above = [p for p, s in curve if s >= half]
+            halfwidth = (max(above) - min(above)) if above else 0.0
+            midpoint = ((max(above) + min(above)) / 2.0) if above else best[0]
+            v = _fit_peak(curve, self.cfg.fit_window)
+            fitted = v is not None
+            # A failed fit still leaves the argmax, which is a real (if step-coarse)
+            # reading -- better than discarding the tile as "no peak".
+            vertex = float(v) if fitted else float(best[0])
+            trusted = (
+                not clipped
+                and contrast >= self.cfg.min_contrast
+                and abs(vertex - midpoint)
+                <= self.cfg.max_fit_offset_frac * max(halfwidth, step)
             )
+            out.append(TileResult(
+                name, roi, vertex, best[0], best[1], len(curve),
+                contrast, halfwidth, midpoint, fitted, clipped, trusted,
+            ))
         return out
+
+    def _step(self) -> float:
+        """Mean encoder counts between consecutive samples."""
+        if len(self._samples) < 2:
+            return self._cpp()
+        span = self._samples[-1][0] - self._samples[0][0]
+        return abs(span) / (len(self._samples) - 1) or self._cpp()
 
     def summary_lines(
         self, results: list[TileResult], csv_path: Optional[str]
@@ -330,25 +423,57 @@ class FieldMapSweep:
         ref_v = ref.vertex if ref is not None else None
         for r in results:
             if r.vertex is None:
-                lines.append(f"field-map {r.name:<7} no peak (n={r.n})")
+                lines.append(f"field-map {r.name:<7} NO DATA (n={r.n})")
                 continue
             rel = ""
             if ref_v is not None and r.name != "centre":
-                rel = f" d={r.vertex - ref_v:+.0f}c vs centre"
+                rel = f" d={r.vertex - ref_v:+.0f}c"
+            flag = ""
+            if r.contrast < self.cfg.min_contrast:
+                flag = "  <- SUSPECT: no real hump (blank or off-screen?)"
+            elif r.clipped:
+                flag = "  <- CLIPPED: still rising at the edge, focus not bracketed"
+            elif not r.trusted:
+                flag = (f"  <- SUSPECT: vertex {abs(r.vertex - r.midpoint):.0f}c "
+                        f"from the half-max midpoint {r.midpoint:+.0f}c")
+            elif not r.fitted:
+                flag = "  (argmax only, parabola failed)"
             lines.append(
                 f"field-map {r.name:<7} vertex={r.vertex:+.0f}c "
-                f"argmax={r.argmax:+.0f}c n={r.n}{rel}"
+                f"argmax={r.argmax:+.0f}c width={r.halfwidth:.0f}c "
+                f"contrast={r.contrast:.0f}x{rel}{flag}"
             )
-        got = [r for r in results if r.vertex is not None]
-        if len(got) >= 2:
-            hi = max(got, key=lambda r: r.vertex)  # type: ignore[arg-type]
-            lo = min(got, key=lambda r: r.vertex)  # type: ignore[arg-type]
-            cpp = self._cpp()
-            spread = hi.vertex - lo.vertex  # type: ignore[operator]
+
+        cpp = self._cpp()
+
+        def _spread(items, key, label):
+            if len(items) < 2:
+                return
+            hi = max(items, key=key)
+            lo = min(items, key=key)
+            d = key(hi) - key(lo)
             lines.append(
-                f"field-map SPREAD {spread:.0f}c ({spread / cpp:.1f} str0 pulses): "
-                f"{hi.name} focuses highest, {lo.name} lowest"
+                f"field-map SPREAD ({label}) {d:.0f}c ({d / cpp:.1f} str0 pulses): "
+                f"{hi.name} highest, {lo.name} lowest"
             )
+
+        clipped = [r for r in results if r.clipped]
+        if clipped:
+            lines.append(
+                f"field-map SWEEP DID NOT BRACKET FOCUS -- {len(clipped)}/"
+                f"{len(results)} tiles peak at the edge of the range. The lens "
+                "started too far from focus for the fixed dive+climb to reach it. "
+                "Re-run from near focus; these numbers are lower bounds, not vertices."
+            )
+        good = [r for r in results if r.trusted and r.vertex is not None]
+        allr = [r for r in results if r.argmax is not None]
+        _spread(good, lambda r: r.vertex, f"fit, {len(good)}/{len(results)} trusted")
+        # The argmax needs no curve model, so it is the honest cross-check: if the
+        # two spreads disagree badly, the fit is doing the talking, not the optics.
+        _spread(allr, lambda r: r.argmax, "argmax, all tiles")
+        if len(good) < len(results):
+            dropped = ", ".join(r.name for r in results if r not in good)
+            lines.append(f"field-map excluded from the fit spread: {dropped}")
         if csv_path:
             lines.append(f"field-map csv {csv_path}")
         return lines

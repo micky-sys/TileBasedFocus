@@ -127,8 +127,18 @@ def _to_gray_u8(frame: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(img)
 
 
-def detect_fiducials(gray_u8: np.ndarray, dict_name: str) -> Optional[np.ndarray]:
-    """Return detected marker centres ordered id 0..3 (TL,TR,BR,BL), or None."""
+def detect_fiducials(
+    gray_u8: np.ndarray,
+    dict_name: str,
+    ids_out: Optional[list] = None,
+) -> Optional[np.ndarray]:
+    """Return detected marker centres ordered id 0..3 (TL,TR,BR,BL), or None.
+
+    Pass ``ids_out`` to receive the marker ids actually seen. All-or-nothing is the
+    right answer for rectification, but a caller diagnosing a failure needs to tell
+    "display blank / camera moved" (0 ids) from "someone is standing in front of one
+    corner" (3 ids), and a bare None cannot.
+    """
     if not _HAVE_ARUCO:
         return None
     try:
@@ -142,6 +152,8 @@ def detect_fiducials(gray_u8: np.ndarray, dict_name: str) -> Optional[np.ndarray
             corners, ids, _ = cv2.aruco.detectMarkers(gray_u8, dic)
     except Exception:
         return None
+    if ids_out is not None and ids is not None:
+        ids_out.extend(sorted(int(i) for i in ids.flatten()))
     if ids is None or len(ids) < 4:
         return None
     by_id = {}

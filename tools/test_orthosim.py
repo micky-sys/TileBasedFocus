@@ -249,6 +249,33 @@ def _render_screen(gt: codec.GroundTruth, layout) -> np.ndarray:
     return canvas
 
 
+def test_detect_fiducials_reports_which_markers_it_saw() -> None:
+    """The field map has to tell a blank display from one obscured corner, and a
+    bare None cannot. Occlusion still fails the detect -- it just says why."""
+    pytest.importorskip("cv2")
+    from capture.orthosim_decode import ScreenLayout, detect_fiducials
+
+    layout = ScreenLayout(screen_w=1600, screen_h=1000)
+    gt = codec.GroundTruth(distance_mm=1, tick=1, velocity_mmps=1, flags=0)
+    frame = _render_screen(gt, layout)
+
+    seen: list = []
+    assert detect_fiducials(frame, layout.aruco_dict, seen) is not None
+    assert seen == [0, 1, 2, 3], f"expected all four markers, got {seen}"
+
+    s, m = layout.fiducial_px, layout.fiducial_margin_px
+    covered = frame.copy()
+    covered[m - 8:m + s + 8, m - 8:m + s + 8] = 127   # someone leans over marker 0
+    seen = []
+    assert detect_fiducials(covered, layout.aruco_dict, seen) is None
+    assert 0 not in seen and len(seen) == 3, f"expected ids 1,2,3, got {seen}"
+
+    seen = []
+    blank = np.full_like(frame, 127)
+    assert detect_fiducials(blank, layout.aruco_dict, seen) is None
+    assert seen == [], f"blank display should see nothing, got {seen}"
+
+
 def test_decode_frontoparallel() -> None:
     pytest.importorskip("cv2")
     from capture.orthosim_decode import ScreenLayout, decode_frame

@@ -68,6 +68,7 @@ from .kyfg_backend import KyfgCamera
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
 from .file_naming import sanitize_project_name
+from .field_map import TILE_NAMES as FIELD_MAP_TILE_NAMES
 from .field_map import FieldMapConfig, FieldMapSweep, five_tile_rois
 from .focus_axis import EncoderAxis
 from .focus_csv_log import FocusCsvLogger
@@ -86,7 +87,7 @@ from .mode_controller import (
 )
 from .pipeline import AcquisitionThread, CameraPipeline, CaptureContext, PREVIEW_MAX_EDGE
 from .serial_client import SerialClient
-from .session_log import SessionLogger, build_date
+from .session_log import SessionLogger, build_date, default_log_dir
 
 log = logging.getLogger(__name__)
 
@@ -2275,7 +2276,12 @@ class MainWindow(QMainWindow):
         # so it's wired outside the block above.
         self._field_map: Optional[FieldMapSweep] = None
         self._field_map_cfg = FieldMapConfig()
-        self._last_coarse_shape: Optional[tuple[int, int]] = None
+        # Latest coarse focus frame, kept by reference so the field map can locate
+        # the screen's fiducials at the moment it is started.
+        self._last_coarse_raw = None
+        # Last successfully measured fiducial box, with the frame shape it came from,
+        # so a momentary marker dropout does not block a repeat sweep.
+        self._last_fiducial_box = None
         self._focus_panel.field_map_requested.connect(self._on_field_map_requested)
         focus_host = QWidget()
         focus_layout = QVBoxLayout(focus_host)
@@ -3755,6 +3761,93 @@ class MainWindow(QMainWindow):
         fm = getattr(self, "_field_map", None)
         return fm is not None and fm.running
 
+    def _field_map_region(self, raw, scale: int):
+        """The box the field-map tiles may live in, in FULL-RES pixels.
+
+        Between the fiducials whenever OrthoSim can see them. The screen covers only
+        ~76 % of the frame HEIGHT at this magnification (~96 % of the width), so
+        tiles placed by frame fraction hang off the panel onto the room behind it —
+        metres away instead of ~3 m — and that shows up as a large vertical tilt that
+        is not a property of the optics at all. The fiducial quad is the only honest
+        boundary, and it is also roughly the region AF itself picks from, which makes
+        the two measurements comparable.
+
+        Falls back to the AF interior inset, then the whole frame.
+        """
+        h, w = raw.shape[:2]
+        box = None
+        # Detection needs only the ArUco dictionary NAME, not an armed OrthoSim
+        # decode, so fall back to the layout default rather than skipping the
+        # search when the toggle is off. (Requiring the layout object is what made
+        # the first fiducial-bounded run silently measure the whole frame.)
+        dict_name = getattr(self._ortho_layout, "aruco_dict", None) or \
+            ScreenLayout.aruco_dict
+        seen: list = []
+        try:
+            from .orthosim_decode import _to_gray_u8, detect_fiducials
+
+            src = detect_fiducials(_to_gray_u8(raw), dict_name, seen)
+            if src is not None:
+                tl, tr, br, bl = src
+                # Largest axis-aligned box inside the (mildly perspective) quad.
+                box = (max(tl[0], bl[0]), max(tl[1], tr[1]),
+                       min(tr[0], br[0]), min(bl[1], br[1]))
+                self._last_fiducial_box = (box, (h, w))
+        except Exception as exc:
+            self._log(f"Field map: fiducial detect failed: {exc}")
+        if box is None and self._last_fiducial_box is not None:
+            # A marker can drop out for a frame or two -- someone leans in, the lens
+            # is parked soft, autoexposure blinks. The screen has not moved, so the
+            # box measured earlier this session still describes it; reuse it rather
+            # than dead-ending a sweep the operator just watched succeed.
+            cached, shape = self._last_fiducial_box
+            if shape == (h, w):
+                box = cached
+                self._log(
+                    f"Field map: only {len(seen)}/4 markers visible (ids {seen}) "
+                    "-- reusing the box measured earlier this session. Valid ONLY "
+                    "if the camera and screen have not moved since."
+                )
+        if box is None:
+            if not self._af_cfg.restrict_interior:
+                # Refuse rather than measure. An unbounded sweep puts tiles on the
+                # wall behind the screen, metres away, and returns that as a huge
+                # "tilt" -- a confident wrong answer, which is worse than none.
+                self._log(
+                    f"Field map: cannot find the screen -- saw {len(seen)}/4 "
+                    f"markers (ids {seen}, dict {dict_name}). Aim the camera so "
+                    "all four are visible, or tick OrthoSim to bound tiles by the "
+                    "interior inset instead. Not sweeping."
+                )
+                return None
+            ins = self._af_cfg.interior_inset
+            box = (w * ins, h * ins, w * (1.0 - ins), h * (1.0 - ins))
+            self._log(
+                f"Field map: no fiducials; using the OrthoSim interior inset "
+                f"({ins:.2f}). Check the drawn tiles are all on the screen."
+            )
+        else:
+            self._log(
+                f"Field map: fiducial box = {(box[2] - box[0]) / w * 100:.0f}% x "
+                f"{(box[3] - box[1]) / h * 100:.0f}% of the frame"
+            )
+        # Keep off the optical ground-truth strip: it is bright, hard-edged and not
+        # ortho content, so it would dominate a tile's score.
+        x0, y0, x1, y1 = box
+        edge = self._af_cfg.exclude_edge
+        if edge:
+            bw = (x1 - x0) * self._af_cfg.edge_band
+            bh = (y1 - y0) * self._af_cfg.edge_band
+            if edge == "top":
+                y0 += bh
+            elif edge == "bottom":
+                y1 -= bh
+            elif edge == "left":
+                x0 += bw
+            elif edge == "right":
+                x1 -= bw
+        return tuple(int(v * scale) for v in (x0, y0, x1, y1))
+
     @Slot()
     def _on_af_stop_requested(self) -> None:
         """One Stop button for whatever is currently driving the focus motor."""
@@ -3786,15 +3879,25 @@ class MainWindow(QMainWindow):
             self._log("Field map: stop autofocus first -- both drive the motor.")
             return
         p = self._active_pipeline()
-        shape = self._last_coarse_shape
-        if p is None or shape is None:
+        raw = self._last_coarse_raw
+        if p is None or raw is None:
             self._log("Field map: no focus frames yet; wait for the M4 preview.")
             return
         if not getattr(self._serial, "encoder_present", False):
             self._log("Field map: encoder absent ($ENC=-1) -- the sweep needs it.")
             return
         scale = KyfgCamera.SUBSAMPLE_FACTOR
-        rois = five_tile_rois(shape[1] * scale, shape[0] * scale, self._field_map_cfg)
+        h, w = raw.shape[:2]
+        region = self._field_map_region(raw, scale)
+        if region is None:
+            return
+        rois = five_tile_rois(w * scale, h * scale, self._field_map_cfg, region)
+        # Draw the tiles on the coarse preview so the operator can SEE what each one
+        # is actually looking at before trusting a vertex from it.
+        self._focus_panel.set_track_rois([
+            (n, tuple(int(v / scale) for v in r))
+            for n, r in zip(FIELD_MAP_TILE_NAMES, rois)
+        ])
         sweep = FieldMapSweep(
             axis=EncoderAxis(
                 self._serial.focus_step,
@@ -3806,6 +3909,7 @@ class MainWindow(QMainWindow):
             status=self._focus_panel.set_autofocus_status,
             finished=self._on_field_map_finished,
             config=self._field_map_cfg,
+            csv_dir=default_log_dir(),
         )
         # Same full-res tap AF uses; the pipeline crops all five ROIs out of the one
         # held slot, so every tile is scored on the very same frame.
@@ -3815,6 +3919,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._log(f"Field map: set_preview_rois failed: {exc}")
             self._af_enable_full_res(False)
+            self._focus_panel.set_track_rois([])
             return
         self._field_map = sweep
         self._focus_panel.set_autofocus_running(True)
@@ -4126,7 +4231,7 @@ class MainWindow(QMainWindow):
         # fed from the raw coarse frame up front. Mutually exclusive so the shared
         # tracker only advances once per frame -- the green-box overlay (main preview)
         # takes priority over the split-screen crop preview.
-        self._last_coarse_shape = tuple(raw.shape[:2])
+        self._last_coarse_raw = raw
         if self._field_map_running():
             # The sweep has pinned its own ROIs on the pipeline; letting the tracker
             # repoint them mid-sweep would move the tiles it is measuring.
