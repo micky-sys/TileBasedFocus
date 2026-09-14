@@ -1,0 +1,35 @@
+---
+description: Safe launch/kill lifecycle for the Iron661 capture app (KAYA grabber DMA safety)
+alwaysApply: true
+---
+
+# Launching / killing the capture app safely
+
+Launching on request is fine. **Killing it wrong hard-freezes Windows.**
+
+Force-killing `host/main_capture.py` while the KAYA grabber is armed and streaming
+DMA corrupts the driver's kernel state; re-opening the grabber afterward hard-freezes
+the machine (no BSOD screen, manual reboot). Confirmed live 2026-07-30. The app already
+has a clean teardown in `MainWindow.closeEvent` ([app.py](mdc:host/capture/app.py)):
+`$M0*` -> drain in-flight frames -> `pipeline.stop()` -> disarm -> `KYFG_Close` ->
+serial disconnect. A normal window close runs it; `taskkill /F` skips it.
+
+## Rules
+
+- ⛔ **Never `taskkill /F`** (force) the app while it may hold the grabber. No exceptions
+  from the agent side — if a graceful stop won't complete, STOP and tell the operator.
+- ✅ **Launch** (only when asked), from repo root:
+  ```powershell
+  $env:QT_QPA_PLATFORM = "windows"; py -3 host/main_capture.py
+  ```
+- ✅ **Stop** by triggering the graceful `closeEvent`:
+  - Preferred: ask the operator to close it via the window / **Disconnect** button.
+  - From the shell if you must: post WM_CLOSE with `taskkill /PID <pid>` **without** `/F`,
+    then POLL `tasklist` until that PID **and** its child `python.exe` subprocesses
+    (packers / io_writers) are gone. Allow up to ~90 s (teardown drains, and waits on the
+    bring-up worker up to 60 s). Do not assume it's dead — verify.
+- ⛔ **Never relaunch** until the previous instance and all its child `python.exe`
+  processes have fully exited and released **COM38** + the grabber (check `tasklist`).
+  Immediate relaunch onto a half-released grabber is the freeze trigger.
+- Bring-up (KAYA open, ~30 s) is when the grabber is most fragile — don't interrupt it
+  with anything but a graceful close.

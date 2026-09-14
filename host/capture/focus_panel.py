@@ -326,6 +326,145 @@ class _FocusScatterGraph(QWidget):
         p.end()
 
 
+class _FieldProfileGraph(QWidget):
+    """AF3's live station view: focus SCORE (Y) against position ACROSS THE FRAME (X),
+    one polyline per tracked object.
+
+    This is a different question from the score-vs-encoder scatter above it. That one
+    asks "what does focus do to this patch"; this one asks "what does the FIELD do at
+    this one lens position", which is what AF3 actually steers on. The lens is dead
+    still for the whole of a station, so every curve here is the field, not focus.
+
+    What to look for: a hump peaking mid-frame means the lens is near best focus (the
+    centre only out-scores the edges when it is near its own vertex). A bowl -- edges
+    high, middle low -- means it is well off, either side. D is that shape reduced to
+    one number, and its sign is the dome/bowl verdict.
+
+    Two operator-chosen display rules, both of which change what the picture answers:
+
+    *Only COMPLETED traverses are drawn.* A partial arc has not visited both edge bands
+    yet, so its shape is a fragment of a profile and reads as a slope that is not there.
+    The engine only publishes trails that actually yielded a D, so the curves on screen
+    are exactly the ones the station's median is built from -- nothing shown that did
+    not count, nothing counted that is not shown.
+
+    *Each curve is normalised to ITS OWN peak*, on a fixed 0..1 axis. Content then
+    cancels in the picture the same way it cancels in D, so the curves overlay and the
+    only thing separating them is shape. The fixed axis is what makes depth readable
+    across stations: as the lens walks, a bowl flattening into a dome and back is a
+    real change in these curves' depth, which an auto-scaled axis would hide by
+    re-stretching every frame. The cost is that a patch scored near the noise floor no
+    longer looks low -- it looks like any other curve -- so judge acquisition quality
+    from the scatter above, not from here."""
+
+    _COLOURS = ((120, 230, 160), (255, 170, 60), (140, 190, 255),
+                (240, 130, 200), (220, 220, 120))
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._row: dict = {}
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(260, 150)
+        self.hide()
+
+    def clear(self) -> None:
+        self._row = {}
+        self.hide()
+
+    def update_row(self, row: dict) -> None:
+        self._row = dict(row or {})
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def paintEvent(self, ev):  # noqa: N802 -- Qt naming
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 160))
+        p.setPen(QPen(QColor(90, 90, 90), 1))
+        p.drawRect(0, 0, w - 1, h - 1)
+
+        row = self._row
+        cyan = QColor(90, 200, 255)
+        p.setPen(cyan)
+        pos = row.get("pos")
+        p.drawText(5, 11, "field profile  st%s%s  norm" % (
+            row.get("station", "-"),
+            "" if pos is None else " @ %+dc" % int(pos)))
+
+        completed = list(row.get("completed") or [])
+        pts = [t for _oid, tr in completed for t in tr]
+        pad_l, pad_r, pad_t, pad_b = 6, 6, 16, 26
+        plot_w, plot_h = w - pad_l - pad_r, h - pad_t - pad_b
+        if plot_w <= 1 or plot_h <= 1:
+            p.end()
+            return
+
+        # Travel axis from the data, exactly as profile_metric decides it, so the
+        # picture and the number can never disagree about which way the scene moves.
+        fw = float(row.get("frame_w") or 1)
+        fh = float(row.get("frame_h") or 1)
+        use_x = True
+        if pts:
+            use_x = (max(t[0] for t in pts) - min(t[0] for t in pts)) >= \
+                    (max(t[1] for t in pts) - min(t[1] for t in pts))
+        extent = fw if use_x else fh
+
+        # Edge bands (outer quarter each end) and the frame centre, so the operator can
+        # see WHICH samples D is actually differencing.
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 16))
+        p.drawRect(pad_l, pad_t, int(0.25 * plot_w), plot_h)
+        p.drawRect(pad_l + int(0.75 * plot_w), pad_t, int(0.25 * plot_w), plot_h)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(120, 120, 120), 1, Qt.PenStyle.DashLine))
+        xc = pad_l + plot_w // 2
+        p.drawLine(xc, pad_t, xc, pad_t + plot_h)
+
+        if not pts:
+            p.setPen(QColor(160, 160, 160))
+            p.drawText(pad_l, pad_t + plot_h // 2, "waiting for traverses...")
+            p.end()
+            return
+
+        # Half-scale marker: with every curve pinned to 1.0 at its own peak, this is
+        # the "lost half its contrast" line, which is the depth worth eyeballing.
+        p.setPen(QPen(QColor(70, 70, 70), 1, Qt.PenStyle.DotLine))
+        p.drawLine(pad_l, pad_t + plot_h // 2, pad_l + plot_w, pad_t + plot_h // 2)
+
+        for i, (_oid, tr) in enumerate(sorted(completed, key=lambda c: c[0])):
+            peak = max(t[2] for t in tr) or 1.0
+            p.setPen(QPen(QColor(*self._COLOURS[i % len(self._COLOURS)]), 1))
+            prev = None
+            for cx, cy, sc in tr:
+                u = (cx if use_x else cy) / max(extent, 1.0)
+                x = pad_l + int(min(max(u, 0.0), 1.0) * plot_w)
+                frac = min(max(sc / peak, 0.0), 1.0)
+                y = pad_t + plot_h - int(frac * plot_h)
+                if prev is not None:
+                    p.drawLine(prev[0], prev[1], x, y)
+                prev = (x, y)
+
+        banked = row.get("banked") or []
+        need = row.get("need")
+        p.setPen(cyan)
+        if banked:
+            med = sorted(banked)[len(banked) // 2]
+            verdict = "DOME" if med > 0 else "bowl"
+            p.drawText(5, h - 14, "D=%+.2f %s  (%d%s traverses)" % (
+                med, verdict, len(banked), "" if need is None else "/%d" % need))
+        else:
+            p.drawText(5, h - 14, "no completed traverse yet")
+        done = row.get("stations") or []
+        if done:
+            best = max(done, key=lambda s: s[1])
+            p.setPen(QColor(180, 180, 180))
+            p.drawText(5, h - 3, "best so far D=%+.2f @ %+dc  (%d stations)"
+                       % (best[1], int(best[0]), len(done)))
+        p.end()
+
+
 class _PreviewStack(QStackedWidget):
     """Host that swaps the single focus display (page 0) for the two-object split
     preview (page 1). The score graphs are parented HERE -- not on either page --
@@ -335,6 +474,7 @@ class _PreviewStack(QStackedWidget):
         super().__init__(parent)
         self.overlay: Optional[QWidget] = None          # bottom-right AF telemetry
         self.scatter_overlay: Optional[QWidget] = None  # top-right score-vs-enc scatter
+        self.profile_overlay: Optional[QWidget] = None  # AF3 field profile, under it
 
     def resizeEvent(self, ev):  # noqa: N802 -- Qt naming
         super().resizeEvent(ev)
@@ -351,6 +491,13 @@ class _PreviewStack(QStackedWidget):
         if sc is not None:
             sc.move(max(0, self.width() - sc.width() - m), m)
             sc.raise_()
+        # Directly beneath the scatter: the two read together (score vs focus above,
+        # score vs field position below) and AF3 needs both to be judged at a glance.
+        pr = self.profile_overlay
+        if pr is not None:
+            top = m + (sc.height() + m if sc is not None else 0)
+            pr.move(max(0, self.width() - pr.width() - m), top)
+            pr.raise_()
 
 
 class _DualObjectPreview(QWidget):
@@ -431,12 +578,15 @@ class FocusPanel(QWidget):
     autofocus_all_requested = Signal()   # focus cam1..3 once, in sequence
     autofocus_stop_requested = Signal()
     field_map_requested = Signal()       # one sweep, fixed tiles, a vertex per tile
+    align_toggled = Signal(bool)         # live camera-vs-screen tilt readout, shown ON the screen
+    observe_requested = Signal()         # fixed focus, N tracked patches, CSV per frame
     autofocus_algorithm_changed = Signal(str)  # "legacy" | "sweep_and_hold"
     fine_lock_changed = Signal(bool)     # freeze the tracked Fine tile (no re-pick)
     csv_log_toggled = Signal(bool)       # start/stop focus-telemetry CSV logging
     preview_toggled = Signal(bool)       # split-screen two-object preview on/off
     dual_track_toggled = Signal(bool)    # two-object tracking overlay (green boxes) on/off
     orthosim_toggled = Signal(bool)      # OrthoSim ground-truth decode + AF interior masking on/off
+    lockstep_toggled = Signal(bool)      # closed-loop display/camera handshake on/off (bench only)
 
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
@@ -656,6 +806,10 @@ class FocusPanel(QWidget):
         self._scatter_graph = _FocusScatterGraph(self._preview_stack)
         self._preview_stack.scatter_overlay = self._scatter_graph
         self._scatter_graph.show()
+        # AF3's station view. Hidden until a station publishes, so AF2/legacy runs
+        # look exactly as they did.
+        self._profile_graph = _FieldProfileGraph(self._preview_stack)
+        self._preview_stack.profile_overlay = self._profile_graph
         self._preview_stack.reposition_overlays()
         outer.addWidget(self._preview_stack, 1)
 
@@ -914,6 +1068,21 @@ class FocusPanel(QWidget):
         self._save_toggle.toggled.connect(self._on_save_toggled)
         row.addWidget(self._save_toggle)
 
+        self._lockstep_toggle = QCheckBox("Lockstep")
+        self._lockstep_toggle.setToolTip(
+            "OrthoSim bench rig only. Drives the display and the camera as a closed\n"
+            "loop: the display reports when the picture is painted AND settled, the\n"
+            "app then fires ONE trigger into a provably static panel, and the scene\n"
+            "does not move again until the frame is in.\n\n"
+            "Removes the doubled crops at the source instead of rejecting them, so\n"
+            "every frame becomes a measurement rather than every other one.\n\n"
+            "Needs the display app running and firmware with $X1* support. NEVER in\n"
+            "flight: it stops the camera self-triggering, so with nothing answering\n"
+            "there are no frames until it gives up and reverts."
+        )
+        self._lockstep_toggle.toggled.connect(self.lockstep_toggled.emit)
+        row.addWidget(self._lockstep_toggle)
+
         self._csv_log_toggle = QCheckBox("Log CSV")
         self._csv_log_toggle.setToolTip(
             "Log manual-backlash focus telemetry to a CSV in the 'Session logs'\n"
@@ -980,6 +1149,37 @@ class FocusPanel(QWidget):
         )
         self._field_map_button.clicked.connect(self.field_map_requested.emit)
         row.addWidget(self._field_map_button)
+
+        self._align_button = QPushButton("Align")
+        self._align_button.setCheckable(True)
+        self._align_button.setToolTip(
+            "Null the mechanical tilt between the camera and the screen, which is "
+            "what puts the top and bottom of one frame at different focus (the field "
+            "map measured 641 counts of ramp against a ~1460c depth of field).\n\n"
+            "Press A in OrthoSim to put up the alignment pattern first, then toggle "
+            "this: twice a second the camera measures the panel's orientation and "
+            "OrthoSim shows it as a bubble level plus degrees, so you can watch the "
+            "screen you are aiming at while you adjust the platform. Park near focus "
+            "first -- a blurred pattern loses corners, and the corner count beside the "
+            "angles tells you if it has. Moves no motor; the sweeps stay locked out "
+            "while it runs because the pattern replaces the ortho scene."
+        )
+        self._align_button.toggled.connect(self.align_toggled.emit)
+        row.addWidget(self._align_button)
+
+        self._observe_button = QPushButton("Observe")
+        self._observe_button.setToolTip(
+            "Diagnostic, NOT an autofocus. Holds the lens still and scores several "
+            "tracked patches on every frame, logging each one to CSV. Answers why a "
+            "newly acquired patch scores ~1.6x an older one at the same focus, which "
+            "is what makes cross-object stitching bias the climb curve.\n\n"
+            "LET THE SCENE SCROLL -- the patches must travel across the frame. Run it "
+            "in both directions (OrthoSim --dir down) to separate a patch's age from "
+            "its height in the frame; forward-only, the two cannot be told apart.\n\n"
+            "Returns the lens to where it started. Stop AF ends it early."
+        )
+        self._observe_button.clicked.connect(self.observe_requested.emit)
+        row.addWidget(self._observe_button)
 
         self._lock_tile_chk = QCheckBox("Lock tile")
         self._lock_tile_chk.setToolTip(
@@ -1138,6 +1338,10 @@ class FocusPanel(QWidget):
         self._af_button.setEnabled(not running)
         self._af_all_button.setEnabled(not running)
         self._field_map_button.setEnabled(not running)
+        self._observe_button.setEnabled(not running)
+        # Align moves no motor, but it needs its pattern on the screen, so the ortho
+        # scene the other three score is gone while it is on -- pointless at best.
+        self._align_button.setEnabled(not running)
         self._af_lead_combo.setEnabled(not running)
         self._af_algo_combo.setEnabled(not running)
         # Lock the Coarse/Fine toggle too: a run forces the Coarse full-res tap it
@@ -1165,6 +1369,27 @@ class FocusPanel(QWidget):
         self._lock_tile_chk.blockSignals(True)
         self._lock_tile_chk.setChecked(False)
         self._lock_tile_chk.blockSignals(False)
+
+    def reset_align(self) -> None:
+        """Pop 'Align' back out without re-emitting, for when the MainWindow refuses
+        it (no AF mode, a sweep already running) -- a button left down while nothing
+        measures is how an operator ends up staring at a frozen bubble."""
+        self._align_button.blockSignals(True)
+        self._align_button.setChecked(False)
+        self._align_button.blockSignals(False)
+
+    def reset_lockstep(self) -> None:
+        """Untick 'Lockstep' without re-emitting, for when the handshake gives up.
+
+        Same lesson as :meth:`reset_align`, learned the hard way on 2026-09-07: the
+        loop degraded to PCB triggering after one missing frame, the box stayed ticked,
+        and two full observe runs were then recorded open loop by an operator who had
+        every reason to believe the rig was in lockstep. A control that misreports the
+        state of the hardware is worse than no control.
+        """
+        self._lockstep_toggle.blockSignals(True)
+        self._lockstep_toggle.setChecked(False)
+        self._lockstep_toggle.blockSignals(False)
 
     def _build_focus_step_box(self) -> QWidget:
         box = QGroupBox("Focus")
@@ -1263,6 +1488,15 @@ class FocusPanel(QWidget):
     def focus_scatter_clear(self) -> None:
         """Reset the manual-backlash scatter."""
         self._scatter_graph.clear()
+
+    def field_profile_update(self, row: dict) -> None:
+        """Show AF3's in-progress station: score vs position across the frame."""
+        self._profile_graph.update_row(row)
+        self._preview_stack.reposition_overlays()
+
+    def field_profile_clear(self) -> None:
+        """Hide the station view (end of an AF3 run, or a non-AF3 run starting)."""
+        self._profile_graph.clear()
 
     def set_af_roi_overlay(self, roi: Optional[tuple[int, int, int, int]]) -> None:
         """Set (or clear) the autofocus winning-tile rectangle to overlay on the

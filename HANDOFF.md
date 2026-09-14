@@ -1120,6 +1120,26 @@ open** (holds the frame grabber exclusively); a stale grabber handle can also li
 after a hard kill. Fix: close Vision Point (and any leftover Python), or reboot to
 clear a stuck handle, then relaunch.
 
+> **Correction, 2026-08-16 — do not chase Vision Point first.** The same error appeared
+> again and Vision Point was the obvious suspect, but it is **not** a reliable cause:
+> it **auto-starts at boot**, so it is running during perfectly healthy sessions too. Its
+> presence in the process list proves nothing. It also ignored a WM_CLOSE (responsive, no
+> window title — likely a tray instance), and force-killing a process that may hold an
+> armed grabber is the freeze trigger, so that path is a dead end anyway.
+>
+> What it actually was, in order: the **Komodo III was disabled in Device Manager**, then
+> a **stale grabber session** survived the re-enable. A reboot cleared both. Check in this
+> order before touching Vision Point:
+>
+> ```powershell
+> Get-PnpDevice | ? Class -match KAYA | % { "{0,-30} Status={1,-8} Present={2}" -f $_.FriendlyName,$_.Status,$_.Present }
+> ```
+>
+> A healthy board reads `Status=OK Present=True` (Komodo II shows `Present=False` on this
+> machine — a ghost entry, not a fault). If the board is healthy and the open still fails,
+> **reboot**; the successful launch afterwards logs `Cleaned up stale grabber session
+> (idx=0)`, which is the app clearing exactly this.
+
 ## 22. Autofocus metric/landing fixes + bench-box BSOD analysis (2026-07-12)
 
 > **Scope note.** All of the crashes below are on the **bench test box** (32 GB RAM),
@@ -2471,3 +2491,2080 @@ Every one of the five failures in §32.1 produced a number that looked *better* 
 tighter spreads, cleaner curves, fewer flagged tiles. A measurement that cannot say "I could
 not measure this" will always be beaten by one that can, because the failure modes are quiet
 and the wrong answers are the pretty ones.
+
+## 33. The dive assumed the lens started near focus (2026-08-13)
+
+Four moving-AF runs failed in a row, all with the same verdict: `climb never rose above its
+start`. The raw scores were the giveaway -- they fell by a factor of nine ACROSS the whole
+climb, from 561 at the bottom to 60 at the top, with no hill anywhere in them.
+
+Freezing the scene and running a field map settled it in ninety seconds:
+
+```
+centre vertex=-2558c  top -2506c  bottom -2495c  left -2475c  right -2608c
+SPREAD (fit, 5/5 trusted) 133c    contrast 26-56x
+```
+
+Focus was **2558 counts (107 pulses) below the lens**, and all five tiles agreed to within
+133 counts, so this was not a confused measurement. The fixed four-burst dive drops 3316
+counts, which put the climb's start only ~760 counts below the peak. The climb crested
+within its first few samples and ran downhill for the rest of its length. Every failure that
+afternoon was the same failure.
+
+### 33.1 The gate was right for the wrong reason
+
+`min_climb_improvement` (§ added 2026-08-13) refused all four runs, and it was correct to.
+But with the dive floor that close to focus, the first sample already scores ~87% of the peak
+on these curves (half-width ~1700c), so peak-over-first cannot exceed about 1.15 against a
+threshold of 1.2. **The gate would have refused a perfectly good run in that state too.** It
+was passing the audit by luck, not by judgement.
+
+### 33.2 Fix: dive on the measured score, not on a burst count
+
+`dive_bursts` is now a MINIMUM. The dive scores the primary patch on each tick (coarse frame
+deliberately -- always fresh, and the dive needs "has this collapsed", not precision) and
+keeps a running peak. It stops once the score falls to `dive_stop_fraction` (0.4) of that
+peak, and can extend to `dive_max_bursts` (12) to get there.
+
+This is self-correcting in both directions without knowing where the lens started:
+
+- **Starting above focus**, diving RAISES the score. The running peak records the pass
+  through focus, and the dive keeps going until it is properly past it.
+- **Starting at or below focus**, the score falls from the first burst, so the dive stops at
+  the nominal depth. No extra bursts, no extra climb length, no extra cross-object seams.
+
+It also restores the meaning of `improvement`: the climb now always starts at <=40% of the
+peak, so a real hill clears 1.2 with room to spare.
+
+The cap is not optional. A textureless or saturated patch never collapses, and without it the
+adaptive rule drives into the mechanical stop. Hitting the cap logs a warning and climbs
+anyway -- a capped dive is a bad dive, not a reason to abandon the run.
+
+Self-checks in `tools/test_af_handover.py`: `..._starts_above_focus_keeps_going...`,
+`..._starts_at_focus_still_stops_at_the_nominal_depth`, `..._textureless_dive_is_capped...`.
+The first reproduces the live failure in miniature and fails against the fixed-burst dive.
+
+### 33.3 What did and did not change between 12:40 and 16:31
+
+Written first as "the bench moved 2558 counts". **Half of that was a misreading, and it is
+worth keeping the correction visible because the trap is easy to fall into twice.**
+
+| | 12:40 | 16:31 | verdict |
+|---|---|---|---|
+| focus vs the lens | at it (vertex +4c) | 2558c below it | **not a drift** |
+| tilt | +237c vertical | 133c left-right | real |
+
+The focus figure is measured relative to wherever the lens happened to be sitting when each
+sweep started, and the app was relaunched at 16:25 between them. `raw` does not survive a
+relaunch -- the ClearCore re-references on connect (see `focus_axis.raw_count`) -- so the two
+sweeps have no common frame, and the 16:31 lens position was itself arbitrary, left there by
+four failed runs. Comparing them measures nothing. A same-session frozen reference is the only
+valid way to ask "did focus move", and when one was finally taken (§35.2) the answer was no.
+
+The tilt change DOES stand: tilt is a comparison between tiles WITHIN one sweep, so it needs
+no common frame across sessions.
+
+The habit is still worth adopting -- a field map at the start of every session costs ninety
+seconds and pins the lens to a known place. Just do not difference two of them across a
+restart.
+
+## 34. The handover stitch was the regression - turned off (2026-08-13)
+
+The operator's call, and it was the right one: results were better YESTERDAY, before the
+handover work landed. Four changes went in on top of each other, each justified on its own,
+and the system got worse. That is debugging by accumulation.
+
+### 34.1 A working handover is worse than a broken one, while the ratio is biased
+
+Read the re-anchor path in `_handle_handover`: it sets `primary_oid`, clears `ondeck_oid`,
+resets `cross_cal` -- and **never touches `cumulative_scale`**. So:
+
+- a **failed** stitch (re-anchor) carries the scale forward untouched;
+- only a **successful** stitch multiplies it by the measured primary/on-deck ratio.
+
+Yesterday the stitch was broken -- 38 re-anchors, `handovers=0` -- so `cumulative_scale`
+stayed at **1.0 for the whole climb**. No compounding, honest scores, and focus the operator
+judged good by eye.
+
+Then §30's ordering fix made the stitch work. The ratio it multiplies by is biased low
+(median 0.625 over 131 live overlap samples; 19 of 20 seams below 1), so 20 working seams
+compound to 8.7e-5. The peak sits at the TOP of the climb, where the crush is deepest, so it
+disappears. Four consecutive runs then reported `improvement=0.03x` and refused to park while
+the focus was visibly fine.
+
+**The score was wrong, not the optics.** Every "fix" after §30 addressed how reliably the
+multiplication happened, never whether the thing being multiplied was correct.
+
+### 34.2 What OFF costs, and why it still wins
+
+`_advance_objects` re-acquires a fresh leading-edge patch whenever the object list empties
+(lines ~876-883), independent of the flag. So with the stitch off the climb does not die -- it
+continues on fresh patches at scale 1.0, which is precisely the pre-handover behaviour.
+
+The cost is real: the curve mixes patches of differing intrinsic texture, so the peak carries
+patch-to-patch noise. That defect is why the stitch was built. It is still better than a curve
+crushed by four orders of magnitude.
+
+### 34.3 Kept from the same day, because none of it depends on the stitch
+
+| change | why it stays |
+|---|---|
+| faster `focus_measure_full_res` | numerically identical, 26% cheaper |
+| ~~`climb_lucky_frames=1`~~ | **reverted to 3** — see below |
+| adaptive dive (§33) | robustness against starting far from focus |
+| `min_climb_improvement` gate | becomes MEANINGFUL once the scale stops collapsing |
+
+That last one matters: the gate compared a crushed late peak against an uncrushed first
+sample, so it was measuring scale collapse rather than climb quality. With the scale pinned
+at 1.0 it measures what its name says.
+
+`climb_lucky_frames` went back to **3** the same afternoon. Dropping it to 1 was justified
+purely by seam count -- a 3x longer climb spans 3x more seams -- and that argument died with
+`enable_handover`, because a seam now multiplies nothing. What remains is the reason the dwell
+existed: the noise it fights is ONE-SIDED. Motion blur, tracking drift and a patch clipped by
+something crossing the FOV can only make a frame worse, never sharper, so a max over three is
+the right estimator and an average would fold the damage in. The 42s climb is a cost the
+operator explicitly accepts.
+
+Residual cost, which lucky-imaging cannot fix: with the stitch off the curve mixes patches,
+and 3x the duration is 3x the patch changes -- each a step in the curve's LEVEL. A max within
+a position does nothing about a step between positions; `peak_fit_window=20` is what absorbs
+that. If the stitch is ever re-enabled the seam-count cost returns and this must be
+re-argued, not left at 3 by inertia.
+
+### 34.4 Before turning the stitch back on
+
+A single scalar cannot reconcile two patches whose own best-focus positions differ, and the
+field map says they do (tilt, §32/§33). The `af2-xcal` data shows the ratio climbing from
+0.55 on the flanks to 0.81 near focus -- position-dependent, exactly as tilt predicts -- and
+plateauing below 1, so there is a constant selection/content term on top. The upgrade path is
+an affine match (level AND slope), not a better-measured scalar. Do not re-enable on the
+strength of a cleaner ratio measurement alone.
+
+## 35. Where AF actually stands, end of 2026-08-13
+
+The day started with four consecutive AF failures and ended with moving runs landing within
+~200 counts of a frozen reference. Two findings did all the work, and both were cases of a
+mechanism being *believed* rather than *measured*.
+
+### 35.1 What was actually wrong
+
+1. **The handover stitch (§34).** A successful stitch multiplies the curve by a ratio biased
+   to 0.625; a failed one multiplies by nothing. Fixing the stitch so it worked is what broke
+   the system. Turned off.
+2. **The fit-window gate (§35.2).** Written the same morning to catch a wild extrapolation,
+   it also rejected good wide fits and fell back to the argmax -- which on curves this broad
+   is the worse estimator by a factor of four.
+
+Both were changes made to *how reliably* a mechanism ran, without checking whether its output
+was correct. Both looked right in unit tests.
+
+### 35.2 The argmax is not a peak locator on a broad curve
+
+The decisive measurement is two FROZEN-scene AF runs 17 minutes apart -- same motionless
+scene, so any disagreement is the estimator and nothing else:
+
+| | parabola fit | argmax |
+|---|---|---|
+| frozen 17:11 | raw **-1062** | -1076 |
+| frozen 17:28 | raw **-1039** | -1788 |
+| **disagreement** | **23c** | **712c** |
+
+The fits agree to 23 counts. The argmaxes disagree by 712. The second run's fit was rejected
+by the gate, so it parked on its argmax -- and the pair then read as 712 counts of focus
+drift that never happened. An earlier version of this write-up recorded exactly that phantom
+drift as a physical finding.
+
+The cause is geometric, not statistical bad luck. Half-width here is ~1700c, so a sample 700c
+off the peak still scores **0.87 of peak**. A few percent of noise on a flat top moves the
+single highest sample hundreds of counts. A parabola over `peak_fit_window=20` either side
+(41 samples) averages it away. This is the same conclusion the field map reached in §32.5 when
+its window went 3 -> 20; the gate undid it for AF.
+
+The gate is now three-way:
+
+| fit lands | action |
+|---|---|
+| inside its own fit window | use it (as before) |
+| outside the window, inside the swept range | **use it**, log a warning -- interpolation |
+| outside the swept range entirely | keep the argmax -- unbounded extrapolation |
+
+### 35.3 Measured performance, Bnei Brak, 400 mm worst case (speed 68.59)
+
+True focus raw ~= -1050, from the two frozen fits.
+
+| run | estimator used | parked raw | error | with the fit |
+|---|---|---|---|---|
+| 1 | fit | -1213 | 163c | -- |
+| 2 | fit | -1240 | 190c | -- |
+| 3 | argmax (gate fired) | -1759 | 709c | **59c** |
+| 4 | argmax (gate fired) | -1780 | 730c | **261c** |
+
+Every run that used the parabola landed within ~200 counts; every argmax fallback missed by
+~700. For scale, the field map's spread across the whole frame is 133c, so ~200c is roughly
+1.5x the rig's own field variation -- i.e. close to the floor of what "focus position" even
+means on this bench.
+
+Note the first run also reported `improvement=29.41x` and `contrast=0.97` against 0.03x
+earlier the same day. The optics were never the problem; the score was.
+
+### 35.4 Config as left
+
+| setting | value | why |
+|---|---|---|
+| `enable_handover` | **False** | §34 -- the stitch multiplies by a biased ratio |
+| `climb_lucky_frames` | **3** | one-sided noise (blur, drift, occlusion) wants a max |
+| `peak_fit_window` | 20 | broad curves; see §32.5 and §35.2 |
+| dive | adaptive, 4..12 bursts, stop at 40% of peak | §33 |
+| `min_climb_improvement` | 1.2 | meaningful again now the scale is pinned at 1.0 |
+
+### 35.5 Stitching WILL be needed -- constraints for whoever builds it
+
+Operator's call, and it is right: Bnei Brak is comparatively uniform terrain. The unstitched
+curve survives it because the level step at each patch change is small next to the hill. On
+varied terrain (Pardes Hana) the steps grow, and once a step approaches the hill's own height
+the parabola has nothing left to average. **Do not read §34 as "handover is a bad idea".**
+Read it as "the scalar-ratio implementation was measurably worse than nothing, on this
+terrain".
+
+Constraints any replacement has to meet:
+
+- **A scalar cannot work, in principle.** The two patches sit at different heights in the
+  frame, the field is tilted, so their best-focus positions genuinely differ. One number
+  cannot reconcile two curves whose peaks are in different places. The live data shows this
+  directly: the ratio is not constant, it climbs from 0.55 on the flanks to 0.81 near focus,
+  exactly as tilt predicts.
+- **There is also a constant term.** The ratio plateaus BELOW 1 even at focus, which tilt does
+  not explain. Best-of-N patch selection and raw content differences are the candidates. So
+  an affine match (level AND slope, the operator's suggestion) is the minimum shape -- and
+  even that assumes the ratio's position-dependence is locally linear.
+- **Per-segment peak fitting is not a way out.** ~13 patch changes per climb over ~50 samples
+  is ~4 samples per segment; no segment brackets the peak on its own. That is why
+  `_fit_peak_scale_free` failed on hardware in §30, and shortening the climb does not fix it
+  because that shortens the segments too.
+- **Consider fixing the metric instead of stitching its output.** A focus score normalised so
+  that it is invariant to a patch's intrinsic texture would not step at a seam at all, and
+  would need no reconciliation. Harder, but it removes the failure mode rather than
+  compensating for it.
+- **Validate against a frozen reference before trusting it, always.** The scalar stitch passed
+  every unit test it had and still destroyed the curve. The frozen-twin protocol in §35.2 --
+  two AF runs on one motionless scene, compare estimators -- costs about four minutes and
+  would have caught it immediately. Make it the acceptance test.
+- **Fail safe.** A re-anchor leaves `cumulative_scale` at 1.0 and is benign. Any stitch must
+  be demonstrably better than not stitching; if that cannot be shown on the bench, ship it
+  off.
+
+### 35.6 Still open
+
+- The tilt signature changed between 12:40 and 16:31 with nothing deliberately touched: +237c
+  vertical became 133c left-right (§33.3). Real -- tilt is a within-sweep comparison -- and
+  unexplained. The accompanying "2558-count focus shift" was NOT real; see §33.3.
+- Post-park drain drift, +16..+81 counts after "arrived" (§31). Small next to today's errors,
+  worth revisiting once they shrink.
+- The Pardes Hana vs Bnei Brak comparison, which is what all of this was preparation for.
+  `tools/af_rebase_runs.py` is already extended for it.
+
+## 36. OBSERVE - an instrument for the stitch, not another stitch (2026-08-16)
+
+### 36.1 Why the previous attempts could not have worked
+
+Every stitch tried so far (§30, §34) was fitted to data from a normal AF run, and a normal AF
+run cannot support the fit. Three things move together in it:
+
+| what | how it moves in a forward AF run |
+| --- | --- |
+| lens position | climbs, by design |
+| patch age | grows for the primary, resets at every handover |
+| patch height in frame | falls at a fixed rate, because the scene scrolls at a fixed rate |
+
+A patch travels across the sensor at a constant rate, so **its age IS its height** -- the two
+are the same number wearing different units. No amount of staring at `af2-xcal` distinguishes
+"the old patch scored low because it is old" from "because it had drifted to a part of the
+field that focuses differently" from "because the new patch is simply better texture". The
+ratio was 0.625 and the cause was unknown, so the correction was a guess.
+
+**A magnitude check, and why the obvious version of it is wrong.** Tilt had been blamed for
+part of the bias, and a quick estimate seemed to rule it out: two patches separated by the
+237c vertical tilt, on curves of half-width ~1700c, differ by `exp(-ln2 * (237/1700)^2)` =
+0.987, about 1.3% -- fifteen times too small for the observed 19% deficit. **That estimate is
+wrong, and wrong in an instructive way.** It evaluates the effect at focus, where it is
+identically zero by construction.
+
+Two Gaussians with peaks `p_o`, `p_n` and half-width `hw` have ratio
+
+```
+ratio(x) = exp(-ln2 * (p_n - p_o) * (p_n + p_o - 2x) / hw^2)
+```
+
+which is **1 at the midpoint of the two peaks and departs from 1 linearly with defocus**, not
+a constant offset. At the dive floor, ~2500c below focus, a 237c separation gives
+`exp(-ln2 * 237 * 5000 / 1700^2)` = **0.75** -- the right order for the 0.55-0.66 measured on
+the flanks. So a peak-position difference between patches predicts exactly the observed
+*shape*: ratio -> 1 at focus, falling away on the flanks.
+
+The design consequence is the important part. If two patches peak at different places, **no
+scalar can reconcile them** -- the mismatch is a shift along x, not a scale in y, and a
+multiplier fitted at one lens position is wrong at every other. That is a sufficient
+explanation for why every scalar stitch degraded the curve.
+
+### 36.2 What was built
+
+**OBSERVE** (`AFStateV2.OBSERVE`, "Observe" button next to "Field map"). Holds the lens still
+and scores several tracked patches on every frame, one CSV row each. It is a measuring
+instrument, not an autofocus: it has no peak, no park, and issues **zero pulses** except an
+optional offset move that it walks back on exit.
+
+Holding focus fixed removes one of the three variables. Running the scene in **both**
+directions removes the confound between the other two: `--dir down` reverses which end of the
+frame an old patch sits at while leaving its age untouched, so
+
+- ratio roughly unchanged under reversal -> age or content drives it, and a position-indexed
+  correction cannot fix it;
+- ratio flips about 1.0 -> pure field position, and the field map already measures it;
+- ratio moves part way -> both, and the difference is the split.
+
+Supporting changes:
+
+- **`_want_objects()`** replaces the old refill gate. Multi-object tracking was welded to
+  `enable_handover`, so turning the stitch off (§34) also turned off the only way to see two
+  patches at one instant -- exactly the data needed to design a stitch. Observation and
+  correction are now separate. Behaviour is unchanged for both handover settings.
+- The refill's overlap check now runs against **every** live patch, not just `objects[0]`.
+  With three alive, two sharing pixels would make their ratio meaningless.
+- **`_af_full_res_multi(rois)`** in `app.py` generalises the old `_af_full_res_pair`; the pair
+  is now its N=2 case. All N crops come out of one held full-res slot, so the scores are
+  same-frame by construction and carry an identical pinning lag that cancels in any ratio.
+- **`host/capture/observe_log.py`** streams the rows. It disables itself on the first OSError
+  rather than raising -- the OrthoSim GT logger did raise, into the repaint loop, and froze
+  the display for 12 hours while the sim ran on underneath (error 6).
+- The same rows are written during a **normal AF run** too, from scores the climb already
+  computed (no extra cost). On its own an AF run still cannot attribute anything, but
+  differenced against a fixed-focus observation at the same speed and direction, it can.
+
+Cost: ~43 ms per patch, so 3 patches is ~129 ms of a ~213 ms budget and the frame rate drops
+to ~3 fps. In a fixed-focus diagnostic that means fewer samples per traverse, not a worse
+measurement.
+
+### 36.3 Configuration and analysis
+
+Env vars, read at launch, recorded in the CSV header:
+
+```powershell
+$env:IRON661_LOG_DIR       = "C:\Iron661Logs"   # NOT Google Drive (error 32)
+$env:IRON661_OBSERVE_OFFSET = "0"               # counts from where the lens sits; +/-1500
+$env:IRON661_OBSERVE_OBJECTS = "3"
+$env:IRON661_OBSERVE_SECONDS = "90"
+```
+
+`tools/observe_report.py` reads the CSVs. It infers scroll direction from the data rather
+than trusting a flag, and prints: within-patch decay (content cancels, so this isolates
+age+position for one patch), the same-frame new/old ratio bucketed against separation and
+against lens position, score vs height pooled, and -- given a forward and a reverse CSV -- the
+decomposition into a direction-independent factor and a position-dependent one.
+
+```powershell
+py -3 tools/observe_report.py --dir "C:\Iron661Logs"          # list what is there
+py -3 tools/observe_report.py FWD.csv REV.csv --focus -1200 --png obs.png
+```
+
+`tools/test_observe.py` covers it: OBSERVE issues no pulses, the live-patch count follows
+`_want_objects` (this one fails with the old gate: "wanted 2 patches alive, got 1"), every
+patch is scored off one frame, the offset is walked back, a dead log sink does not kill the
+run, and the report separates a synthetic pure-position cause from a synthetic pure-age one.
+
+### 36.4 Run protocol
+
+Per scroll direction, three lens positions. Keep speed at **68.59** throughout (the 400 mm
+worst case, §27) so the results transfer to the runs being debugged; motion blur is itself a
+candidate cause, so a speed sweep is a follow-up, not a mid-protocol variable.
+
+1. **Frozen twins.** Freeze the scene, run AF twice. The fits should agree to ~25c (§35.2).
+   If they do not, stop and find out why before spending an hour observing. This value is
+   `--focus` for the analysis.
+2. **Unfreeze** and let it scroll. Observe at offset 0, then at +1500, then at -1500,
+   relaunching with the env var between each.
+3. **Relaunch OrthoSim with `--dir down`**, leaving the AF lead selector on **Auto** so
+   `leading_edge_from_motion` picks the opposite edge by itself. No code change is needed:
+   `--dir` flips the visual scroll without touching speed, so the `%`-based wrap, the
+   forward-integrating distance and the unsigned codec are all unaffected.
+4. Repeat the three observations.
+5. One normal moving AF run in each direction. These log the same CSV automatically.
+
+### 36.5 What this can and cannot settle
+
+Separable afterwards: field position vs patch content vs patch age; whether the ratio is a
+level offset or a genuine difference in peak position; whether a scalar, an affine match, or
+a texture-invariant metric is the right correction.
+
+**Not** settled: whether the chosen correction helps. That still needs the frozen-twin
+acceptance test of §35.5. The scalar stitch passed every unit test it had and still destroyed
+the curve.
+
+### 36.6 The first OBSERVE log had a bug in the instrument, not a finding (2026-08-16)
+
+The first real log (`Iron661_observe_20260816_145717.csv`, 435 rows over 37 s) showed
+**frame-global 20x score spikes** on ~8% of frames — every live patch lifting together, on a
+scene that was scrolling but at a lens position that never moved. It was read as a display
+artifact of the OrthoSim panel (a tear or a mid-exposure refresh) and nearly written up as one.
+
+It was `_observe_scores` falling back to `_coarse_pair_score` whenever the full-res batch was
+stale. Coarse runs **~16x larger on this scenery** (50x on synthetic), so those rows were not
+noisy samples of the series, they were samples of a **different metric**. A stale batch is
+stale for every patch at once, which is exactly why the contamination looked frame-global and
+therefore physical. `_score_primary` had the rule right — stale means return `None` and skip
+the sample — and the new method broke it one layer down. Scoring one curve with two metrics
+is now the third distinct bug of that shape in this project, after coarse-vs-full-res in the
+climb (§27) and in the cross-cal ratio (`_pair_scores`).
+
+**What settled it was saving the scored crops to TIF with the score in the filename.** The
+number in the filename is computed on the pixels in the file, so the files are a copy of the
+series that cannot contain a fallback. Over the same 37 seconds:
+
+| | n | min | median | max |
+|---|---|---|---|---|
+| saved crops (full-res by construction) | 451 | 131 | 1313 | **6236** |
+| CSV rows below 4x median | 400 | 131 | 1299 | **4506** |
+| CSV rows above 4x median | 35 | **6236** | 21362 | 39226 |
+
+The first two rows are the same population. The third is **disjoint** from them — nothing
+between 4506 and 6236. A physical artifact varies with how badly it hits and produces a
+continuum; a clean gap means a switch, and the only switch in the path was the metric.
+
+Worse than random, and the reason this mattered rather than just being noise: the fallback was
+**biased towards young patches**. 24% of age-0 rows were contaminated against 4–8% at most
+other ages, because a patch newly added to the object list is not yet in the pinned ROI set,
+so its first score is the one most likely to come back stale. Patch age is one of the two
+variables OBSERVE exists to separate, so the bug's error was correlated with the signal — a
+new-over-old ratio computed from that log would have been wrong in a consistent direction and
+looked like a real age effect.
+
+Lessons, in the order they cost time:
+
+- **A fallback that changes metric is worse than a gap in the data.** A missing frame is
+  visibly missing. A frame scored with the other ruler is invisible until something disjoint
+  shows up in a histogram — and `max()` over the series (lucky imaging, §27.1) selects the
+  fallbacks preferentially, so the contamination is exactly what the AF would have acted on.
+- **Bimodal is a mechanism, not a magnitude.** The tell was never the 20x, it was the gap.
+- **Give a diagnostic a second channel that cannot share the first one's bug.** The TIF names
+  cost an afternoon and settled in one query a question the CSV could not answer about itself.
+- The self-check is `test_a_stale_full_res_batch_logs_nothing_rather_than_a_coarse_score`. It
+  was verified to **fail** against the pre-fix body — a regression test that passes either way
+  proves nothing, and this one silently did not run at all at first, because
+  `tools/test_observe.py` had a hand-maintained list of tests in `main()`. That list now
+  collects `test_*` from the module.
+
+### 36.7 The crop filenames said `p1` and `p1` was not a patch (2026-08-16)
+
+Second bug found the same way, in the same afternoon, in the code written to find the first
+one. `_save_af_crops` tagged each file with its **loop index** over the crop batch.
+
+Terminology first, because it is the whole bug. During AF/OBSERVE the engine pins a *list* of
+ROIs on the pipeline (`set_preview_rois`) and gets back a list of full-res crops in the same
+order, all cut from one held frame. A position in that list is what pipeline.py calls a
+**pane** — the channel was built for the two-object split preview, one per UI pane; OBSERVE
+just pins `observe_objects` of them. Do **not** call these "slots": in this codebase a slot is
+an index into the shared-memory pool of 244 MB full-res frame buffers (`SHM_POOL_SLOTS`,
+`slot_view`, `_submit_slot`), and both words appear in one sentence in pipeline.py — crops are
+taken "from the same held full-res *slot*" into *panes*.
+
+The engine rebuilds that list from `self._rs.objects` every frame, so a pane rebinds the moment
+an object retires and the list shifts up. Measured on the 145717 run: **all 29 objects passed
+through all three panes.** A filmstrip built by filtering filenames on `p1` was therefore a
+montage of a dozen unrelated patches, and it read as "tracking is broken, these are not even
+the same scene".
+
+Tracking was fine. Joining the crops back to the CSV on the score (387 of 435 rounded scores
+are unique, which makes it a usable key) and regrouping by `oid` gives one coherent object per
+strip — the same building complex drifting up the crop over 16 frames. The measured lifetime
+matches what was designed: **median 16 frames per object, range 3–18, 3 alive per frame, 29
+objects in 154 frames.**
+
+`_full_res_multi(rois)` is now `_full_res_multi(rois, oids)` and the tag is `o{oid}` (the N=2
+cross-cal pair passes no oids and keeps `p{i}`). Self-check:
+`test_the_score_callback_is_told_which_OBJECT_each_roi_belongs_to`, which asserts the highest
+label equals the engine's newest oid — a pane index cannot exceed `observe_objects-1`, so that
+equality can only hold for real oids. It has to run long enough for a patch to actually retire
+(the synthetic scene scrolls 3 px/frame, so 60 frames retires only one object and pane and oid
+are indistinguishable); the test asserts that precondition rather than trusting a frame count.
+
+Two lessons, one technical and one about writing this stuff down:
+
+- **An identifier that is positional in a list whose membership changes is not an identifier.**
+  Only label a file with something that outlives the container it arrived in.
+- **Do not coin a term that the codebase already uses for something else.** The first draft of
+  this section called panes "slots" throughout, which would have left a reader unable to tell
+  a tracked-patch position from a DMA frame buffer.
+
+### 36.8 The crop batch was attributed one object off, once per patch lifetime (2026-08-16)
+
+Third bug of the day, same shape as the first two, and the only one that also corrupts the
+**live climb**, not just the diagnostic.
+
+Crops lag the pin by one frame, so a batch answers the object list as it was on the previous
+call while the caller zips it against the list it holds now. The guard for that compared the
+**count**:
+
+```python
+if len(got) != len(rois):      # "same count means the same request"
+    return None
+```
+
+It is not the same request. A patch retiring while another is born on the same frame leaves
+the count at N and shifts every member: `[1,2,3] -> [2,3,4]`. Measured on the 145717 log,
+consecutive logged-frame pairs break down as 78% identical set, **13% same count with a
+different set**, 9% different count (the only case the old guard caught). 13% is about once
+per patch lifetime, so *every* patch received, at least once, a score belonging to its
+neighbour — in the OBSERVE log and in `_pair_scores`, whose ratio the stitch multiplies into
+`cumulative_scale` at every handover. A cross-cal pair that turns over while staying size 2
+has its two scores **crossed**, which inverts that frame's ratio.
+
+How it surfaced: an operator looked at a per-object filmstrip and said the frames were not all
+the same object. They were right. The NCC matrix over one object's 17 crops showed three
+distinct scene clusters (`{29,34}` at 0.49, `{30,32,38}` at ~0.52, `{31,35,36,42,43,44}`), each
+member correlating ~0.04 with the other clusters. The frames where the offline join found the
+crop's own ROI disagreeing with the logged `y_centre` — 28, 33, 40 — are exactly the
+generation-change frames. The crop label was right (it comes from the pinned list); the logged
+score and oid were wrong.
+
+Fixed by comparing identity instead of size: `_af_full_res_multi` keeps the labels the pending
+batch answers and drops the frame when the request has changed, and `_pair_scores` now passes
+its two oids so the N=2 path is guarded too. Cost is one skipped sample per turnover. Check:
+`test_a_lagging_crop_batch_is_dropped_when_the_object_list_turned_over`, which drives the real
+method with a stub owner, because the lag lives in the app rather than the engine.
+
+**Do not trust any pre-fix OBSERVE log or cross-cal ratio**, including the 13:26/13:29/14:56/
+14:57 CSVs. The 1.6x new-over-old ratio has now been measured through three separate identity
+and metric faults and has to be re-measured before it is interpreted.
+
+### 36.9 The panel's pixel grid is 20% of what the focus metric scores (2026-08-16)
+
+Asked whether visible "duplication" in the saved crops was a camera or a screen effect, three
+tests on the pixels:
+
+- **No bit-identical rows** in any crop examined. That rules out a digital copy anywhere in
+  camera, grabber or pipeline — those repeat bytes exactly.
+- **No secondary autocorrelation peak.** An FFT autocorrelation with the central lobe
+  suppressed found nothing isolated; the apparent peaks all sat on the shoulder of the central
+  lobe. So no rigid repeat of content within a frame.
+- **A very strong periodic grid.** Every crop carries the same two spectral spikes at a **2.5
+  px period** in both axes (in green-plane pixels, so ~5 sensor px per screen pixel), at
+  340–620x the spectral noise floor. That is the LCD's own pixel matrix, resolved by the
+  camera. It is a screen effect, it is present in every frame, and it is not motion-dependent.
+
+Those spikes hold **~20% of the fine-detail energy** in the band `focus_measure_full_res`
+scores. So a fifth of the focus signal is the sharpness of the panel's pixel structure rather
+than of the simulated scene. That is not automatically wrong — the panel surface *is* the
+target plane — but it means the metric is substantially insensitive to scene content, and any
+position-dependent moiré between the panel grid and the Bayer/green sampling would appear as a
+field effect with no optical cause. Worth checking before more of the cross-object bias is
+attributed to tilt.
+
+The perceived duplication was neither camera nor capture: at 1:1 the crops are clean and
+single. Downscaling a 2.5 px grid for viewing aliases it into blotchy moiré (the filmstrip
+tiles were reduced 4x), and the *repeated scene content* across tiles was §36.8's
+misattribution. **Inspect these crops at 1:1.**
+
+**Still open, and now separable from the above:** the saved crops show two real content
+effects that the score does track and focus does not. Patches ride off the lit area of the
+panel into the black surround (the top-scoring crop in the run is mostly black with one
+razor-sharp lit edge across it), and some frames carry a black band from the panel refresh.
+Both put a hard step edge in the crop, both raise a Laplacian score, and neither is focus.
+That is a rig-geometry and patch-lifetime question — see §36.4 before trusting any run where
+a patch leaves the lit region.
+
+Per-object strips (§36.7) locate it in the **lifetime**: for oid 5, frames 29–39 are clean
+scenery and the last three frames of its life, 41–44 at y 471→176, are part black band with a
+row of bright blocks. So the contamination is concentrated at **end of life**, as the patch
+reaches the top edge of the lit panel. It did not spike the full-res score there (1122, 1400,
+1142 against a ~1300 median), so it is a smaller effect than the metric-mixing bug was — but
+it is systematically tied to age, which is one of the two variables OBSERVE exists to measure.
+Trimming the last few frames of each patch, or shrinking the tile region to the fiducial quad
+as the field map already does (§36.4), is the obvious guard.
+
+### 36.10 The rig now steps instead of scrolling, because the panel ghosts (2026-08-16)
+
+The operator saw doubled crosswalk stripes in the saved crops — one bright, one black — and
+was right. What made it diagnosable was a *negative* observation from a year of bench work:
+
+> Throughout our testing, with frozen scenes and printed pages, I've never seen duplication
+> on a static scene.
+
+That single fact kills every static explanation at once. A signal-chain defect (CDS
+misalignment, cable reflection, FPGA sharpening) is content-independent and would smear a
+printed page. A second real road marking would be there when the scene is frozen. Optical
+ghosting would follow the lens, not the motion. Whatever it is, **motion is a precondition**.
+
+Measured, on `145722_241`: the dark copy sits 1600–3000 counts *below* local background, and
+the offset is 18–23 px by three estimators (per-row bright-peak-to-dark-trough spacing, the
+variance-minimising global shift, blob-pair magnitudes). At the run's scroll rate — 102 coarse
+px/frame over 406 samples at 4.21 fps, so ~858 green px/s — that offset is **21–27 ms of scene
+motion**, i.e. one panel refresh (20 ms at 50 Hz, 16.7 at 60).
+
+So the duplicate is the *previous refresh's* content. Two consequences:
+
+- It is not the camera integrating two panel frames. Exposure is **250 µs**
+  (`DEFAULT_CAMERA_CONFIG`, `TriggerMode On` / `TriggerSource Line1`), which cannot span two
+  refreshes. The camera catches the panel **mid-transition**, and the below-background polarity
+  is LCD overdrive undershoot — a pixel driven past its target on a bright-to-dark step.
+  Transitions only exist when content moves, which is exactly the gate the operator observed.
+- A static scene hides it perfectly: both copies land in the same place. Every clean frozen
+  test was clean for the wrong reason.
+
+**Direction is unmeasured.** A dashed line only constrains the component across the line, so a
+mostly-vertical shift of a tilted stripe reads as lateral; compact bright/dark blob pairing
+came back with a flat direction histogram (pure texture). An earlier claim in this session that
+the offset was *lateral* was an artifact of line geometry and should not be relied on.
+
+> **Correction, 2026-08-19 (§36.12): stepping did NOT remove it.** It made the artifact rare
+> (~6% of frames) and far worse when it lands, because a step mixes two scene positions ~700 px
+> apart instead of ~20. The timing margin quoted below is real but irrelevant — the failure is the
+> step's *phase* against the shutter, not the time available. Fixed by stepping on alternate frames
+> and refusing to score the frame in between.
+
+**The fix removes it rather than characterising it.** The rig is now stepped, not scrolled:
+
+- `orthosim_codec.STEP_HOST/STEP_PORT` — loopback UDP, one datagram per captured frame whose
+  payload is the measured inter-frame interval in seconds.
+- `app.py::_orthosim_step` — sent from `_on_raw_focus_frame`, the earliest once-per-frame point
+  already filtered to the active camera. On `frame_acquired` a two-camera rig would step twice
+  per frame. Fire-and-forget, non-blocking, `OSError` swallowed: it sits in the per-frame path
+  of a rig where stalls are expensive, and the display app must be optional.
+- `orthosim_gui.py::StepListener` + `orthosim_core.step_dt` — the display holds one scene
+  position until nudged, then advances. Everything in the rig already integrated a single
+  `dt` (scroll offset, distance, scale ruler, ground-truth CSV), so feeding it a *virtual* dt
+  needed no new motion code and keeps all four consistent by construction.
+
+Why the measured interval and not the configured 4.2 Hz: a conflated or late frame widens the
+real gap, and the simulated aircraft should cover that ground rather than drift away from the
+ground truth it is logging. Clamped per nudge to 0.01–2.0 s so a debugger breakpoint cannot
+teleport the scene. Pausing *drains and discards* pending nudges — banking them would replay
+the backlog as one huge jump on un-pause, a worse smear than the one being removed.
+
+Bonus: `tick` is now incremented once per camera frame, so the tick in the optical bar **is**
+the frame index. A frame can be tied to a scene position by reading it out of the image, with
+no clock correlation.
+
+Timing margin is ~1000x: 250 µs of exposure inside a 238 ms trigger period, against a panel
+needing 2–3 refreshes (35–50 ms) to settle. The step is issued right after a frame arrives, so
+it lands at the start of that gap.
+
+**Two limits to know.** The focus tap only runs in the focus modes and only for the active
+camera (`set_focus_tap(in_focus and is_active)`), so **in M0/M1 the scene now stands still**
+where it used to scroll; and the tap is capped at 5.5 Hz (`FOCUS_TAP_MIN_INTERVAL_S`), above
+the 4.2 Hz trigger, so every frame nudges today but a faster trigger would let two frames share
+one scene position — harmless (still ghost-free), but the per-frame correspondence loosens.
+The HUD spells out `WAITING FOR CAMERA` when no nudges have arrived, because a stepped rig with
+no capture app attached looks broken rather than idle.
+
+**Every moving-scene OrthoSim measurement taken before this change carries the ghost**, which
+adds real contrast at a ~20 px scale that the Laplacian metric scores — inflating scores on
+moving scenes and not on frozen ones, which is precisely the comparison the freeze test rests
+on. Re-run the §36.4 protocol on the stepped rig before drawing conclusions from the earlier
+forward/reverse or moving-AF logs. In flight there is no panel and no refresh, so none of this
+exists on the real target.
+
+### 36.11 The bench duplication was the room lights. The camera is exonerated (2026-08-18)
+
+The motor rig — a spinning arm in front of the lens, no display anywhere in the optical path —
+**reproduced the duplication**, which looked at first like a second, screen-independent
+mechanism. It is not a camera defect. It is **100 Hz mains flicker** from the ceiling LEDs, and
+an exposure sweep settled it in two minutes.
+
+The geometry said "lit twice" before any sweep was run. On
+`Duplications/Cam2439008_20260818_Project_152044_L3_S3_F2.tif` (10,000 µs, gain 7) the two copies
+of the arm **converge at the hub and diverge toward the tip** — they differ by a *rotation about
+the pivot*, so the arm was imaged at two discrete angles — with clean background between them,
+and the static board, screws and mount single and sharp in the same frame. A signal-chain defect
+is content-blind and would have doubled the screws too. Only a light that goes dark between two
+instants doubles a moving object while leaving static ones untouched, because static objects are
+in the same place at both instants.
+
+Mains-driven lighting modulates at **twice** mains: 100 Hz on 50 Hz, one flash every **10 ms**.
+So copies ≈ `1 + exposure_ms / 10`, and the 10,000 µs frame that started this was exactly one
+flicker period — two flashes, one near each end of the shutter. The prediction was tested and
+held:
+
+> I tried it and it disproved my theory. At 40 ms I got multiple duplications. So the camera is
+> exonerated.
+
+**The only duplication still open is the one in flight**, and it needs its own explanation:
+sunlight does not flicker, and flight exposure is **250 µs**, far too short to span two flashes
+of anything. It is parked — assumed unfixable for now and not the main driver of focus failure —
+so no bench test currently in flight-configuration speaks to it. Do not reach for the flicker
+explanation there.
+
+**What this leaves behind for the screen rig, which is still live.** Flicker cannot *duplicate*
+anything in a stepped run, because duplication needs motion during the exposure and the stepped
+scene holds still. What it still does is change **how much light lands per frame**: unless the
+exposure is an integer multiple of 10 ms, each frame catches a different fraction of the flash
+train, at a phase that walks frame to frame. The panel's own refresh and any backlight PWM add
+a second modulation sampled at a random phase. A 250 µs exposure on an LCD under mains light is
+therefore a brightness lottery, and it is a live suspect for the frame-to-frame score scatter in
+§36.4's logs.
+
+Note what does **not** need averaging in a stepped run: the 60 Hz panel refresh. A static scene
+is redrawn with identical values every refresh, so the sampling phase changes nothing and any
+scan banding is constant frame to frame. Only *illumination* modulation — mains flicker and
+backlight PWM — varies what a short exposure collects. So the fix is to remove the flicker rather
+than to integrate over it: **lights off** (the panel is self-emissive, room light only adds
+flicker-modulated veiling glare and surface reflections) and **monitor brightness at maximum**,
+where most panels run the backlight at full duty and stop modulating. If the room lights must
+stay on, make the exposure an integer multiple of **10 ms** and drop gain and panel brightness to
+keep off the saturation rail.
+
+### 36.12 The stepped rig did not remove the ghost, it concentrated it (2026-08-19)
+
+**§36.10's claim that stepping removes the panel ghost is wrong.** Stepping made it rare and
+much worse. The operator, in a dark room on the stepped rig, saw it immediately:
+
+> I'm certain of what I'm saying, here, there's a crosswalk overlaid on a building.
+
+Confirmed in the sensor data, not on the display: their screenshot matched at **0.956** (1:1, no
+rescale) inside `G:\Project\focus\Cam2439008_20260819_Project_focus_141845_919_o0_y1866_s185.tif`
+at pixel (587, 148). The frame is two pieces of the city added together; the frame before it, same
+object, same ROI, is clean.
+
+The arithmetic confirms it independently and is the cheapest detector. Object 0 sat at a **clamped
+ROI** (`y1866`) for three frames and scored **344, 337, 185**. A 50/50 blend of two unrelated
+textures preserves the mean and halves the Laplacian energy, so a blended frame should score ~0.5x
+— 185/337 = 0.55. Across the run, **6% of scored frames** show a single-frame dip to 0.55–0.70x
+with both neighbours recovering.
+
+**Mechanism: the panel caught mid-transition, exactly as §36.10 diagnosed — but a full step wide.**
+250 µs cannot span two refreshes; what it catches is LCD pixels physically partway to their new
+values during the ~10–20 ms transition, so the panel itself is displaying a mixture. Under
+continuous scroll the two mixed positions were ~20 px apart and it read as a subtle edge ghost. A
+step moves the scene ~700 full-res px at once, so the same transition now superimposes an entirely
+different neighbourhood.
+
+**It is a phase problem, not a duration problem.** There is ~188 ms of slack in a 238 ms period, so
+§36.10's timing margin was real and irrelevant. `_orthosim_step` fires from `_on_raw_focus_frame`,
+i.e. when a frame reaches Python after readout and queueing — an unbounded delay downstream of a
+hardware trigger the app never observes. Measured: frame intervals 0.172–0.578 s around a 0.235 s
+median, 23% of frames advancing >1.5x the median step and ~10% not at all. The transition therefore
+lands at a free-running phase, and `transition / period` ≈ 15/238 ≈ 6% of the time it lands inside
+an exposure. Measured 6%.
+
+**Fix: alternate, so the phase stops mattering.** `_orthosim_step` now steps on every *other* frame
+and marks the frame in between `_af_frame_unsettled`; `_af_full_res_multi` consumes that batch but
+refuses to report it. Costs half the frames — cheap next to a halved score that is
+indistinguishable from real defocus. Scene speed is preserved by measuring the interval from the
+last step actually **sent**, so each step carries two frame periods rather than running the
+simulated flight at half the configured speed; halve `--speed` to trade that back for smaller jumps
+and more trusted samples per object. The end-of-run log gains `unsettled=`, which should be roughly
+half of `fresh`.
+
+One dependency to know: the alignment assumes the preview-crop batch arrives *before* the engine
+tick for the same frame (documented at `_af_crop_rois`), which makes the frame after a step the one
+whose score is corrupt. If a future run still shows ~6% dips on trusted frames, the flag is off by
+one and the skip needs shifting — the counter and the dip test above are enough to tell.
+
+**Methodology warning, because two plausible searches both returned false negatives here.** Sorting
+162 crops by lowest contrast missed it, and so did scanning for an off-zero autocorrelation peak:
+natural imagery self-correlates most strongly at small lags, so such a scan measures texture, not
+duplication, and it reported "no doubling" over a set that demonstrably contained it. This is the
+second time an autocorrelation/cepstral approach has produced a confident wrong answer on this
+question (see §36.10). What worked was mundane: template-match the operator's own screenshot to
+find the offending file, then read the score series of one object at a fixed ROI.
+
+### 36.13 The field map was measuring the wrong 40% of the frame (2026-08-31)
+
+**The tile cross was not centred, and the trim meant to keep it off the ground-truth bar was cutting
+the clean end and leaving the bar inside.** The operator saw it before the arithmetic did:
+
+> Notice that field map is still not symmetric.
+
+`_field_map_box` trimmed `edge_band` (25%) from the **single edge named by `exclude_edge`** — and
+`exclude_edge` names a **screen** edge, while the optics **invert**. OrthoSim draws the bar at the
+screen's top; it images at the frame's **bottom**. So `exclude_edge="top"` trimmed clean ortho off
+the frame's top and left the bar sitting inside the tile box, and the fix of flipping it to
+`"bottom"` merely moved the same asymmetry to the other end. Cross centre landed 9.2% of frame
+height off centre, against 9.5% predicted from the three compounding insets
+(`interior_inset` 0.12, `edge_band` 0.25 one-sided, `FieldMapConfig.inset` 0.15).
+
+**Two costs, and the second is the one that matters.**
+
+*Baseline.* The five tiles spanned only **40%** of the frame height, so the reported vertical tilt
+was a fraction of the real one. The two runs bear that out: 301c with the trim at one end, 525c at
+the other. The number tracked the geometry, not the optics.
+
+*Validity.* `five_tile_rois` separates a **tilted** subject plane (top and bottom fall on opposite
+sides of centre) from a **curved** field (both the same side). That reading is only true if top and
+bottom are **equidistant** from centre. An off-centre cross samples an asymmetric pair of a curve
+and returns it as tilt, so the two failure modes were not actually separated at all.
+
+**Fix: one symmetric inset, in place of three insets and an orientation guess.** `inset_box()` in
+`field_map.py` shrinks the box by `box_inset` (0.13) at **both** ends of **both** axes; the
+no-fiducial fallback now starts from the whole frame rather than an `interior_inset` box, and
+`FieldMapConfig.inset` drops 0.15 → 0.05. Trimming both ends clears the bar wherever it images, so
+`exclude_edge` no longer enters the field map and the inversion cannot bite again. Vertical baseline
+**40% → 67%** of frame height, cross centred to ±2 px. Guarded by
+`test_the_tile_cross_is_centred_and_clears_the_bar_at_either_end`, which asserts the symmetry, the
+bar clearance at *either* end, and a >60% baseline.
+
+**Why this replaced the three-parking observe plan.** That plan needed the operator to hand-jog to
+focus and hold a known lens position across three 90 s runs, which the 1290c backlash (§35) makes
+unreliable — a raw count means a different optical position depending on the approach direction.
+A field map does its own dive-and-climb and reports tile vertices **relative to each other within
+one sweep**, so backlash never enters. The operator's call:
+
+> I think this is the wrong path, it's too complicated. Make field map symmetric and close to the
+> edges, then we'll run it on several frozen frames to get a separation of the screen and optics.
+
+**The separation this buys, which is the point.** Repeat the sweep on several *different* frozen
+scenes and the two effects fall out along different axes:
+
+- **Vertex** differences between tiles are **optics**. A lens's best-focus position at a field point
+  cannot depend on what content sits there, so a vertex pattern that repeats across scenes is a real
+  optical field tilt/curvature; one that wanders with content is not optical at all.
+- **Peak-height** differences between tiles — each measured at that tile's **own** best focus, so
+  defocus is already divided out — are **not focus**. Whatever remains is panel non-uniformity,
+  backlight, vignetting or content. Content is what the repetition cancels: average each tile's
+  own-peak score over scenes and the position-fixed residual is the screen's share.
+
+A single sweep cannot do this, because one scene's content difference between tiles is as large as
+the effect being chased (own-peak scores in the 13:57 run: top 2450, bottom 2039 — a 1.20x that is
+indistinguishable from texture luck). Compare **tile-minus-centre within each run**, never absolute
+counts: each sweep re-zeros its own axis and returns downward, so the run zero drifts (12373 →
+12537 observed) while the differences do not.
+
+### 36.14 The y-gradient is a real tilt sampled off centre — but whose tilt? (2026-08-31)
+
+**Read §36.14.1 before quoting this section.** The six sweeps separate **content and rendering**
+from **geometry**. They do *not* separate the screen's mounting from the camera's alignment, and an
+earlier draft of this section claimed they did.
+
+**Six field maps, six different frozen OrthoSim scenes, 131 samples each**
+(`host/Session logs/Iron661_fieldmap_20260831_14{5211,5338,5438,5554,5644,5747}.csv`, 5/5 tiles
+trusted in all six). Analysis script `tools/_fm_scenes.py`; presentation in
+`canvases/field-map-optics-vs-screen.canvas.tsx`.
+
+**Vertex, tile minus centre (counts). Repeatable across content ⇒ optics.**
+
+| tile | 1 | 2 | 3 | 4 | 5 | 6 | mean | stdev | CV |
+|---|---|---|---|---|---|---|---|---|---|
+| top | +592 | +527 | +566 | +500 | +516 | +506 | **+534c** | 37c | **7%** |
+| bottom | −157 | −150 | −105 | −84 | −77 | −65 | −106c | 39c | 36% |
+| left | +701 | +757 | +951 | +859 | +936 | +803 | **+834c** | 99c | **12%** |
+| right | +78 | −21 | +232 | +86 | +244 | +61 | +113c | 104c | 91% |
+
+Vertical: tilt ±320c, curvature +214c, top-to-bottom span **+641c**. Horizontal: tilt ±361c,
+curvature +474c, left-to-right span +721c.
+
+Six independent scenes agreeing to 7% on the top tile leaves no room for a rendering or panel
+artifact — content cannot move a vertex. **The field tilt is real geometry** (see §36.14.1 for what
+that does *not* settle). Curvature is positive
+on both axes (all four edges focus at *higher* counts than centre), which is what a **flat** target
+does: its edges are geometrically farther from the lens. The magnitudes agree — 474/214 = 2.21
+measured against (4462/3174)² = 1.98 predicted from the tile offsets alone — so the curvature term
+is mostly "flat target at an angle", which flight shares and which is not a defect. The **tilt** is
+rig alignment; in flight its equivalent is aircraft attitude.
+
+**This accounts for the 2× y-decay in the OBSERVE runs, with no extra mechanism.** Divide each
+tile's curve by its own peak and content cancels exactly, no peak shape assumed. The resulting
+top:bottom ratio as a function of where the lens is parked, relative to the *centre* tile's best
+focus:
+
+| park | −500 | −250 | 0 | +250 | +500 | **+750** | +1000 | +1250 | +1500 | +2000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| top ÷ bottom | 0.64 | 0.65 | 0.91 | 1.29 | 1.65 | **2.05** | 2.35 | 2.49 | 2.52 | 2.00 |
+
+Park ~+750c above centre focus and the measured ratio is **2.05** — exactly what the moving runs
+showed. Parking above centre focus is what happens whenever AF converges on a low-y object and then
+scores everything else from there. **The gradient was never a display artifact.**
+
+**One open lead, deliberately not called a finding.** Own-peak score (each tile at its *own* best
+focus, so defocus is divided out, normalised to the sweep's geometric mean so exposure drift
+cancels) still shows top:bottom = **2.07 ± 0.45** over the six scenes. If real that is serious: a
+perfectly focused patch at the top would score twice a perfectly focused patch at the bottom, which
+breaks cross-object score comparison and handover cross-calibration *regardless of focus*. But the
+per-scene values run 0.77 → 3.5, so content still dominates and six scenes cannot pin it — worse,
+all six came from one scroll path and ortho content self-correlates over long distances, so the
+scatter probably *understates* the true content noise.
+
+"Position-fixed" still mixes three things a screen cannot separate: off-axis lens MTF, magnification
+differences from the tilt, and the LCD's viewing-angle contrast falloff. One hint already argues
+against the panel — a viewing-angle effect is symmetric in field angle and would hit left and right
+equally, and it does not (left 0.63, right 1.05). Combined with left's other symptoms (largest
+vertex offset at +834c, lowest contrast 25–37× against 45–83× elsewhere, widest hump to 2745c), the
+left of the field looks genuinely **soft**, not dimly rendered.
+
+**The clean discriminator is a printed target** — no panel, no viewing-angle gamma. If the own-peak
+gradient persists on paper it is the lens; if it flattens, it is the screen.
+
+### 36.14.1 A tilted monitor produces the identical signature. Measure it before believing the lens (2026-08-31)
+
+The operator caught the overclaim in §36.14 immediately:
+
+> Say the screen is very tilted. That would mean the bottom part of it is in focus when the top isn't
+> and vice versa, and that would produce exactly what we're seeing, no?
+
+**Yes, exactly.** Tilt the panel and the top of it sits at a different object distance than the
+bottom, so best focus for the top tile lands at a different count. That is content-independent, so
+it repeats across six frozen scenes with a 7% CV — indistinguishable from a tilted sensor or a
+tilted lens element. **All three are geometry, and the vertex test cannot tell them apart.**
+
+The word "screen" changed meaning between sections and the claim was carried over without being
+re-earned. In §36.10–36.12 "the screen" meant refresh, overdrive, tearing and panel non-uniformity,
+and those *are* ruled out here. In §36.14 it means the physical panel and its mounting, and those
+are not.
+
+**Why this is not pedantry: only a camera-side tilt follows to flight.** A monitor-mount tilt is
+manufactured by the rig, and the 2× y-decay would then be an artifact we built ourselves.
+
+**The angle is recoverable from the same sweep, with no standoff measurement.** The curvature term
+*is* a distance measurement — a flat plane's edges are farther from the lens by the sagitta
+`y²/(2D)`. The tilt term is `2y·tanθ` in the same counts. Divide and `D` cancels:
+
+    tan θ = (T_span / (4 · C)) · tan α,     tan α = r · p / f
+
+with `r` the tile offset in px, `p` = 3.45 µm, `f` = 300 mm (cam 2439008, §28). Substituting the
+measured terms:
+
+| axis | tile offset | half-field α | curvature C | tilt span | **implied misalignment** |
+|---|---|---|---|---|---|
+| vertical | 3174 px | 2.09° | 214c | 641c | **1.57°** |
+| horizontal | 4462 px | 2.94° | 474c | 721c | **1.12°** |
+
+≈ **1.92° about a diagonal axis** — which is a tape-measure quantity, not a subtle one. Across the
+~0.5 m of screen the tile cross spans at a ~7 m standoff that is **~14 mm** of depth difference
+(10 mm at 5 m, 18 mm at 9 m; the *angle* is standoff-free, the millimetres are not).
+
+**Do this before anything else:**
+
+1. **Measure.** Phone inclinometer on the monitor face vs a flat reference on the camera body for
+   pitch (1.6° is well above a phone's ~0.2° noise); tape camera-to-screen at the left and right
+   edges of the imaged region for yaw. Also tape the standoff — if it lands near the ~7 m the
+   curvature term implies, the geometric reading of the curvature holds.
+2. **Shim it square, re-run the field map.** If the vertex ramp collapses, the rig owned it and every
+   future observe run is clean. If it survives a squared monitor, the tilt is inside the camera and
+   it *does* follow to flight.
+3. **Fallback, zero assumptions:** roll the camera 180° about its optical axis and re-sweep. A
+   camera-side tilt keeps the ramp's sign against image row; a screen tilt inverts it. Flipping the
+   content in OrthoSim proves nothing — that changes content, not geometry.
+
+**Caveat on the angle.** It treats the whole curvature term as flat-plane geometry. Lens field
+curvature (Petzval) has the same `r²` shape, so the sweep alone cannot separate them and a lens
+contribution moves the number. The measured `474/214 = 2.21` against `(4462/3174)² = 1.98` says the
+term is `r²`-shaped to ~12%, but Petzval is *also* `r²`-shaped, so shape cannot arbitrate — only the
+taped standoff can.
+
+### 36.14.2 Stop measuring the tilt in encoder counts — measure it in degrees, live, on the screen (2026-08-31)
+
+§36.14.1's step 1 was "phone inclinometer plus tape measure". That reads the *monitor's* tilt, not
+the **camera-to-monitor** angle, which is the quantity that matters and which no inclinometer can
+reach: the camera rides a platform aimed by hand, so the answer changes every time it is nudged. The
+sweep can recover the angle, but a field map costs a motor sweep and a scene freeze per reading —
+useless for a closed loop where the operator's hands are on the rig.
+
+So the camera measures it directly, and the answer is displayed **on the screen being aimed at**.
+
+**Toggle `Align` in the focus panel** (beside `Field map`), with the **`A`** pattern up in OrthoSim.
+
+- OrthoSim replaces the scene with a static **25×14 ChArUco board** of 150 screen-px squares
+  (3750×2100 on the 4K panel, 312 interior corners, `DICT_5X5_250`). Blitted 1:1 with smoothing
+  **off** — resampling rounds the square edges, and the edge *is* the measurement.
+- The capture app runs `cv2.aruco.CharucoDetector` + `solvePnP` on the **coarse 4× tap** at 2 Hz
+  (~130 ms per detection, so the GUI thread stays ~74% idle) and sends the angles back over the
+  existing step socket with an `ALIGN ` prefix.
+- OrthoSim shows a **bubble level** plus the two signed angles at 64 pt, the corner count and the
+  standoff, greying out after 2 s of silence. Inner ring = 0.36°, the acceptance threshold.
+
+**Three decisions worth not re-litigating:**
+
+**No camera calibration.** Simulated against the real 300 mm / 3.45 µm geometry: 0.013° of scatter at
+a pessimistic 0.5 px of corner noise, and every systematic under 0.04° (principal point off by
+200 px, focal length off by 1%, uncorrected `k1 = 0.10`). Radial distortion is symmetric and largely
+cancels in a top-vs-bottom difference, which is the same reason the *keystone* is the observable and
+not the line spacing — a tilt shifts the top and bottom of the frame by the same amount to first
+order, indistinguishable from a pan, and only the convergence of the parallel lines survives.
+
+**The angles are in the SCREEN's axes**, taken as `asin(R[2, i])` from `solvePnP`'s rotation, whose
+first two columns *are* the panel's own axes seen by the camera. The camera is rolled ~90° on this
+rig, so any reading labelled for an image axis arrives swapped and sign-flipped — §36.13's failure
+mode exactly. `tools/test_align.py` asserts a 90° camera roll does not move the reading; that test is
+the guard, not decoration. The bubble is primary because a dot driven to the centre has no axis label
+to get backwards.
+
+**Not the four corner fiducials.** They are pinned to the *screen's* corners, so they went off-frame
+when the rig moved closer ("0/4 markers found"), and `detect_fiducials()` is all-or-nothing by
+design. Four points also read only 0.28° at 0.25 px of corner noise — borderline against the 0.36°
+budget even when all four are visible. A board that fills the *panel* inverts the problem: what sets
+precision is how much of the **frame** carries pattern, so **overfill is the best case here**. Rendered
+through the real imaging chain and masked down: 312 corners → 0.02°, 50 corners over the central 40%
+→ 0.04°, but 30 corners → 0.33° and 12 → 0.50°. `ALIGN_MIN_CORNERS = 40` sits on that cliff and
+`measure()` returns `None` below it — an operator who nulls a wrong bubble has spent the session and
+still has the ramp.
+
+**Operating notes.** Park near focus first: corner localisation needs the pattern roughly sharp, and
+the corner count beside the angles is what tells you it isn't. `Align` is mutually exclusive with AF,
+`Field map` and `Observe` — its pattern replaces the ortho scene those three score, so the lockout is
+about the scene, not the motor.
+
+### 36.14.3 Nulled. The tilt was the rig, and it does not follow to flight (2026-09-01)
+
+The operator nulled the bubble by hand — *"no small amount of fiddling and duct tape"* — and then
+swept a field map. **The tilt term collapsed by ~100× on the vertical axis while the curvature term
+stayed put**, which is the outcome that settles §36.14.1:
+
+| axis | | tilt (opposite edges) | curvature (edges − centre) | implied angle |
+|---|---|---|---|---|
+| vertical | before | 641c | 214c | 1.57° |
+| | **after** | **−5c** | 198c | **0.013°** |
+| horizontal | before | 721c | 474c | 1.12° |
+| | **after** | **+77c** | 434c | **0.131°** |
+| | | | | **1.92° → 0.131°** |
+
+**Residual 0.131° against a 0.36° budget — passes with 2.7× margin.** Two field maps 48 s apart read
+0.207° and 0.131°, so run-to-run repeatability is ~0.08°, about what backlash and a 131-sample fit
+should give.
+
+**Why this is believable and not just a smaller number.** Three independent things line up:
+
+1. **The curvature term barely moved** (214→198c, 474→434c) while the tilt term fell off a cliff.
+   That is exactly the signature of removing a *tilt*: the antisymmetric term is a relative angle and
+   the symmetric term is flat-plane geometry plus Petzval, so a mechanical adjustment must kill the
+   first and leave the second. Had both dropped, something about the *measurement* changed rather
+   than the rig.
+2. **The live readout agreed independently.** The bubble sat near zero at 116 corners (≈0.08° of
+   scatter) — a ChArUco/`solvePnP` pose measurement — while the field map's 0.131° comes from motor
+   counts and focus scores with no geometry in common. Two unrelated instruments, same answer.
+3. **A monotonic y-gradient cannot survive this.** What remains is symmetric about the centre, and a
+   symmetric term cannot produce the one-directional score decay of §36.14 by construction.
+
+**The answer to §36.14.1: the rig owned it.** The tilt was the hand-aimed camera platform against the
+screen, not anything inside the camera, so **it does not follow to flight** — and every observe run
+since §36.5 was measuring a bench artifact stacked on top of whatever the real effect is. Re-baseline
+before drawing any further conclusion from an old run.
+
+**Two things still open:**
+
+- **The standoff from `tvec[2]` was never written down**, so §36.14.1's Petzval caveat is still open:
+  the split between flat-plane geometry and lens field curvature in that ~200c/~430c residual is
+  unmeasured. It is now logged every ~10 s while `Align` is on (next launch onward) — read it off the
+  next session log.
+- **116 corners means the pattern covered only ~half the frame.** Enough (0.08°), but getting the
+  camera to see more of the screen takes it to 312 and halves the scatter, which matters if the
+  residual ever needs to be pushed below ~0.1°.
+
+**The procedure, for next time the camera is remounted:**
+
+1. `A` in OrthoSim to put the pattern up. **Park near focus first** — see the trap below.
+2. Toggle `Align`, drive the dot inside the green 0.36° ring, toggle `Align` off, `A` again for the scene.
+3. Freeze the scene, run one field map, and check the header says *trusted*, not *CLIPPED*.
+
+**Trap that cost a sweep.** The first attempt reported a **93c spread** — apparently a perfect null —
+and it was meaningless: 4 of 5 tiles peaked at the final sample with *"SWEEP DID NOT BRACKET FOCUS"*
+in the header. The lens had started ~4400c out, and the sweep is a fixed dive-then-climb from
+wherever it sits, so every tile hit the same end of travel. **The spread of a set of clipped values
+measures the clip, not the optics** — and it fails *low*, i.e. it looks like success. Always read the
+per-tile CLIPPED/SUSPECT flags before the spread line.
+
+### 36.15 The crop now lands on the object; the short lifetime was the leading edge going amnesiac (2026-09-01)
+
+**The ROI-lag fix is accepted.** `tools/_roi_lag.py` on the 12:37 observe run, 13 consecutive
+same-object crop pairs: **content dy median 0, max 4 crop rows**, against median ~630 / max 692
+before. The acq thread now measures scene travel on `small_u16` and shifts the (one-frame-stale)
+pinned ROI by it before cutting, so the pixels that get scored are the pixels the green box drew.
+The residual 4 rows is 2 coarse px - the tracker's own noise floor, not a lag. It cost nothing:
+`conflated=0` across 1344 focus-tap emits at a steady 4.8 fps, where the same rig used to conflate
+28% of frames.
+
+**Then the next question: why does every patch only live 3-4 scored frames?** Two independent
+limits, and only one of them was a bug.
+
+**Bug: a held frame forgot which way the scene flows.** `_resolve_lead()` recomputed the leading
+edge from the *current* frame's motion, and `leading_edge_from_motion` reads |dy| < 0.5 px as
+static. `lead_edge=None` does not mean "no preference" - it sends `select_leading_edge_roi` over the
+**whole frame** (the deliberate bench behaviour from §34, so a static rig doesn't lock onto centre
+sky). On the stepped rig **only every other frame advances**, so half of all frames read as static
+and half of all patches were born wherever the sharpest tile happened to be - including at the exit
+edge. Measured: births spanned **y238..y1832** of a 2382 px frame, median y1000, when the leading
+band is y<600. A patch born at the exit retires in one frame, and OBSERVE compares a patch against
+*itself* over time, so a run of 1 is not a short measurement - it is no measurement.
+
+Fixed by latching: `_RunState.lead_seen` holds the last direction with measurable motion, and
+`_resolve_lead` returns `lead_hint or lead_seen`. Flow direction is a property of the scene, not of
+one frame. A real direction reversal still overwrites it, since a moving frame takes priority.
+Self-check: `test_a_frame_that_did_not_move_must_not_forget_which_way_the_scene_flows`.
+
+**This is not purely a bench bug.** ACQUIRE runs on the first frame of a run, which has no motion
+history by construction, so **the first object of every run - in flight too - is still picked from
+the whole frame** rather than the leading edge. It anchors the dive, so it is the one patch you
+least want born at the exit. Costs one frame of latency to fix properly; not done.
+
+**Not a bug: the stepped rig halves the sample rate.** Travel is **334 coarse px per scored frame**
+(the scene advances once per scored frame by design - step, skip the unsettled frame, score the
+settled one). Usable traversal is 2382-520 = 1862 px, so **5.6 scored frames is the hard ceiling**
+however well the picker aims. The v2 lifetime budget (§ handover_stagger_frames) assumes 15.3 frames
+at the 400 mm worst case, so the bench is running ~3x faster than flight worst-case *relative to the
+FOV*. If a run needs more samples per patch, slow OrthoSim: `Down` steps `ground_speed_mps` by 2
+(default 51.44 = 100 kn); ~13 presses to 26 m/s doubles samples-per-patch to ~9-11 and doubles the
+wall time for the same ortho distance.
+
+### 36.15.1 Both limits confirmed on the 14:04 run - and the last 25% was a publish race (2026-09-01)
+
+Same rig, lead latch in, OrthoSim slowed 51.4 -> ~22 m/s. Against the 12:37 baseline:
+
+| | 12:37 before | 14:04 after |
+|---|---|---|
+| birth y (median, range) | 1000, y238..y1832 | **380**, y238..y1476 |
+| births in the leading band (y<600) | 9/20 | **18/19** |
+| life (median scored frames) | 3.0 | **12.0** |
+| travel per scored frame | 334 coarse px | 147 coarse px |
+| ceiling from that travel | 5.6 frames | 12.7 frames |
+| rows logged | 68 | **208** |
+
+Patches now use **94% of the available crossing** (12.0 of 12.7). The single birth outside
+the band is **oid 0** at y1476 - the frame-1 ACQUIRE with no motion history, exactly the
+limit called out in §36.15, and now visible as a clean single exception rather than half
+the population.
+
+**The remaining crop error was a publish race, not tracking.** With the pin correct, 3 of
+12 crops per object were still displaced ~330 rows - and oid 1 and oid 2 showed the
+*identical* dy sequence (-336, +44, +292, -328, +328) at different indices, so it was
+frame-global. One frame of travel at this speed is 147 coarse px = 294 crop rows. The
+errors were 292-336. **The residual was exactly one frame of travel, on ~25% of frames.**
+
+`set_preview_rois` published the pin as three separate assignments (`_preview_rois`,
+`_roi_follow`, `_roi_pin_fresh`) while the acq thread read the debt at the top of the
+focus-tap block and the ROI list ~90 lines later - **with the full-res slot fetch in
+between**. A pin landing in that window got cropped with the *previous* pin's debt. Hence
+one frame of over-shift, on whatever fraction of frames the GUI's posting phase happened
+to land in the window.
+
+Fixed by publishing `(rois, follow)` as **one tuple in one write** and having
+`_accrue_roi_travel` return the snapshot it paired the debt with; the cut uses what it
+hands back rather than re-reading the attribute. Freshness is now tuple *identity*, which
+also kills a latent one: the debt used to survive a follow=True -> follow=False switch, so
+a field map run straight after an observe would have shifted its supposedly-fixed tiles by
+the leftover debt. Self-check extends
+`test_the_crop_window_is_shifted_by_the_travel_measured_before_cropping`.
+
+**Not yet re-verified on hardware** - the 14:04 numbers above are from the racy build.
+
+### 36.15.2 The crop lag is a STALENESS problem, not a snapshot problem (2026-09-01)
+
+The 14:18 run says the §36.15.1 race fix changed nothing: 3 of 11 oid-1 pairs still
+misregistered. The operator spotted it by eye - *"OID001_y0776 vs y0917, shifted by about
+a third a frame"* - and that is exactly right: **-286 rows on a 952-row crop = 0.30**.
+
+**Two hypotheses killed with data before touching code.**
+
+1. *A blend/ghost read as a shift?* No. High-passed self-similarity over lags 380-800 is a
+   flat r=0.06..0.10 across all 12 crops, flagged and clean alike. A doubled frame would
+   spike at the step lag. Also every crop is 952x1340, so nothing was clamped.
+2. *Lost travel?* No. Converting each pair into window motion vs scene motion:
+
+   | pair | scene moved | window moved |
+   |---|---|---|
+   | y776->y917 | 564 | 278 |
+   | y917->y1091 | 696 | 630 |
+   | y1091->y1256 | 660 | 678 |
+   | y1256->y1448 | 768 | 1100 |
+   | **total** | **2688** | **2686** |
+
+   **Nothing is lost - it is pure delay.** The window falls behind and then over-shoots
+   catching up, which is the signature of a correction applied too late, not one missing.
+
+**Root cause: the debt was reset whenever a new pin arrived**, which silently assumes the
+GUI answers within one frame. It does not - it conflates under load, and the session log
+shows `conflated` going 0 -> 2 across exactly the emits where oid 1 went bad (14:18:09
+`#128 conflated=0`, 14:18:12 `#144 conflated=2`; the bad crops are 14:18:12.9 onward). A
+pin three frames old was charged one frame of travel, so the window lagged by two.
+
+**Fix: an odometer instead of a reset.** The acq thread keeps a cumulative travel total
+that is never reset and stamps it per frame (`_roi_travel_at[ts]`, last 64). The GUI hands
+back `src_ts` - the frame its ROIs were derived from - with the pin, and the shift is
+`total_now - total_at(src_ts)`. Correct for any staleness, including conflated frames, and
+it needs no assumption about GUI latency. Deletes the reset rule and the pin-identity
+tracking with it. Unknown `src_ts` (the field map, first pin) => zero shift, unchanged.
+
+Self-check: `test_the_crop_window_is_shifted_by_the_travel_measured_before_cropping` now
+charges a deliberately 3-frames-stale pin and asserts it gets 3x STEP, which is precisely
+what the old rule got wrong.
+
+**Not yet verified on hardware.**
+
+### 36.15.3 Odometer works; the SAME race was also mislabelling which object a crop is (2026-09-01)
+
+Two results from the 14:47 run (odometer build, `conflated=10` - a harder test than 14:18).
+
+**The geometry is fixed.** oid 0 (8 crops) and oid 1 (14 crops) register at 0 or -4 rows on
+every consecutive pair, through a run with more conflation than the one that failed. Lives
+are 14 scored frames against a 14.0 ceiling - the full crossing.
+
+**But the operator spotted crops filed under the wrong object**, and cross-correlation
+settles it:
+
+| crop | best match elsewhere | best match within its OWN object |
+|---|---|---|
+| `OID002_y1540` | **0.635** (oid 1's patches) | 0.069 |
+| `OID003_y1039` | **0.931** (`OID002_y1731`) | 0.100 |
+
+Both were written in the same batch (`144728_070` / `144728_075`), and both carry the
+neighbour's SCORE too - `OID003_y1039` scored 325 among neighbours of 179/179/205, which is
+oid 2's range, because scores are matched through the same list (`by_label = zip(answered,
+got)`). So the whole record moved one object over, not just the picture.
+
+**Same root cause as the lag, different symptom.** The GUI *inferred* which pin an arriving
+batch answered - "whatever I pinned last time" - but the pin is posted from the GUI thread
+and read by the acq thread whenever it next looks, so a batch can answer the pin *before*
+last. When it does, every crop and every score shifts onto its neighbour's oid. This is the
+identity half of the same asynchrony the odometer fixed for geometry: **the GUI cannot infer
+anything about which pin acq used - acq has to say.**
+
+**Fix: the pin travels with the batch.** `raw_focus_preview_crops` now carries the pin's
+`src_ts` as a third field, the GUI keeps `_af_pin_by_ts` (last 16 pins, keyed by the frame
+they were derived from), and the handler looks the labels and ROIs up by the pin the batch
+names. Nothing is inferred from call order any more. Self-check: a batch that answers the
+older of two pins must be labelled from the older one.
+
+**Note for the earlier sections:** this mislabelling was present for every run in §36.15.x,
+so a fraction of the crops analysed there were filed under the wrong oid. It does not change
+those conclusions (they turned on frame-global displacement patterns shared ACROSS objects,
+which mislabelling cannot manufacture), but per-object numbers from before 14:47 carry it.
+
+**Verified on hardware (15:24 run, 60 crops).** Every crop cross-correlates best against its
+own object: 60/60, median margin over the best impostor +0.953, worst +0.668. Before the fix
+the misfiled ones matched a neighbour at 0.635-0.931 against 0.07-0.10 for their own object,
+so the margin is not a weak test - a single misfile would show as a negative.
+
+### 36.15.4 The big doubling was the ROOM LIGHTS, and the detector that found it (2026-09-01)
+
+Operator flagged seven crops in the 15:04 run as visibly doubled. Three dead ends first, all
+worth not repeating:
+
+- **Vertical self-similarity** does not separate them. The flagged crop peaked at lag 266
+  rows r=0.232 - but its clean twin peaked at 258 rows r=0.131, and the non-flagged crops ran
+  to 0.145. Overlapping, no margin.
+- **Duplicate tracker y is NOT a doubling signature.** 13 of 109 positions in that run were
+  duplicated (the tracker measured no motion), which looked like an obvious tell. It is not:
+  their self-similarity ran 0.037-0.189, straddling the clean population, and the later
+  member scored lower in 5 of 10 groups - a coin flip.
+- **Blind 2D autocorrelation** is hopeless here. EVERY oid 3 crop peaks at dy=-30 dx=-4
+  r~0.37, flagged or not: that is the ortho's own field-row periodicity, and it is stronger
+  than the artifact.
+
+**What works: fit each crop against its own neighbour.** A double is `a*scene +
+b*shift(scene,s)`. Take the temporally adjacent crop of the SAME object as the reference -
+only valid because the odometer (36.15.3) registers consecutive crops to within a few rows -
+band-pass both (sigma 1.8 to kill the LCD pixel grid, sigma 12 to kill illumination
+roll-off), phase-correlate to register, fit `suspect = a*ref`, then cross-correlate the
+RESIDUAL back against the ref. A ghost leaves a shifted copy behind; a clean crop leaves
+noise. Flagged median r=0.380 vs unflagged 0.107, 6 of the operator's 7 in the top 9 - and it
+surfaced two more they had not looked at (`OID006_y1377`, `OID008_y0773`). Lives in
+[tools/_ghost_fit.py](tools/_ghost_fit.py), ~1 min for a run.
+
+**Two families, only one of which is the lights.** The flagged family is LARGE and VERTICAL:
+dy = -242, -241, -321, -330 rows, roughly half a scene step (~600 rows). Re-running with the
+room lights off collapsed it from 6-8 of 122 crops (the strongest signals in the set, max
+r=0.580) to **1 of 60, max r=0.274**. The second family is untouched by the lights and sits
+at the top of BOTH runs: `dx = +-18..20`, horizontal, i.e. along readout - the same 18-20 px
+separation from the motor-test and flight analysis. Possible harmonics at dx=42/51/54 on one
+object. That one is still open and is a Kaya question, not a rig question.
+
+**Caveat, deliberately left standing:** the mechanism is NOT understood. The prediction going
+in was that lights-off would change nothing, because room light can only add a static
+reflection off the panel and cannot manufacture a copy of the ortho shifted by half a scene
+step. That prediction was wrong. Whatever the cause is, it may be something that co-varied
+with the lights (panel brightness, exposure, step/shutter parity) rather than the lights
+themselves - so **it can come back, and lights-off is a workaround, not a fix.** Run
+`_ghost_fit.py` on any run whose scores look odd before trusting them.
+
+### 36.16 The seam is gone, and what remains is field curvature (2026-09-01)
+
+First run where the crops are geometrically right (odometer, 36.15.3), verified filed under
+the right object (60/60, 36.15.4) and free of the big ghost (lights off, 36.15.4). So the
+first observe numbers worth believing. `Iron661_observe_20260901_152340.csv`, 145 rows, 15
+patches, 56 frames, fixed focus.
+
+| | was | now |
+|---|---|---|
+| new/old seam ratio, same frame | 0.625 (the original failure), later 1.6x then 0.79x | **0.971x**, n=125 |
+| last/first score within one patch | <1 | **1.06x**, n=12 |
+| patch lifetime | 3 frames, then 12-14 | **22** of a ~25 ceiling, n=15 |
+| score vs y | 2x monotonic ramp, then asymmetric U 434-258-317 | **symmetric U** |
+
+**The seam problem is closed.** 0.971 is one. The whole original failure was the stitch
+multiplying the climb curve by the outgoing/incoming ratio at every handover: at 0.625 a
+20-seam run shrank the curve to 0.00024, the climb "never rose", and the run was refused.
+There is now nothing systematic left to multiply by. Note also that within-patch decay is
+1.06 - so the ratio was **never** an age effect (the "a patch is scored worse the longer it
+is tracked" hypothesis in `observe_report.py`'s header is dead). It was the artifacts.
+
+**What remains is symmetric, and that changes its origin.** Pooled score vs height:
+
+    y  459   305        y 1387   241
+    y  743   262        y 1700   294
+    y 1085   226        y 2006   306
+
+Minimum at frame centre, both ends within 1 count of each other, 1.35x centre-to-edge. **A
+tilt cannot make that shape** - a tilt is a ramp, which is what 36.14.3 nulled mechanically.
+A bowl symmetric about the field centre is field curvature: at one fixed focus the centre and
+the edges sit at different defocus. That is a property of the LENS, so unlike the tilt it
+**does follow to flight**, and it is the thing the AF actually has to live with. It also
+means the earlier asymmetric U (434-258-317) was a tilt ramp superimposed on this bowl -
+which is why it read as neither a clean ramp nor a clean bowl.
+
+Open, and now the interesting question: 1.35x of field curvature across the frame means the
+AF's notion of "in focus" depends on where in the field its patch happens to sit. Whether
+that matters depends on the depth of field at flight standoff - which is what the `standoff`
+item (tvec[2] off an Align session) is for.
+
+### 36.16.1 The bowl is per-object, not an artefact of pooling (2026-09-01)
+
+The pooled curve above averages over 15 patches, so it could in principle be the mean of
+objects that each behave differently - which would mean the AF's per-object score is still
+unpredictable and the "score vs y" story is a statistical mirage. It is not. Resample each
+object's score onto a common height grid (only the 10 that actually cross the frame; 0, 8, 12,
+13, 14 were born or died mid-frame) and correlate each against the pooled mean:
+
+| | |
+|---|---|
+| median correlation with the pooled curve | **+0.94** |
+| objects above +0.5 | 10 of 10 |
+| objects above +0.9 | 8 of 10 |
+| score swing within one life, max/min | median **1.59x**, worst 1.82x |
+| within-object CV | median 15.3%, range 6.3-22.7% |
+
+**This retires the "there is some fuckery afoot" complaint** (the 2-3x score differences on
+the same oid that stopped the 16 Aug run). The swing is still there at 1.59x - which is 4.6x
+the 3.3% CV noise floor, so it is not measurement noise - but it is the SAME swing for every
+object. An object is scored by where it sits in the field; the object itself contributes
+almost nothing. That is the difference between a metric that is noisy (unusable) and one that
+is position-dependent (correctable), and it is the strongest argument yet that a per-y
+correction on the score would work: the correction curve exists and is shared.
+
+Note the per-object swing (1.59x) is larger than the pooled centre-to-edge ratio (1.35x)
+because pooling into height buckets averages across objects whose extremes do not land in the
+same bucket. Same effect, the per-object number is the honest one.
+
+**Two exceptions worth not over-reading: oid 4 (+0.59) and oid 6 (+0.63).** Both fall over the
+first half like everyone else; neither recovers at the bottom. That is exactly the shape the
+`bar-in-tile` bug would produce - an ROI sliding into the GT bar band contaminates the high-y
+end of a life specifically - so leave them alone until that is fixed rather than inventing an
+optical explanation.
+
+Plots live in a canvas rather than PNGs, because embedded images do not render in this chat on
+Windows: `.cursor/projects/<project>/canvases/focus-baseline.canvas.tsx`.
+
+### 36.17 The doubling came back, and it was the two apps' rate mismatch all along (2026-09-07)
+
+Reported as "slight overlay in OID001_y1103 where there isn't one in OID001_y0980". The honest
+answer to "haven't we killed this several times over" is **no - we killed its neighbours**. The
+record: the motor-bench duplication was mains flicker (36.x), the big vertical doubling was
+suppressed by turning the room lights off *without ever understanding the mechanism* (36.15.4,
+logged at the time as able to come back), post-step panel blends are refused by AF and tagged
+`_step`, and the dx=+-18..20 horizontal ghost is **still open**. This is a fifth thing.
+
+`tools/_ghost_fit.py` ranks `OID001_y1103` 8th of 313 crops at r=0.374, and the offsets give it
+away - three different objects carry the *identical* ghost:
+
+| crop | ghost offset | r |
+|---|---|---|
+| `OID003_y0543_s1783` | dy=-247 dx=+7 | 0.561 |
+| `OID002_y0785_s1876` | dy=-247 dx=+7 | 0.453 |
+| `OID001_y1103_s1614` | dy=-247 dx=+7 | 0.374 |
+
+All three were written within 15 ms (`102819_475/481/490`), so it is **one frame of the whole
+sensor**, not a per-object tracking or scoring fault. Frame 23 also shows the fingerprint:
+`track_response` 0.860 against 0.908-0.916 either side, and every object's score down together
+(oid1 -6%, oid2 -12%, oid3 -18%).
+
+**Root cause.** `_orthosim_step` nudges the display once per two frames and sends the MEASURED
+interval, so a healthy run alternates hold, ~150 rows, hold, ~150 rows. A datagram that lands
+after the repaint is not lost - `step_dt` *sums* the backlog - so the scene covers two intervals
+in one jump. Measured on the 10:28 run: **8 stall-then-lurch pairs in 117 intervals (7%)**,
+travel 0 rows then 242-304, recurring on a regular ~28-frame period. A shutter open across that
+jump records the panel partway between two scene positions ~250 rows apart.
+
+The arithmetic rules out every earlier suspect. 247 rows is **3.29 frames, 853 ms** of scene
+travel, while the 7968 us exposure can only smear **2.3 rows**. Too slow for mains flicker
+(20 ms), too slow for a display tear (17 ms), far too big for motion blur.
+
+`step_dt`'s own docstring names this failure - *"lurch the scene forward by the whole backlog,
+in one repaint, which is precisely the smear the stepped rig exists to avoid"* - and guards the
+**pause** case by draining. Nothing guarded the case where the repaint simply falls behind.
+
+**Fix**: `AutoFocusEngineV2._frame_lurched` refuses to score a frame whose travel exceeds
+`lurch_factor` (1.5) x the median of recent **moving** frames. The ROIs are still advanced -
+the scene really did move that far - only the measurement is refused, the same shape as the
+existing `_frame_is_featureless` gate. Regression test in `tools/test_observe.py`, verified to
+fail with the guard disabled.
+
+Two traps worth keeping. First, the reference must come from moving frames only: a parked frame
+reads as *hundredths* of a pixel rather than a clean zero, so the first cut took a percentile
+over all frames, landed on that noise, and refused every genuine advance. Second, the lurch also
+drags the crop naming ~238 rows stale - all three objects off by the identical 238 - so the ROI
+odometer loses registration during a lurch too.
+
+**This does not explain the score bowl.** These are isolated 7% events; the bowl is a smooth
+shared curve. Different problem.
+
+### 36.18 Vignetting cannot be calibrated out, because it is not what bends the curve (2026-09-07)
+
+The goal is to flatten score-vs-y so an object reads the same wherever it sits. The obvious
+theory - the middle of the frame is visibly brighter, so vignetting is depressing the middle -
+is wrong, and it is worth writing down why so nobody spends a week on a flat-field map.
+
+`focus_measure_full_res` divides by `mean**2` and every step before it (green sub-grid, Gaussian
+blur, Laplacian, standard deviation) is linear. Scaling a crop by *k* scales the variance by
+*k^2* and `mean**2` by *k^2*, so it cancels **exactly**. Verified offline against 145 saved
+crops: the recomputed score matches the filename score to a median 0.1%. **A gain map on the
+pixels is a mathematical no-op for this metric.** Brightness can only get in through saturation,
+where clipped pixels go flat and the Laplacian has nothing to measure.
+
+Sized by forward model on the Sept 1 crops - take the 12 that clipped nothing, scale them up to
+the centre band's real brightness, re-clip at 16383, rescore:
+
+| gain | simulated mean | clipped fraction | score ratio |
+|---|---|---|---|
+| 1.00 | 5389 | 0.0000 | 1.000 |
+| 1.42 | 7637 | 0.0200 | 0.989 |
+| 1.60 | 8539 | 0.0628 | **0.969** |
+| 1.80 | 9437 | 0.1293 | 0.934 |
+
+**Saturation costs ~3% against a 28% bowl** - about a seventh. Real, worth removing, not the
+answer. Note also that brightness, clipped fraction and field position are all the same function
+of y within one run, so they are collinear and *no re-analysis of a single run can separate
+them*. Only changing exposure moves saturation while holding position, which is why the
+low-exposure run is a requirement rather than a nicety.
+
+What is left is focus. Reading each field-map tile as a fraction of its **own** peak (which
+divides content out) gives the pure defocus penalty, and it is strongly parking-dependent:
+centre/edges is 0.910 parked at -63c, 0.637 at +455c, 0.445 at +948c. The observed 0.687 sits
+inside that range, so **the bowl is defocus, and its depth is mostly a function of where the
+lens is parked, not an irreducible property of the optics.** At the best compromise park the
+residual would be ~9% rather than 28%.
+
+**Open question, and it matters for flight.** The centre scores *lowest*, which is backwards for
+a lens - any normal lens is sharpest on-axis. A symmetric bowl with a bad centre is equally the
+signature of the *target* being nearer or further in the middle than at the edges, i.e. a
+**bowed screen**. Nulling tilt removes the linear term; a bow is quadratic and survives it, and
+the panel is wall-mounted with duct tape. The two are indistinguishable in a field map.
+Separating them needs a rotated panel or a genuinely flat target, and only the lens term follows
+to flight.
+
+### 36.18.1 Tooling and the two blockers found on the 10:28 run (2026-09-07)
+
+`tools/flatness_report.py` does the decomposition: measured bowl, saturation from the forward
+model on the run's own pixels, and the defocus prediction from a field map. It reuses
+`observe_report.read/by_oid` and `fieldmap_report.read_tiles/field_terms` (which already splits
+the five vertices into `tiltV/curvV/tiltH/curvH`) rather than re-deriving any of it. `--selfcheck`
+covers it on synthetic bowls.
+
+One number it reports needs care: **`resid_cv` does not go to zero on noiseless data.** The
+shared curve is six binned medians joined by straight lines and that cannot trace a parabola, so
+~2.5% of shape leaks into the residual. Some of the "3.3% noise floor" quoted in 36.16.1 is this
+tool's own resolution, not the rig's.
+
+Run on `Iron661_observe_20260907_102813.csv` it found two things that block the plan:
+
+| | |
+|---|---|
+| shape | **monotonic** 1.101 -> 0.925 with y, i.e. a *gradient* (1.191x) |
+| per-object r vs shared curve | +0.871 |
+| within-object swing | 1.30x |
+| residual CV | 4.9% (~2.5% of it binning) |
+| crops that clip at least one pixel | **313 of 313**, sat_frac 2-9%, p99.9 pegged in every band |
+
+1. **Every crop clips**, so there are zero clean crops and the forward model cannot run at all.
+   Saturation is unmeasurable at this exposure - the lower-exposure run is now mandatory.
+2. Sept 1's field map spans raw `[-9761,-1489]c` and this run parks at `+2032c`, so it predicts
+   nothing. The tool refuses rather than clamping silently. **A same-session field map is
+   mandatory** - raw counts are not comparable across app sessions.
+
+Also note the shape changed: Sept 1 was a symmetric bowl (curvature), 10:28 is a monotonic
+gradient (the tilt signature). Consistent with the rig having been moved, and the reason
+realignment comes first.
+
+### 36.19 Lockstep: the two apps are now a closed loop (2026-09-07)
+
+36.17 added a *guard* (`_frame_lurched`) against the display and the camera drifting out of
+phase. It was still open loop: the app nudged the display and hoped. The doubling came back
+anyway (`OID008_y0752`, score 1685 against 2644/2283 either side), because a guard can only
+reject a badly timed frame, never prevent one.
+
+**The rig is now a handshake.** The display says "picture is painted and settled", the app
+fires exactly one trigger into that static panel, and the display does not move again until
+the app reports the frame is in.
+
+```
+app --STEP n-->  display : advance ONE fixed step, repaint
+                 display : paintGL hands the frame over, settle window starts
+app <--READY n-- display : painted and settled
+app --$T*-->     PCB     : one trigger, panel provably static
+app              frame delivered and scored  ("done acquiring")
+app --STEP n+1-> ...
+```
+
+**There is no phase left to land badly**, so three things follow. The alternating step is
+bypassed (`_af_frame_unsettled` is always False in lockstep): **every frame is a measurement
+instead of every other one**. The step is a FIXED dt rather than the measured wall-clock
+interval, so travel is identical frame to frame - that removes the variable-jump family of
+artefacts outright and repairs `_ghost_fit`, whose registration broke at 319 rows/frame. And
+`_frame_lurched` becomes dormant insurance rather than a ~6% tax.
+
+#### The firmware bug this uncovered
+
+`$T*` (`testClick()`) already fired one trigger without disturbing the motors - the right
+primitive - but it used `delay()`, and `serviceFocusPulse()` is not called during a `delay()`.
+A focus move is a TRAIN of ~10 ms pulses separated by `focusPulseGapMs` (12 ms), sequenced
+from `loop()`. So `delay(picsInPlaceDelay)` held the motor energised for up to **209 ms
+instead of ~10 ms, a ~20x overshoot**. Invisible while `$T*` was a manual one-shot with the
+lens parked; squarely on the hot path once the host triggers every frame *while AF drives the
+lens*. `TakePicsInPlace` had always busy-waited for exactly this reason. Now `testClick` does
+too, and it enforces the max-FPS floor BEFORE the pulse instead of as a trailing delay, so a
+host slower than 209 ms pays nothing.
+
+#### Design notes worth keeping
+
+- **The app is master.** Lockstep inverts the open-loop channel's safety property: there a
+  lost datagram cost one step, here it would deadlock the run, and a 90 s run is ~430 round
+  trips. Both messages are sequence-numbered; an unanswered STEP is re-sent with the SAME seq
+  (the display serves a duplicate idempotently, so a retry cannot double-advance), and after
+  3 tries the app **hands the trigger back and reverts to PCB triggering**. Degrading beats
+  hanging - a frozen preview with a disarmed camera and no explanation is the worse failure.
+- **The settle window starts in `paintGL`, not at the advance.** The margin exists to cover
+  what the PANEL does after it receives the frame; timing it from the advance would spend
+  part of it waiting for Qt to paint. `--settle-ms`, default 50.
+- **`decode_step` refuses a bare float on purpose.** That is the open-loop payload, and
+  accepting it would let a stale sender advance a lockstep display with no handshake - the
+  behaviour being replaced, returning as an invisible mixed mode.
+- **`$X1*` is bench-only and must never survive the session.** It stops M4 self-triggering,
+  so with nothing driving it there are no frames at all. `closeEvent` sends `$X0*` before
+  `$M0*`; the flag lives on the PCB and would otherwise outlive the process.
+- Pausing the display still answers READY. Forfeiting the ground is correct; going silent
+  would hang the app.
+
+#### Acceptance test
+
+Flash `Parallax_CLRCR_V2_4.ino`, relaunch both apps, tick **Lockstep** in the focus panel,
+run a short observe. Two things must both hold: **zero doubled crops**, and **~2x the scored
+frames per object** versus the alternating runs. The display HUD should read
+`LOCKSTEP: N frames, N answered, settle 50 ms`. If the settle margin can come down from 50 ms
+with the crops still clean, the cycle gets faster for free.
+
+#### Result: passed (2026-09-07 13:11)
+
+`Iron661_observe_20260907_131115.csv`, 90 frames, 18 objects, 15 of them alive for a full
+10-sample traverse of y=421..2061. Measured on the saved crops against the open-loop run at
+12:48 the same morning:
+
+| | open loop (12:48) | lockstep (13:11) |
+|---|---|---|
+| frames where the scene did not advance | 10% | 3.3% |
+| frames where the scene advanced twice | 6.5% | **0%** |
+| samples per object | ~4.6 | **10** |
+| median step | 319 px | 182 px |
+
+Double advances are gone outright, which is the ghost source, and the sample count more than
+doubled as predicted. One `no READY for step 302` fired at 13:11:48 and **retried and
+recovered** — that is exactly the degradation fix from earlier the same day earning its keep;
+before it, a single timeout silently reverted the whole run to open loop (which is what
+happened to the 12:47 and 12:48 runs) while leaving the checkbox ticked.
+
+The residual 3.3% of zero-advances is **not a defect** — it is the operator starting the scene
+moving a few frames after pressing Observe. All five land in frames 3-7 on OID0, the only
+object alive at that point, whose `y_centre` sits at 1476 for six consecutive frames and then
+advances +183 like everything else. Every object born once the scene was moving advances
+182-183 px on every single step, ten out of ten, with no misses. Lockstep's steady state is
+exact; do not go looking for a bug here.
+
+Confirmed on the saved crops, not just from the operator's account: the six `OID000_y1238`
+TIFs cross-correlate at **NCC 0.987-0.992** against each other, while the same object one and
+two real steps later sits at **NCC 0.755 and 0.731**. The scene really was frozen for those
+six frames; the ROI was not stuck while content flowed underneath it (that would have looked
+like the 0.73 control).
+
+That accident left a free calibration: six repeat measurements of the same patch at the same
+y, same focus, same everything. They span 1109-1180, i.e. **+/-3% (1.06x)**. So the score
+repeatability floor is ~3%, and the 1.41x position effect below is ~13x that floor — the bowl
+is not measurement noise.
+
+Note for future digging in `E:\Project\focus`: the `y` in the crop filename is the ROI's **top
+edge**, while `y_centre` in the observe CSV is its centre — a fixed 238 px apart (half of the
+476 px preview ROI). Matching filenames against CSV y values directly finds nothing.
+
+What is left after the rig went clean is optical, and it is now measurable without artefact
+contamination: each object loses ~26% of its score travelling down the frame, and all 15
+objects lose it the same way (within-object spread 1.41x median, range 1.26x-1.52x). The shape
+is a bowl with its minimum near y=1515 **plus** a residual tilt that leaves the top end 28%
+above the bottom end — so neither field curvature nor tilt alone accounts for it. Objects also
+differ 1.88x in absolute level, but that is patch content and it divides out under
+per-object normalisation. Next step is a same-session field map at this park position to split
+the curvature from the residual tilt.
+
+### 36.20 Exposure is clipped at one end only, and the operator has no readout for it (2026-09-08)
+
+The flattening work raised a question with a wider blast radius than autofocus: the mission is
+aerial photography, so using the full scale well matters in its own right, not merely as a
+confound for the focus metric.
+
+**Measured over every crop of the 13:11 run** (168 TIFs, 214,314,240 px, gain 6.0, exposure
+7968 us):
+
+| | value |
+|---|---|
+| pixels at >=99% of full scale | **3.08%** |
+| lowest pixel value found anywhere | **468 ADU (2.9% FS)** |
+| pixels at exactly 0 | 0 |
+| pixels below 2% FS | 0 |
+| median pixel | 6666 ADU (40.7% FS) |
+
+So "does lowering gain risk clipping from below" is answered **no, and not remotely**: there
+is a 468-count moat at the bottom and a wall at the top that 3% of pixels are already against.
+Scaling the signal by 0.5 takes >=99% FS from 3.08% to **0.0000%** while the darkest 0.01% of
+pixels fall only from 798 to 633 ADU. Even 0.25 leaves that tail at 550 ADU.
+
+**Gain and exposure are not interchangeable here.** `focus_measure_full_res` is Laplacian
+variance over squared mean, i.e. scale-invariant, so analog gain -- a pure linear rescale ahead
+of the ADC -- changes the score, its noise floor and its repeatability by *nothing at all*. It
+only unclips the top. Exposure reduction instead throws away photons: shot-noise variance goes
+as the signal, so the metric's noise term goes as 1/I, roughly doubling per halving and taking
+the ~3% repeatability floor to ~4%. **Lower the gain, not the exposure** -- and only while that
+gain is analog. Once a pixel reads 16383 its value is gone, and scaling afterwards slides a
+flat-topped histogram down without recovering the gradient.
+
+That is also why this cannot be a post-hoc tool. These crops cannot say how far the exposure
+overshot, because the top of the histogram is destroyed by construction. Overexposure is only
+measurable *before* it happens.
+
+#### BACKLOG (not built): clipping readout / auto-gain for the operator
+
+Recorded because the primitives already exist and the design constraints are the expensive
+part:
+
+- `_clipped_fraction()` (`autofocus.py:496`) already does the high side, already handles the
+  14-bit vs 8-bit full-scale distinction, already subsamples 4x (cheap enough to run
+  frame-wide), and is already called on every AF acquire. A low-end twin is a threshold
+  parameter, not a new function.
+- **"% clipped" is only half a readout.** It says what is being lost, not whether the range is
+  being used. The 13:11 frames are the proof: 3.08% blown at the top *and* the median sitting
+  at only 40.7% FS. Pair the clip fractions with a high percentile expressed as a fraction of
+  full scale -- that is the "am I filling the well" number, and the one an auto-gain servo
+  should target.
+- **Do not servo to zero clipping.** `autofocus.py:233-241` already records this lesson from
+  the AF side: an earlier `sat_frac_reject` fade curve punished clipped tiles and inverted good
+  picks, losing a building 30% blown but rich in the other 70% to featureless unclipped sky.
+  Aerial scenes always contain sky and speculars that clip, and dragging the whole frame down
+  to save them is how you expose correctly for nothing. Percentile target, clip fractions as
+  guardrails.
+- **AF does not compete for this knob.** The focus metric is scale-invariant, so gain can be
+  set purely for image quality at zero cost to autofocus.
+
+#### Unresolved: something adds signal-proportional frame-to-frame variance
+
+An attempt to pull read noise out of OID0's six static repeats via a photon-transfer curve
+**failed**: the fit returns a negative read-noise intercept, which is unphysical, and the
+variance is proportional to signal and far too large for sensor read noise (105 ADU sigma at a
+1509 ADU signal, ~7%). Suspects are LCD temporal dithering, which would produce exactly this
+signal-proportional signature, and the residual sub-pixel registration already visible in
+those crops at NCC 0.987-0.992 rather than 1.0. Consequence for the numbers above: the noise is
+*over*estimated, so the dark-end margin is wider than stated. Consequence to chase later: if
+panel dither is real, it is a floor under every score taken off this screen that no amount of
+settle margin will remove.
+
+#### Next action: the reverse run needs no code
+
+`--dir {up,down,left,right}` already exists and is a render-time sign flip
+(`orthosim_gui.py:530`). `_scroll` still accumulates positively and `step_dt` still returns a
+positive dt, so **reversing does not touch the lockstep handshake**; the speed clamp at
+`orthosim_gui.py:383` is irrelevant because direction never goes through the speed. There is no
+saved `orthosim_config.json`, so the default `scroll_dir = "up"` is what has been running. The
+capture app needs no change either: `leading_edge_from_motion()` returns the edge opposite the
+measured motion for either sign, so with the lead selector on Auto it re-picks at the new
+leading edge by itself. Append `--dir down` to the §29.7 launch line.
+
+Forward and reverse cover the same ten y positions in opposite time order, which separates the
+two live hypotheses cleanly. A property of frame *position* (optics, screen, illumination)
+stays put in y, so the reverse curve overlays the forward one. A property of *time since pin*
+(selection bias, tracking decay) stays put in time, so plotted against y the reverse curve
+comes out mirrored.
+
+Watch one interaction on the first reverse run. The optical bar and fiducials sit at
+`bar_edge = "top"` and do not move, while the AF tile grid masks that band out via
+`exclude_edge`. Content currently flows *up*, so the bar is on the trailing edge and the two
+never interact; reversing puts it on the entry side -- the case where the picker must choose
+from the leading band *minus* the excluded strip. `tools/test_orthosim.py` already covers that
+worst case ("the strip and the leading edge are the SAME edge") and asserts the picker stays
+out of the strip, so it degrades rather than breaks, but births may land some way inward and
+shorten the reverse traverse at one end. Read the birth positions out of the
+`af2-observe acquired oid=N roi=...` log lines. There is no `--bar-edge` flag, and adding one
+also means flipping the app's bar-edge dropdown to match or ground-truth decode fails, so only
+do it if the y overlap turns out too small to compare.
+
+## 41. AF3 on the rig: the bracket was one-sided, and the acquisition lane (2026-09-09)
+
+First AF3 run on the rig (`Iron661_observe_20260909_101055.csv`, Bnei Brak scrolled LEFT,
+lockstep, 1.53 fps). Read `tools/af3_run_report.py <csv>` for any AF3 run; it rebuilds the
+stations from the encoder dwells and recomputes D with the engine's own metric.
+
+**The mechanics work.** 31 stations, ~180c apart, 22.3 s each, and every one banked exactly the
+4 traverses it asked for -- no timeouts, no starved stations. 224 objects, median life 19
+frames, median traverse 73% of frame width. D climbed -0.40 -> +0.60 with a peak at raw 1613;
+u* walked in from 0.20 and pinned near 0.59. Parked raw 1750.
+
+**But the sweep never bracketed focus, and that was invisible from the UI.** The raw
+centre-band score rose 35x across the walk and was STILL at its maximum on the last station:
+78 -> 2476 -> 2254 -> 2766, no turnover. The walk ended on the 4200c budget, not on a peak, so
+the parabola vertex was an extrapolation off the end of its own data. The last three stations
+look like a plateau, consistent with sitting inside the ~1460c depth of field, so the park was
+probably fine -- but "probably" is exactly what a one-sided bracket cannot distinguish, and it
+means `park_bias_counts` still has no measured value (D peaked 312c before the score did, and
+that gap is itself censored).
+
+Two smaller facts from the same run:
+
+- **`sweep_counts` is counted in NOMINAL counts.** 4200 asked, 5395 actually travelled, because
+  `encoder_counts_per_pulse` is 24 while the axis really moves ~30. Left alone deliberately:
+  that same constant divides into AF2's `backlash_pulses`, so correcting it would silently
+  shorten AF2's park excursion below the 1290c lash it is sized to beat. Fix it there first.
+- **Encoder positions are not comparable across a direction reversal.** Frame 2 scored 1861 at
+  raw 3430 approaching from below; the walk scored 228 at raw 3330 approaching from above. ~8x
+  at nominally the same position, which is the ~1290c backlash. Do not compare a hand-focus
+  point to a walk station.
+
+### 41.1 Fix: the walk stops on evidence, not on budget
+
+`_past_the_peak` ends the sweep once it has seen a real far flank, with `sweep_counts` (now
+5600 nominal, ~38 stations) demoted to a backstop. When the backstop *is* what ends the run,
+the log warns and the status line says "NO far flank -- vertex extrapolated", so run B's
+failure mode cannot look healthy again.
+
+The stop is two-stage because a bare "D fell" is worthless -- **D is even, negative on both
+flanks, so a dip cannot tell "past the peak" from "not there yet"**. So it stays DISARMED until
+D has climbed `station_arm_rise` (0.35) out of its own pedestal, which per the field map only
+happens near focus; only then do stations sitting `station_fall_margin` (0.08) below the
+running max start counting, and 3 of them close it.
+
+Those numbers are set from run B's own data, and run B is now the regression fixture: its
+pedestal contains `-0.318, -0.326, -0.420, -0.374`, three straight stations below a running
+max, 1300c short of focus. `test_early_exit_never_fires_on_run_b` feeds the real 31-station
+sequence in prefixes and requires every one to come back NOT bracketed.
+
+### 41.2 Fix: objects are acquired from one lane, and that lane is 8% off axis
+
+> The objects are not being chosen solely from the middle row, this interferes with the
+> repeatability of the measurements
+
+Correct, and it matters for a reason D does not cover. D cancels **content** -- both its terms
+come from one patch -- but it does not cancel **lane**: a patch crossing down the left of the
+frame and one crossing down the middle sample different slices of a curved field, so medianing
+their Ds averages two different measurements. Run B's objects were born anywhere from
+y_centre 1190 to 1478.
+
+`_tiles_in_centre_lane` (in `autofocus.py`, beside `_tiles_in_lead_band`) keeps only candidates
+in the middle `acquire_lane_frac` of the candidates' cross-axis spread. It composes with the
+lead band: the lead band decides WHEN a patch is taken, the lane decides WHERE across the flow.
+Cross axis is inferred from `lead_edge`, so it needs no direction flag and works both ways.
+
+**OFF for AF2 and flight** (`acquire_lane_frac = 0.0`), on for AF3 (0.34). Note that
+`AutoFocusConfigV2` is NOT a subclass of `AutoFocusConfig` and has no such field, so the shared
+picker reads it via `getattr(cfg, ..., 0.0)`. A test pins that, because the day V2 grows the
+field is the day that default stops being what protects flight.
+
+**Known bias, accepted for now.** On the coarse 3350x2382 frame the interior grid is three
+columns at x = 737, 1407, 2077, so the lane is a single 670 px column (20% of width) centred at
+**1407 -- 268 px, 8% LEFT of the frame centre at 1675**. The cause is grid packing, not the
+filter: `tiles_per_frame = 5` gives 670 px tiles, three of them (2010 px) pack from the left
+inset at x = 402, and the trailing 536 px of interior is discarded. **This is the same
+asymmetry already noticed in the field map** ("field map is still not symmetric") turning up in
+a second tool, which argues it is the grid rather than either instrument. Repeatability is what
+was asked for and is delivered -- every object now shares one lane -- but the lane is not on
+the optical axis. Two ways out when it matters: `tiles_per_frame` ~ 3.95 makes three 849 px
+columns fill the interior exactly and lands the middle one on 1675 (one knob, but tile size
+changes so absolute scores stop comparing with earlier runs), or centre the grid packing itself
+(correct everywhere including the field map, but touches AF2, observe and field map together).
+
+### 41.3 Unrelated, found on the way: OrthoSim ground truth has been dead
+
+`GroundTruthLogger.close()` had a `try/finally` with no `except`, so the Errno 22 that the
+write path already tolerates -- the F: virtual drive rejecting a flush -- propagated out of
+`main()` and made every normal operator shutdown exit non-zero and look like a crash. Fixed.
+
+The knock-on is worse than the crash: **GT was being disabled ~10 s into every run** and no
+ground truth was recorded at all. Pass `--log` with a path on real local disk
+(`%LOCALAPPDATA%\Iron661\...`) and it records.
+
+Also for the record: the capture app DOES write a session log to disk,
+`host/Session logs/Iron661_session_<stamp>.txt`. A search for `*.log` misses it. The terminal
+capture is separately capped at 1 MB and simply stops recording, so it is useless for a
+long-running session -- read the session log instead.
+
+## 42. AF3 got 2.5x faster, and the frame rate came back (2026-09-10)
+
+A day of two halves. The first half made the station walk stop wasting objects: 18.3 s per
+station -> 12.8 s. The second half was about the frame rate, went wrong twice, and ended with
+conflation at **zero** and stations at **7.4 s**.
+
+Read this section before optimising anything on the focus path, because the two failures are
+more instructive than the fix.
+
+### 42.1 AF3 never finished: it landed in HOLD, not DONE
+
+`app.py` decided one-shot-ness by NAME -- `algorithm == "sweep_and_hold"` -- so the day AF3
+was added under a new name it silently became *continuous*. It parked correctly and then sat
+in HOLD forever: `_finished` never fired, the observe CSV was never closed (it flushes every
+50 rows, so the tail stayed in the buffer), and full-res scoring kept running on a lens that
+had already arrived.
+
+Now `one_shot = self._autofocus.algorithm != "legacy"` -- named by what CANNOT land rather
+than by what can, so the next engine defaults correctly instead of silently wrong.
+
+### 42.2 The park was one station off, and the status log showed it
+
+`_open_station` captured `self._axis.position` in the same tick as `step_pulses`, i.e. BEFORE
+the motor moved, so every station's recorded position was the PREVIOUS station's. That pairs
+every D with the position one step behind it and slides the fitted vertex a full station:
+the 143034 run parked +155c off its own D peak and printed two stations at -3412c.
+
+Fixed by re-reading `st.pos` on every `_climb_tick`. What the fit consumes is then the value
+from the last frame of an ~18 s dwell -- settled by any measure.
+
+`test_station_position_is_the_settled_one_not_the_pre_step_read` uses a `_LaggingPosition`
+axis that returns the pre-step value for exactly one read. Deleting the fix reproduces the
+live `[0, 0, 6, ...]` signature, which is how it was verified.
+
+### 42.3 Half the objects banked nothing, and it was structural
+
+**49% of objects (82 of 167 on the 143034 run) contributed no traverse at all.** An object
+born within one traverse-length of a station step is doomed at both ends: rejected as a late
+birth before the step, then rejected again after the trail reset because what it has LEFT to
+cross is a partial arc with no edge-to-centre contrast, which `profile_metric` refuses. It
+holds a roster slot the whole time.
+
+Two changes, both in `autofocus_v3.py`:
+
+- `_open_station` now clears the roster (`objects`, `_trails`, `_banked`, `_banked_u`). Costs
+  one frame, not five: AF2's `_advance_objects` re-acquires immediately on an empty roster
+  with no stagger gate on that path. The scene-motion tracker is independent of the roster,
+  so dropping the objects does not disturb tracking.
+- `handover_stagger_frames` drops 5 -> 1. AF2 spaces births so a handover pair has overlap to
+  cross-calibrate on; **AF3 never hands over** -- every D lives inside one object by
+  construction -- so the stagger bought nothing and cost four gaps of 5 frames before a
+  station's last traverse could start. That was ~20 of the 29 frames a station took.
+
+Measured: dwell 29.3 -> 19.1 frames, usable objects 4 -> 5, rejected 49% -> 38%, and the
+station 18.3 s -> 12.8 s.
+
+### 42.4 Open loop must not discard frames -- it runs IN FLIGHT
+
+`_orthosim_step` alternated: step the display, then discard the next frame as possibly
+panel-blended (a 250 us shutter catching the LCD mid-transition records pixels physically
+between two scene positions, ~6% of frames on 2026-08-19, score halved and indistinguishable
+from real defocus).
+
+Lockstep superseded that mitigation on the bench. But the call site is **deliberately
+ungated**, so the alternation was also throwing away half of AF's samples in flight, where
+there is no panel within a thousand miles. Removed. It was free: the crop batch was already
+cut and scored on every frame, with the discard happening afterwards.
+
+Evidence it landed, in the CSVs: the pre-fix open-loop run has consecutive-frame pairs only
+at 1 patch (15 of them), because every other frame was dropped and consecutive frame numbers
+essentially never appeared. The post-fix run has them at every patch count.
+
+### 42.5 Two "optimisations" that measured as nothing, and why
+
+Both aimed at the CROP. Both were reasoned from first principles and both were wrong.
+
+**Every patch was copied twice.** `np.ascontiguousarray(view).copy()` -- on a strided ROI view
+the first call already allocates an owned contiguous array and `.copy()` duplicated it. Now
+`np.array(view, order="C")`. Deliberately NOT a bare `.copy()` deletion: `ascontiguousarray`
+passes an already-contiguous slice (a full-width ROI) straight through, so deleting only the
+`.copy()` would alias a recycled SHM slot. `tools/test_preview_crop_copy.py` pins that.
+Offline this saves 18.4 -> 10.4 ms per patch. **On the rig it changed nothing measurable.**
+
+**The green sub-grid, cut in the pipeline.** Both consumers (`focus_measure_full_res` and
+`_save_af_crops`) immediately reduce the Bayer rectangle to `[0::2, 1::2]`, so cutting it
+directly out of the slot ships a quarter of the bytes. Built, proven bit-identical, all
+suites green -- and **it measured SLOWER on the rig than what it replaced.** Reverted.
+
+The reason is in `tools/bench_af_cost.py`, which now measures the three cut strategies:
+
+```
+full Bayer cut, metric decimates       cut   9.76 ms   ( 10.2 MB shipped)
+green cut (rows AND cols)              cut   4.93 ms   (  2.6 MB shipped)
+rows-only cut                          cut   4.79 ms   (  5.1 MB shipped)
+...then the same score on all three    score  26.31 ms
+```
+
+Two lessons. **The cut is a quarter of a patch; the score is the rest** -- both changes were
+aimed at the smaller half. And **a column stride is not a saving**: neighbouring uint16 share
+a cache line, so it re-reads the same bytes and throws half away, while giving up the
+vectorised per-row memcpy. Only the ROW stride buys anything (rows are 26800 B apart).
+
+**The measurement caveat that made this take all day.** `af3_frame_budget.py` buckets 14-38
+frames per patch count, and the run-to-run spread on those medians is +-30 ms -- the same size
+as the effects being chased. Three changes in a row read as noise, including one that read as
+a regression. Do not optimise against that tool below ~50 ms; use `bench_af_cost.py` offline
+to size a change first, and only take it to the rig when it is bigger than the noise.
+
+### 42.6 The fix: score the patches CONCURRENTLY
+
+Every step of `focus_measure_full_res` releases the GIL (cv2 filters, numpy astype and
+reductions) and the patches are independent, so one frame's patches can overlap:
+
+```
+serial, cv2 threads=16 (today)          122.03 ms
+pool of 5, cv2 threads=16                50.58 ms
+serial, cv2 threads=1                   125.14 ms
+pool of 5, cv2 threads=1                 49.67 ms
+```
+
+cv2's own thread count is **irrelevant** -- a 1.28 Mpx plane is too small for its internal
+split to pay. The parallelism has to come from the patches.
+
+`_on_raw_focus_preview_crops` now does `list(self._af_score_pool().map(_af_score_crop, crops))`.
+`map` is ordered and `list` waits for all of it, so it stays the same synchronous, same-frame,
+same-ordered list every downstream guarantee already assumes -- only the wall time changes.
+That matters more than it sounds: **scores are matched to objects BY POSITION**, so a reorder
+would silently swap two objects' focus curves rather than raise anything.
+`test_patches_scored_in_parallel_come_back_in_the_order_they_were_pinned` scores five
+deliberately-different patches with a `None` hole mid-list and requires the pooled answer to
+equal the serial one.
+
+The pool is shut down at the TOP of `closeEvent`, before anything touches hardware. It is idle
+by construction so it returns at once, but its threads are non-daemon and must not outlive
+into the grabber teardown.
+
+Measured on the rig (14:22 run, open loop, 5 patches):
+
+| | before | after |
+|---|---|---|
+| conflated frames | 33 in 176 (~19%) | **0 in 224** |
+| marginal cost per patch | 19-28 ms | **12 ms** |
+| 5-patch frame period | 296-313 ms | **235 ms** |
+| seconds per station | 10.0 | **7.4** |
+
+The residual 12 ms/patch is essentially just the crop (9-10 ms on the bench), which is what
+should be left once the score is off the critical path.
+
+Still open: the run was stopped by the operator at station 7, so there is no park to check the
+D-peak offset against, and `park_bias_counts` still has no measured value.
+
+## 43. `park_bias_counts` stays 0, and `u*` is dead (2026-09-10)
+
+Two things that had been open since AF3 was written are now settled, from eight real runs
+across two orthophotos. `tools/af3_ustar_check.py` does it; it reuses the report's station
+reconstruction (which was factored out of `af3_run_report.main` for the purpose, so the two
+tools cannot drift) and recomputes D and u* with the engine's own `profile_metric`.
+
+### 43.1 D's vertex is already unbiased -- leave `park_bias_counts` at 0
+
+The module docstring warns that D's peak sits ABOVE the centre's true best focus and that
+`park_bias_counts` exists to subtract the gap. On this rig the gap is not there:
+
+| run | scene | walk | D vertex − score peak | u* crossing − score peak |
+|---|---|---|---|---|
+| 10:17:01 | Bnei Brak | 29 stations | **+62c** | +620c |
+| 15:02:01 | Pardes Hana | 22 stations | **+71c** | +594c |
+| 15:09:09 | Pardes Hana | 20 stations | **+152c** | +647c |
+| | | median | **+71c (spread 90)** | +620c (spread 53) |
+
++71c is 5% of the ~1460c depth of field and under half the ~200c station spacing, i.e. D's
+argmax and the centre score's argmax keep landing on the SAME STATION. So the honest claim is
+not "the bias is 71 counts", it is **"there is no bias this method can resolve"** — and that
+is the useful answer either way, because a correction smaller than the station spacing cannot
+improve a park that is quantised to stations. Leave it at 0.
+
+It also holds on both terrains, which was the other thing the Pardes Hana switch was for.
+
+### 43.2 u* is worse, repeatably, by ~550 counts -- do not switch to it
+
+`u*` (field position of a traverse's own score peak, 0.5 = frame centre) was logged as "the
+unbiased estimator in waiting": on a curved field it should walk inward and reach frame centre
+exactly at the centre's vertex, needing no bias at all. `_selfcheck` proves that on a synthetic
+field and prints `u* ... (3.5x better)`.
+
+On the rig it is **3.5x worse, not better**. u* does behave qualitatively as modelled — it
+rises through 0.5 in every run that gets far enough — but it crosses ~620c high where D lands
+~71c high. The spread is only 53c, so this is a real property of the optics, not noise: the
+rule is consistently, reliably wrong. The synthetic model's field-curvature parameters simply
+do not match this lens, which is precisely what its own closing note warns about ("set
+`park_bias_counts` from the RIG's measured gap, not this model's").
+
+u* is cheap to keep logging (one parabola fit) so it stays, but nothing should be built on it.
+
+### 43.3 Why five of the eight runs could not answer this -- read before adding runs
+
+Only 3 of 8 runs had an **uncensored** score peak. A walk that stops while the centre score is
+still rising has not seen the peak, so its gap is a lower bound and averaging it in poisons the
+median. The 14:55 Pardes run is the cautionary case: it reported "+436c apart" and looked like
+strong evidence for a large bias, and it was purely an artefact of stopping early — the two
+longer runs on the same scene minutes later gave +71 and +152.
+
+This is structural, not bad luck. `station_descend_stop = 3` ends the walk three stations after
+D peaks, and the centre score peaks later than D, so **the early exit systematically censors
+the very measurement you would use to calibrate the park.** The tool flags it (`[CENSORED]`)
+and excludes those runs; any future attempt to measure a park offset needs the early exit
+relaxed for that run, not more short runs.
+
+One caveat on the reference itself: unlike the field map, a walk sees new ground at every
+station, so the centre score carries scene content as well as focus — it swings 8-14x of its
+own median across a long walk. That it still peaks on D's station despite that is reassuring
+about D, but it is why the resolution here is one station and not better.
+
+## 44. Varied topography, and open loop is worth 2.2x (2026-09-10)
+
+### 44.1 OrthoSim on Pardes Hana -- same geometry, different ground
+
+Bnei Brak is dense urban; every AF3 result up to today was measured on it, so "does the metric
+need city texture" was unanswered. Pardes Hana (agricultural, varied relief) now runs at
+**identical simulated geometry**, which is what makes the two comparable:
+
+```powershell
+py -3 tools/orthosim_gui.py "Running TIF\Pardes_hana.tif" --gsd 5.0 --reduce 2 --screen 1 `
+  --scale --M 3.3553 --zoom 0.8502 --speed 51.44 --dir up --settle-ms 120 --log <csv>
+```
+
+Both orthos are natively 0.05 m/px (`ModelPixelScaleTag`), so `--gsd 5.0` carries over
+untouched. Two things did have to change:
+
+- **`--reduce 2` is mandatory, not optional.** Pardes Hana is 127454 x 15877 (2.02 Gpx) against
+  Bnei Brak's 77786 x 15021 (1.17 Gpx). Undecimated it peaks ~12.1 GB against ~12.4 GB free
+  with the capture app resident; reduced it sits at 3.8 GB.
+- **`--zoom` must DOUBLE to 0.8502 to compensate.** `main()` does `cfg.ortho_gsd_cm *= reduce`,
+  so `--reduce` silently rescales the geometry. Doubling zoom holds all three derived numbers
+  exactly where Bnei Brak had them: 11.762 cm/screen-px, 3.505 cm/cam-px, 437.3 screen-px/s.
+  **Changing `--reduce` without touching `--zoom` changes the simulated altitude** — which
+  would have made the terrain comparison meaningless while looking like it worked.
+
+**Answer: the metric does not care.** D peaked +0.55, +0.44 and +0.48 on Pardes Hana against
++0.52 on Bnei Brak, and 43.1's park agreement holds on both. Agricultural texture is enough.
+
+One root-cause fix was needed to get there. OpenCV refuses images over 2^30 px as a
+decompression-bomb guard, and *both* orthos exceed it — Bnei Brak worked only because it had
+been launched from a shell that happened to export `OPENCV_IO_MAX_IMAGE_PIXELS`. It is set in
+`orthosim_gui.py` now, before `import cv2` (cv2 reads it once at import), because the failure
+reads as a corrupt file: `Assertion failed: pixels <= CV_IO_MAX_IMAGE_PIXELS`. Note it is NOT
+a memory limit — it fires on the file header regardless of how little is decoded, so `--reduce`
+does not avoid it and is still what bounds RAM.
+
+### 44.2 Open loop is 2.2x faster than lockstep and lands in the same place
+
+Two full walks seven minutes apart on the same scene, one in lockstep and one not:
+
+| | lockstep (15:02) | open loop (15:09) |
+|---|---|---|
+| total, AF press -> "in focus" | 5 min 13 s | **2 min 20 s** |
+| dive | 4.6 s | 3.8 s |
+| station walk | 274 s / 22 stations | **119 s / 20 stations** |
+| per station | 12.5 s | **6.0 s** |
+| park | 34.3 s | **16.9 s** |
+| AF frame rate | 1.71 fps | **4.40 fps** |
+
+The whole speedup is the frame rate (2.6x), and everything that waits on frames inherits it —
+the walk at 2.1x, the park at 2.0x, because the park waits on frames to confirm the move
+settled. **Accuracy did not pay for it:** D peaked +0.48 vs +0.44, and the D-vertex-vs-score-peak
+gap was +152c vs +71c, both inside one station's spacing (43.1).
+
+So lockstep is a debugging aid, not the operating mode. Nothing about AF3 needs it.
+
+### 44.3 Lockstep still drops itself roughly once per run
+
+`lockstep OFF (no frame after $T*): N frames, 4 timeouts -- PCB self-triggering again` fired at
+14:58:54 (405 frames) and 15:07:40 (594 frames). The 15:09 open-loop run above happened
+*because* lockstep failed, not because anyone disabled it. Harmless for AF3 per 44.2, but it
+means any measurement that assumes lockstep held for a whole run must check that it did.

@@ -17,7 +17,11 @@ Two file scheme variants:
   uncompressed uint16 TIFF since they're tiny ROIs and don't pressure
   the drive)::
 
-      <drive>:\\<project>\\focus\\Cam{SN}_{YYYYMMDD}_{project}_focus_{HHMMSS_mmm}.tif
+      <drive>:\\<project>\\focus\\[{tag}_]Cam{SN}_{YYYYMMDD}_{project}_focus_{HHMMSS_mmm}.tif
+
+  ``tag`` is optional and LEADS the name so a directory sort groups one
+  tracked object's whole life together (e.g. ``OID007_y1408_s43254``);
+  untagged captures keep the plain timestamped form.
 
 ``SN`` is the camera's GenICam ``DeviceSerialNumber`` (e.g. ``2439007``)
 read once at startup. The project name is user-entered in the GUI; we
@@ -308,13 +312,25 @@ class FocusFrameName:
     project: str
     camera_serial: str
     when: _dt.datetime  # full timestamp; sub-second precision used in filename
+    tag: str = ""
+    """Optional PREFIX, e.g. ``OID007_y1408_s43254``. Several patches can be saved from
+    ONE frame, so the timestamp alone no longer identifies a file; and putting the object
+    id and score in the name is the point -- it turns "is every crop of object 7 really
+    the same object, and is a 43000-scoring patch actually sharp?" into sorting a
+    directory by filename."""
 
     def directory(self) -> str:
         return os.path.join(self.drive_root, self.project, FOCUS_SUBDIR)
 
     def basename(self) -> str:
         ms = f"{self.when.microsecond // 1000:03d}"
+        # Tag FIRST. Trailing it (the original) sorted the folder by time, interleaving
+        # every tracked object, so following one object through its life meant hand-picking
+        # its files out of the listing. Leading with it groups each object's whole life
+        # together, which is what the folder is opened to check.
+        tag = f"{sanitize_tag(self.tag)}_" if self.tag else ""
         return (
+            f"{tag}"
             f"Cam{self.camera_serial}_"
             f"{self.when.strftime('%Y%m%d')}_"
             f"{self.project}_focus_"
@@ -325,12 +341,19 @@ class FocusFrameName:
         return os.path.join(self.directory(), self.basename())
 
 
+def sanitize_tag(tag: str) -> str:
+    """Keep a filename tag to characters Windows will accept, and keep it short."""
+    keep = [c for c in str(tag) if c.isalnum() or c in "-_"]
+    return "".join(keep)[:48]
+
+
 def build_focus_frame_name(
     *,
     drive_root: str,
     project_raw: str,
     camera_serial: str,
     when: _dt.datetime | None = None,
+    tag: str = "",
 ) -> FocusFrameName:
     project = sanitize_project_name(project_raw)
     serial = sanitize_serial(camera_serial)
@@ -341,6 +364,7 @@ def build_focus_frame_name(
         project=project,
         camera_serial=serial,
         when=when,
+        tag=tag,
     )
 
 

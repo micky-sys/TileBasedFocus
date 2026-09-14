@@ -281,8 +281,28 @@ class AutoFocusConfigV2:
     # %% Search: dive (fast, below focus) %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     dive_strength: int = 3
     """Focus strength for the fast dive below focus (str3 = big ~10 ms pulses)."""
+    dive_stop_fraction: float = 0.4
+    """Keep diving until the score falls to this fraction of the best seen ON THE WAY
+    DOWN, so the climb always starts genuinely below focus.
+
+    A fixed burst count silently assumes the lens starts near focus. On 2026-08-13 the
+    bench shifted and left it 2558 counts high; four bursts drop 3316, so the climb
+    began only ~760 counts below the peak, reached it within a few samples and spent
+    the rest of its length going downhill. Every run that afternoon failed that way.
+
+    Watching the score fixes it in both directions. Starting ABOVE focus, diving first
+    RAISES the score, so the running peak records the pass through focus and we keep
+    going until we are properly below it. Starting below, the score falls immediately
+    and we stop at the minimum burst count. 0.4 of peak is ~1.4 half-widths down on
+    these curves -- clear of the peak, still on a measurable part of the flank."""
+
+    dive_max_bursts: int = 12
+    """Hard cap on the adaptive dive. A textureless or saturated patch never shows a
+    clean collapse, and without this it would drive to the mechanical stop."""
+
     dive_bursts: int = 4
-    """Number of SEPARATE '-' pulse bursts in the dive. Separate (not one long
+    """MINIMUM number of SEPARATE '-' pulse bursts in the dive; ``dive_stop_fraction``
+    decides when to stop beyond this, up to ``dive_max_bursts``. Separate (not one long
     burst) so the encoder is re-read between them -- a stalled motor or an end stop
     is caught early instead of after one long blind drive."""
     dive_burst_pulses: int = 15
@@ -417,6 +437,16 @@ class AutoFocusConfigV2:
     and sets the park's landing tolerance (half a pulse -- the finest step there is).
     ponytail: CALIBRATE ON-RIG (drive a known pulse burst, read the signed encoder
     delta); 1.0 is only a self-check placeholder."""
+    min_climb_improvement: float = 1.2
+    """The climb's peak must beat its FIRST sample by at least this factor.
+
+    The climb starts at the dive floor, well below focus, so any real hill clears this
+    easily (6.1x, 3.1x on good live runs). Coming in at or below 1.0 means the curve
+    never rose -- the samples are not one curve at all, but segments left on unrelated
+    scales by re-anchored handovers. ``min_contrast`` does not catch it: contrast is
+    (max-min)/max, which a crushed curve still passes with room to spare (0.86 on the
+    run that then parked 3000 counts low)."""
+
     min_contrast: float = 0.15
     """The climbed curve peak must rise this fraction above its floor
     ((max-min)/max) to count as a real focus peak; below it the range is flat (no
@@ -427,21 +457,103 @@ class AutoFocusConfigV2:
     """phaseCorrelate response floor below which we don't trust the motion vector
     (so we hold the ROI rather than chase a garbage shift)."""
 
+    lurch_factor: float = 1.5
+    """Refuse to score a frame whose scene travel exceeds this multiple of the recent
+    median travel. Guards the display catching up after a missed repaint.
+
+    ``_orthosim_step`` nudges the display once per two frames and the display advances
+    by the measured interval, so a healthy run alternates hold, ~150 rows, hold, ~150
+    rows. When a datagram lands after the repaint, ``step_dt`` sums the backlog and the
+    scene covers it in ONE jump -- 2026-09-07 10:28 had 8 such pairs in 117 intervals
+    (7%): travel 0 rows, then 242-304. A shutter open across that jump records the panel
+    partway between two scene positions ~250 rows apart, which is the doubling seen on
+    OID001_y1103 (frame-global: three objects, identical dy=-247 dx=+7, all three scores
+    down 6-18%, track_response 0.860 against 0.908-0.916 either side).
+
+    Compared against MOVING frames only (|dy| >= 0.5 px, the existing static threshold).
+    A parked frame reads as hundredths of a pixel, not a clean zero, so any statistic
+    taken over all frames lands on that noise and every real advance becomes an outlier.
+
+    ponytail: travel alone, so a conflated frame (real gap, clean pixels) is refused
+    too. Costs a few good samples to keep every bad one out, which is the right way
+    round for a measurement run. Upgrade path if the loss ever matters: require the
+    track_response dip as well, since a doubled frame confuses the correlator and a
+    merely-skipped frame does not."""
+
+    lurch_history: int = 12
+    """Moving frames kept for the median travel the lurch test compares against."""
+
     # %% Cross-object handover (moving-scene climb) %%%%%%%%%%%%%%%%%%%%%%%
-    enable_handover: bool = True
+    enable_handover: bool = False
     """Keep a second leading-edge object on deck during the CLIMB and cross-calibrate
     the two so the score-vs-encoder curve can be stitched across a handover when the
-    primary pans off mid-climb. Off = single-object climb (finishes/fails as before
-    when the target leaves), which is all a near-static bench needs."""
-    xcal_min_overlap_frames: int = 6
+    primary pans off mid-climb. Off = the climb re-acquires a fresh leading-edge patch
+    whenever the primary pans off (see :meth:`_advance_objects`) and keeps scoring at
+    scale 1.0, which is what the pre-handover engine did.
+
+    OFF on purpose since 2026-08-13, and it is the stitch that is disabled, not the
+    tracking. The stitch multiplies the curve by a measured primary/on-deck ratio at
+    every seam, and that ratio is biased LOW: median 0.625 over 131 live overlap
+    samples, 19 of 20 seams below 1. A re-anchor (failed stitch) leaves the scale
+    untouched; only a SUCCESSFUL stitch multiplies. So while the bias exists, making
+    handover work is strictly worse than leaving it broken -- 20 successful seams
+    compound to 8.7e-5 and the peak, which sits at the top of the climb where the crush
+    is deepest, vanishes into the noise floor. Live consequence: four consecutive runs
+    reported 0.03x improvement and refused to park while the operator could see the
+    focus was visibly good. The scores were wrong, not the optics.
+
+    The cost of OFF is a curve that mixes patches of differing intrinsic texture, so the
+    peak carries patch-to-patch noise. That is a real defect and it is why the stitch was
+    built -- but it beat a curve crushed by four orders of magnitude, on the bench, by
+    eye. Turn this back on only once the ratio is unbiased; a single scalar cannot
+    reconcile two patches whose own best-focus positions differ (field tilt), so the
+    upgrade path is an affine match (level AND slope), not a better-measured scalar."""
+    xcal_min_overlap_frames: int = 4
     """Minimum frames with BOTH objects textured-and-visible before their cross-cal
     ratio is trusted for a handover. Fewer -> too little shared visibility to pin the
     A/B scale; the engine then finishes the climb with the peak so far instead of
-    stitching a new object on an unknown scale."""
-    handover_stagger_frames: int = 8
+    stitching a new object on an unknown scale.
+
+    Bounded from above by the OBJECT LIFETIME, not by taste: this plus
+    ``handover_stagger_frames`` is how many frames the pair must coexist, and an object
+    only lives ``FOV_traversal / image_motion`` frames. At the 400 mm worst case that is
+    15.3 frames, and the old 6+8=14 left ~1 frame of slack -- live, 11 of 18 object
+    changes missed the window and re-anchored onto an unknown scale (2026-08-13). 4+5=9
+    leaves real margin. Raise these only alongside a recalculation of the lifetime at
+    the speed you intend to fly."""
+    handover_stagger_frames: int = 5
     """Don't acquire the on-deck object until this many frames after the primary was
     acquired, so the pair doesn't enter (and later leave) the FOV in lockstep -- that
-    would give near-zero overlap to calibrate on. Mirrors DualObjectTracker's stagger."""
+    would give near-zero overlap to calibrate on. Mirrors DualObjectTracker's stagger.
+
+    Pulls two ways: large enough that the promoted object still has life left to climb
+    on, small enough that ``+ xcal_min_overlap_frames`` fits inside the object lifetime
+    (see there). At 15.3 frames, 5 leaves the promoted object ~10 frames and the
+    calibration ~10 frames to find its 4."""
+
+    # %% Observation (diagnostic; no autofocus, no motor) %%%%%%%%%%%%%%%%%
+    observe_objects: int = 3
+    """How many patches OBSERVE keeps alive and scores every frame.
+
+    The point is simultaneity: two patches measured on the SAME frame at the SAME lens
+    position differ only in where they sit and what they contain, which is the whole
+    question. Three gives three pairs per frame instead of one. Costs ~43 ms per patch
+    (`focus_measure_full_res`), so three is ~129 ms of a ~213 ms budget -- the frame rate
+    drops to ~3 fps, which in a fixed-focus diagnostic only means fewer samples per
+    traverse, not a worse measurement."""
+
+    observe_seconds: float = 90.0
+    """Auto-stop, so an observation cannot be left running by accident. At the 400 mm
+    worst case an object lives ~3.2 s, so 90 s is ~28 traverses."""
+
+    observe_offset_counts: float = 0.0
+    """Move this far from the starting position ONCE before observing, and walk back
+    when done (the field map's move/work/return pattern).
+
+    The ratio's dependence on lens position is the discriminator between a field-tilt
+    cause and a content cause, so the observation has to be repeatable at a few points
+    along the curve. This spares the operator from jogging the lens by hand between
+    runs. It is the ONLY motion OBSERVE ever commands."""
 
     # %% Hold / re-verify %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     reverify_interval_s: float = 0.0
@@ -479,6 +591,13 @@ class _TrackedObject:
 
     oid: int
     roi: Roi
+    born: int = 0
+    """Frame index this patch was acquired on, so its AGE is measurable at handover.
+
+    The cross-cal ratio is a comparison between an old patch and a fresh one, and every
+    candidate explanation for its systematic sub-1 bias (tracking drift, migration to a
+    weaker part of the field, the tilt across that gap) predicts the bias grows with the
+    older patch's age. Without a birth frame that prediction cannot be tested."""
 
 
 class AFStateV2(Enum):
@@ -486,6 +605,7 @@ class AFStateV2(Enum):
     ACQUIRE = "acquire"
     DIVE = "dive"
     CLIMB = "climb"
+    OBSERVE = "observe"
     PARK = "park"
     HOLD = "hold"
     DONE = "done"
@@ -495,12 +615,18 @@ class AFStateV2(Enum):
 @dataclass
 class _RunState:
     continuous: bool = True
+    t0: float = field(default_factory=time.monotonic)
     seed_roi: Optional[Roi] = None
     lead_hint: Optional[str] = None
+    lead_seen: Optional[str] = None
     frames: int = 0
     low_texture_frames: int = 0
     motion_dx: float = 0.0
     motion_dy: float = 0.0
+    motion_response: float = 0.0
+    lurch_frames: int = 0
+    travel_hist: list = field(default_factory=list)  # recent |dy|, for the lurch reference
+    travel_ref: float = 0.0                          # the reference it was last judged against
     objects: list = field(default_factory=list)  # objects[0] = the scored target
     next_oid: int = 0
     # cross-object handover (climb): objects[0] is the scored primary, objects[1] the
@@ -514,9 +640,16 @@ class _RunState:
     handovers: int = 0
     seam_positions: list = field(default_factory=list)
     last_acquire_frame: int = -(10 ** 9)
+    # observe (diagnostic)
+    observe_t0: float = 0.0
+    observe_home: float = 0.0
+    observe_rows: int = 0
     # dive
     dive_start_pos: float = 0.0
     dive_bursts_left: int = 0
+    dive_bursts_done: int = 0
+    dive_peak_score: float = 0.0
+    dive_last_score: Optional[float] = None
     dive_last_t: float = 0.0
     # climb
     # [(pos:int, score:float, oid:int)] -- the oid marks segment boundaries so the peak
@@ -527,6 +660,7 @@ class _RunState:
     min_score: float = 1e30
     best_pos: Optional[int] = None
     best_oid: Optional[int] = None  # object the peak was measured on; park compares to it
+    best_roi: Optional[Roi] = None  # and WHERE it sat: best focus is region-dependent
     fell_count: int = 0
     # climb
     climb_start_pos: float = 0.0
@@ -564,6 +698,9 @@ class AutoFocusEngineV2:
         finished: Optional[Callable[[bool, dict], None]] = None,
         config: Optional[AutoFocusConfigV2] = None,
         full_res_score: Optional[Callable[[Roi], Optional[float]]] = None,
+        full_res_pair: Optional[Callable[[Roi, Roi], tuple]] = None,
+        full_res_multi: Optional[Callable[[list], Optional[list]]] = None,
+        observe_row: Optional[Callable[[dict], None]] = None,
         sample: Optional[Callable[[int, float, bool], None]] = None,
         axis: Optional[FocusAxis] = None,
     ) -> None:
@@ -573,6 +710,9 @@ class AutoFocusEngineV2:
         self._status = status or (lambda _m: None)
         self._finished = finished or (lambda _ok, _r: None)
         self._full_res_score = full_res_score
+        self._full_res_pair = full_res_pair
+        self._full_res_multi = full_res_multi
+        self._observe_row = observe_row or (lambda _row: None)
         self._sample = sample or (lambda _p, _s, _f=False: None)
         self._pulse = pulse  # kept so set_axis() can rebuild the open-loop fallback
         # Inject a closed-loop EncoderAxis to run on real motor position; default to
@@ -652,6 +792,12 @@ class AutoFocusEngineV2:
         if not self.running:
             return
         rs = self._rs
+        if self.state == AFStateV2.OBSERVE:
+            # An observation is not a focus run: it has no peak to hold, and it owes the
+            # lens back where it found it. Stopping in place would leave the next
+            # observation measuring from a different reference without saying so.
+            self._finish_observe(reason)
+            return
         # HALT IN PLACE -- do NOT move the motor on stop. The dive-then-climb PARK
         # already seated the lens on focus, so pressing STOP should just end the hold.
         # The old code re-parked here with the LEGACY park_upward() (a big absolute
@@ -708,6 +854,15 @@ class AutoFocusEngineV2:
 
         dx, dy, response = self._tracker.update(frame)
         rs.motion_dx, rs.motion_dy = dx, dy
+        rs.motion_response = response
+        # Which way the scene flows is a property of the SCENE, so remember it rather
+        # than re-deriving it per frame: a frame that happens not to have moved does not
+        # mean the scene stopped. On the stepped rig only every other frame advances, so
+        # half of them read as static -> lead None -> the picker searched the whole frame
+        # and put patches at the exit edge (12:37 run: births y238..y1832, median life 3
+        # frames of a possible 5.6). A genuine direction change still overwrites it.
+        if response >= self.cfg.min_track_response:
+            rs.lead_seen = leading_edge_from_motion(dx, dy) or rs.lead_seen
 
         if self.state == AFStateV2.ACQUIRE:
             self._acquire(frame)
@@ -729,7 +884,21 @@ class AutoFocusEngineV2:
             return
         rs.low_texture_frames = 0
 
-        if self.state == AFStateV2.DIVE:
+        # The display can cover a missed repaint in a single jump. A shutter open across
+        # that jump records the panel partway between two scene positions, and a blend of
+        # two textures halves the score -- indistinguishable downstream from real
+        # defocus. The ROIs were advanced above because the scene really did move that
+        # far; only the measurement is refused.
+        if self._frame_lurched(rs.motion_dy):
+            rs.lurch_frames += 1
+            log.info("af2 lurch: dy=%+.0f rows against a recent %.0f -- frame not"
+                     " scored (%d of %d frames)",
+                     rs.motion_dy, rs.travel_ref, rs.lurch_frames, rs.frames)
+            return
+
+        if self.state == AFStateV2.OBSERVE:
+            self._observe_tick(frame)
+        elif self.state == AFStateV2.DIVE:
             self._emit_sample(frame)  # trace the dive on the graph too
             self._dive_tick(frame)
         elif self.state == AFStateV2.CLIMB:
@@ -748,6 +917,7 @@ class AutoFocusEngineV2:
             return
         pos = int(round(self._axis.position))
         raw = self._score_primary(frame)
+        self._log_object(rs.objects[0], raw)
         # Same normalisation as the climb: after a handover the parked object is the
         # promoted one, so scale its score onto the anchor object's curve so the park
         # settle's "parked but soft" check compares against the peak on one scale.
@@ -788,16 +958,45 @@ class AutoFocusEngineV2:
         if self.cfg.full_frame_target:
             return None
         rs = self._rs
-        return rs.lead_hint or leading_edge_from_motion(rs.motion_dx, rs.motion_dy)
+        # lead_seen is this frame's direction when it moved, the last known one when it
+        # didn't. Still None only before the first measurable motion -- i.e. the frame
+        # ACQUIRE runs on, which has no motion history by construction.
+        return rs.lead_hint or rs.lead_seen
 
     def _add_object(self, roi: Roi) -> _TrackedObject:
         rs = self._rs
-        obj = _TrackedObject(oid=rs.next_oid, roi=roi)
+        obj = _TrackedObject(oid=rs.next_oid, roi=roi, born=rs.frames)
         rs.next_oid += 1
         rs.objects.append(obj)
         return obj
 
     # %% object tracking %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    def _frame_lurched(self, dy: float) -> bool:
+        """Did the scene jump further this frame than the run's own recent rhythm?
+
+        The reference is the median of recent MOVING frames, so it sits on the rig's
+        actual advance whether the scene is stepped or scrolling, and one lurch inside
+        the window cannot drag it.
+        """
+        rs = self._rs
+        mag = abs(float(dy))
+        # 0.5 px is what ``leading_edge_from_motion`` and the dual tracker already call
+        # static, so held and moving mean the same thing here as they do there.
+        if mag < 0.5:
+            return False        # a parked frame is not a lurch, and sets no reference
+        hist = rs.travel_hist
+        # Median of the MOVING frames. Not a percentile over all of them: a parked frame
+        # reads as a few hundredths of a pixel rather than a clean zero, so a percentile
+        # lands on that noise and then every genuine advance is a huge outlier against
+        # it -- the first cut of this refused all of them.
+        ref = float(np.median(hist)) if len(hist) >= 4 else 0.0
+        rs.travel_ref = ref
+        hist.append(mag)
+        del hist[:-self.cfg.lurch_history]
+        # ref == 0 covers the opening frames of a run, where there is no rhythm yet to be
+        # an outlier against.
+        return ref > 0.0 and mag > self.cfg.lurch_factor * ref
 
     def _advance_objects(self, frame, dx, dy, response) -> None:
         rs = self._rs
@@ -843,24 +1042,195 @@ class AutoFocusEngineV2:
         # at the leading edge and has most of the FOV still to cross.
         promoted = rs.primary_oid is not None and rs.objects[0].oid != rs.primary_oid
         if (
-            self.cfg.enable_handover
-            and self.state == AFStateV2.CLIMB
-            and len(rs.objects) == 1
+            len(rs.objects) < self._want_objects()
             and not promoted
             and response >= self.cfg.min_track_response
             and (rs.frames - rs.last_acquire_frame) >= self.cfg.handover_stagger_frames
         ):
             lead = self._resolve_lead()
             roi, score = select_leading_edge_roi(frame, lead, self.cfg)
-            if score >= self.cfg.min_texture_score and not _overlaps(roi, rs.objects[0].roi):
+            # Against EVERY live patch, not just objects[0]: with more than two alive
+            # the new pick can land on any of them, and two patches sharing pixels make
+            # their ratio meaningless -- which is precisely what OBSERVE measures.
+            clear = all(not _overlaps(roi, o.roi) for o in rs.objects)
+            if score >= self.cfg.min_texture_score and clear:
                 obj = self._add_object(roi)
-                rs.ondeck_oid = obj.oid
-                # Fresh calibration: the ratio is A/B for THIS B, so any stale ratios
-                # from a previous on-deck object (that panned off before promotion) must
-                # not carry over.
-                rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
                 rs.last_acquire_frame = rs.frames
-                log.info("af2-climb on-deck acquired oid=%d roi=%s", obj.oid, roi)
+                if self.state == AFStateV2.CLIMB:
+                    rs.ondeck_oid = obj.oid
+                    # Fresh calibration: the ratio is A/B for THIS B, so any stale ratios
+                    # from a previous on-deck object (that panned off before promotion)
+                    # must not carry over.
+                    rs.cross_cal = _CrossCal(self.cfg.xcal_min_overlap_frames)
+                    log.info("af2-climb on-deck acquired oid=%d roi=%s", obj.oid, roi)
+                else:
+                    log.info("af2-observe acquired oid=%d roi=%s score=%.1f",
+                             obj.oid, roi, score)
+
+    def _want_objects(self) -> int:
+        """How many patches to keep alive at once.
+
+        Deliberately NOT tied to ``enable_handover``. Multi-object tracking used to be
+        welded to the stitch, so turning the stitch off (2026-08-13, HANDOFF 34) also
+        turned off the only way to see two patches at the same instant -- which is the
+        very data needed to design a stitch that works. Observation and correction are
+        separate concerns and this is where they come apart."""
+        if self.state == AFStateV2.OBSERVE:
+            return max(1, int(self.cfg.observe_objects))
+        if self.cfg.enable_handover and self.state == AFStateV2.CLIMB:
+            return 2
+        return 1
+
+    # %% observe (diagnostic: fixed focus, many patches) %%%%%%%%%%%%%%%%%%
+
+    def start_observe(self, *, lead_edge_hint: Optional[str] = None) -> None:
+        """Track several patches at a FIXED lens position and score them every frame.
+
+        This is not an autofocus -- it is the instrument for designing one. A moving
+        scene confounds two things hopelessly: a patch travels at a constant rate, so
+        its AGE is its HEIGHT in the frame, and no amount of staring at a normal run
+        separates "the score fell because the patch got old" from "because it moved to
+        a part of the field that focuses differently". Holding the lens still removes
+        focus from the equation; running the scene both ways (OrthoSim --dir down)
+        reverses the age/height correlation and separates the last two.
+
+        Everything else -- the tracker, acquisition, the scoring metric -- is the same
+        code the climb uses, on purpose. A reimplementation would measure a different
+        instrument than the one being debugged."""
+        self._tracker.reset()
+        self._axis.reset()
+        self._paused = False
+        self._gate_resume = None
+        self._rs = _RunState(continuous=False, lead_hint=lead_edge_hint)
+        rs = self._rs
+        rs.observe_home = float(self._axis.position)
+        rs.observe_t0 = 0.0  # 0 => not yet at the offset; set when observation starts
+        self._set_strength_safe(self.cfg.strength)
+        self.state = AFStateV2.OBSERVE
+        self._status("observe: acquiring patches")
+        log.info("af2-observe begin objects=%d offset=%+.0fc for %.0fs (raw=%s)",
+                 self.cfg.observe_objects, self.cfg.observe_offset_counts,
+                 self.cfg.observe_seconds, self._raw_str())
+
+    def _raw_str(self) -> str:
+        raw = getattr(self._axis, "raw_count", None)
+        return "n/a" if raw is None else str(int(round(raw)))
+
+    def _observe_seek(self, target: float) -> bool:
+        """Drive to ``target`` and report whether we are there yet.
+
+        Paced like the dive rather than fired as one long burst: re-reading the encoder
+        between moves is what catches a stalled motor early, and ``move_to`` recomputes
+        the delta from the measured position each time, so repeating it is a closed
+        loop rather than an accumulating open-loop guess."""
+        rs = self._rs
+        pos = float(self._axis.position)
+        if abs(pos - target) <= self._land_tolerance:
+            return True
+        now = time.monotonic()
+        if rs.dive_last_t and (now - rs.dive_last_t) < self.cfg.dive_burst_interval_s:
+            return False
+        rs.dive_last_t = now
+        self._axis.move_to(target)
+        log.info("af2-observe seek pos=%+dc -> %+dc", int(round(pos)), int(round(target)))
+        return False
+
+    def _observe_tick(self, frame: np.ndarray) -> None:
+        rs = self._rs
+        target = rs.observe_home + float(self.cfg.observe_offset_counts)
+        if not rs.observe_t0:
+            if not self._observe_seek(target):
+                return
+            rs.observe_t0 = time.monotonic()
+            self._status(f"observe: holding {self.cfg.observe_offset_counts:+.0f}c")
+            log.info("af2-observe holding pos=%+dc raw=%s -- %d patches, %.0fs",
+                     int(round(self._axis.position)), self._raw_str(),
+                     self.cfg.observe_objects, self.cfg.observe_seconds)
+        if not rs.objects:
+            return
+        scores = self._observe_scores(frame)
+        for obj, score in zip(list(rs.objects), scores):
+            self._log_object(obj, score)
+        pos = float(self._axis.position)
+        # Graph the primary so the operator can see it is alive.
+        if scores and scores[0] is not None:
+            self._sample(int(round(pos)), scores[0], True)
+        if (time.monotonic() - rs.observe_t0) >= self.cfg.observe_seconds:
+            self._finish_observe("ran its time")
+
+    def _log_object(self, obj: "_TrackedObject", score: Optional[float]) -> None:
+        """One CSV row: this patch, this frame, RAW score.
+
+        Raw, never ``* cumulative_scale``: the stitch is the thing under investigation,
+        so the log has to record what was measured, not what the stitch made of it.
+
+        Also called during a real dive/climb/park, which is what makes step D of the
+        protocol possible -- the fixed-focus observations give the nuisance model, and
+        this is the run it gets subtracted from."""
+        if score is None:
+            return
+        rs = self._rs
+        raw = getattr(self._axis, "raw_count", None)
+        rs.observe_rows += 1
+        self._observe_row({
+            "frame": rs.frames,
+            "t": time.monotonic() - (rs.observe_t0 or rs.t0),
+            "pos_counts": float(self._axis.position),
+            "raw_counts": float("nan") if raw is None else float(raw),
+            "oid": obj.oid,
+            "born_frame": obj.born,
+            "age_frames": rs.frames - obj.born,
+            "roi": obj.roi,
+            "y_centre": 0.5 * (obj.roi[1] + obj.roi[3]),
+            "score": score,
+            "track_response": rs.motion_response,
+        })
+
+    def _observe_scores(self, frame: np.ndarray) -> list:
+        """One score per live object, all from THIS frame. Same-frame is the whole
+        point -- a ratio between patches measured a frame apart would fold in whatever
+        changed between the frames, which is what we are trying to isolate."""
+        objs = list(self._rs.objects)
+        rois = [o.roi for o in objs]
+        if not rois:
+            return []
+        if self._full_res_multi is not None:
+            # Pass the oids: the app labels the crops it saves with them. Its own
+            # enumeration index is only a POSITION in this list (a preview pane), and
+            # positions rebind every time an object retires and the list shifts up --
+            # over one 37 s run all 29 objects passed through all three positions, so a
+            # position-numbered filename cannot be grouped by object at all.
+            got = self._full_res_multi(rois, [o.oid for o in objs])
+            if got is None:
+                # Stale batch. Skip the frame rather than substitute a coarse score:
+                # the coarse metric runs ~16x larger on this scene, so a fallback row
+                # is not a noisy sample of the same series, it is a sample of a
+                # different one. Mixed into a log meant for comparing patches ACROSS
+                # frames it reads as a frame-global spike, and any max() over the
+                # series (lucky imaging) selects the fallbacks and nothing else.
+                # Same rule as :meth:`_score_primary`, one layer up.
+                return [None] * len(rois)
+            return list(got) + [None] * (len(rois) - len(got))
+        # No full-res path wired at all (sim / self-checks): the coarse frame is the
+        # only resolution there is, so the series is self-consistent.
+        return [self._coarse_pair_score(frame, r) for r in rois]
+
+    def _finish_observe(self, why: str) -> None:
+        rs = self._rs
+        home = rs.observe_home
+        log.info("af2-observe done (%s) rows=%d frames=%d oids=%d -- returning to %+dc",
+                 why, rs.observe_rows, rs.frames, rs.next_oid, int(round(home)))
+        # Walk back so the next observation starts where this one did. An observation
+        # left off-focus would silently move the reference for everything after it.
+        for _ in range(60):
+            if self._observe_seek(home):
+                break
+            time.sleep(self.cfg.dive_burst_interval_s)
+        self.state = AFStateV2.DONE
+        self._status(f"observe: done ({rs.observe_rows} rows)")
+        self._finished(True, {"observe": True, "rows": rs.observe_rows,
+                              "frames": rs.frames, "objects": rs.next_oid,
+                              "reason": why})
 
     # %% dive (fast, below focus) %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -869,12 +1239,16 @@ class AutoFocusEngineV2:
         self._set_strength_safe(self.cfg.dive_strength)
         rs.dive_start_pos = float(self._axis.position)
         rs.dive_bursts_left = max(1, self.cfg.dive_bursts)
+        rs.dive_bursts_done = 0
+        rs.dive_peak_score = 0.0
+        rs.dive_last_score = None
         rs.dive_last_t = 0.0  # 0 => first burst fires on the next tick
         self.state = AFStateV2.DIVE
         self._status("autofocus v2: diving below focus")
-        log.info("af2-dive begin start=%+dc bursts=%d x%d pulses",
+        log.info("af2-dive begin start=%+dc bursts=%d..%d x%d pulses stop<%.0f%% of peak",
                  int(round(rs.dive_start_pos)), self.cfg.dive_bursts,
-                 self.cfg.dive_burst_pulses)
+                 self.cfg.dive_max_bursts, self.cfg.dive_burst_pulses,
+                 self.cfg.dive_stop_fraction * 100.0)
 
     def _dive_tick(self, frame: np.ndarray) -> None:
         rs = self._rs
@@ -883,11 +1257,38 @@ class AutoFocusEngineV2:
         if rs.dive_last_t and (now - rs.dive_last_t) < self.cfg.dive_burst_interval_s:
             return
         pos = float(self._axis.position)
+        # Watch the score on the way down. Scored on the coarse frame deliberately: it
+        # is always fresh, whereas the full-res crop path runs about half stale, and the
+        # dive only needs "has this collapsed yet", not precision.
+        if rs.objects:
+            s = self._coarse_pair_score(frame, rs.objects[0].roi)
+            if s is not None and s > 0.0:
+                rs.dive_last_score = s
+                rs.dive_peak_score = max(rs.dive_peak_score, s)
+        collapsed = (
+            rs.dive_peak_score > 0.0
+            and rs.dive_last_score is not None
+            and rs.dive_last_score <= self.cfg.dive_stop_fraction * rs.dive_peak_score
+        )
+        if rs.dive_bursts_left <= 0 and not collapsed:
+            # Past the nominal depth but still near the peak -- the lens started above
+            # focus, so the climb would begin on the far side of it. Keep going.
+            if rs.dive_bursts_done < self.cfg.dive_max_bursts:
+                rs.dive_bursts_left = 1
+            else:
+                log.warning("af2-dive hit the %d-burst cap without the score collapsing "
+                            "(last=%.4g peak=%.4g) -- climbing anyway",
+                            self.cfg.dive_max_bursts,
+                            rs.dive_last_score if rs.dive_last_score else float("nan"),
+                            rs.dive_peak_score)
         if rs.dive_bursts_left <= 0:
             dropped = rs.dive_start_pos - pos  # +ve if we moved DOWN
             raw = getattr(self._axis, "raw_count", None)
-            log.info("af2-dive done pos=%+dc dropped=%+dc raw=%s", int(round(pos)),
-                     int(round(dropped)),
+            log.info("af2-dive done pos=%+dc dropped=%+dc bursts=%d score=%.4g of "
+                     "peak %.4g raw=%s", int(round(pos)), int(round(dropped)),
+                     rs.dive_bursts_done,
+                     rs.dive_last_score if rs.dive_last_score else float("nan"),
+                     rs.dive_peak_score,
                      "n/a" if raw is None else int(round(raw)))
             if dropped < self.cfg.dive_min_drop_counts:
                 self._fail(
@@ -900,10 +1301,13 @@ class AutoFocusEngineV2:
         # Fire one downward burst (open-loop; we read the encoder next tick).
         self._axis.step_pulses(-1, self.cfg.dive_burst_pulses)
         rs.dive_bursts_left -= 1
+        rs.dive_bursts_done += 1
         rs.dive_last_t = now
         raw = getattr(self._axis, "raw_count", None)
-        log.info("af2-dive burst left=%d pos=%+dc raw=%s", rs.dive_bursts_left,
-                 int(round(pos)), "n/a" if raw is None else int(round(raw)))
+        log.info("af2-dive burst %d pos=%+dc score=%.4g peak=%.4g raw=%s",
+                 rs.dive_bursts_done, int(round(pos)),
+                 rs.dive_last_score if rs.dive_last_score else float("nan"),
+                 rs.dive_peak_score, "n/a" if raw is None else int(round(raw)))
 
     # %% climb (fine, lucky-imaging max over climb_lucky_frames per position) %%%
 
@@ -997,22 +1401,34 @@ class AutoFocusEngineV2:
         if self._handle_handover():
             return
 
-        # While BOTH objects are visible, sample their SAME-frame coarse scores to build
-        # the A/B calibration the next handover uses. Coarse (not full-res) because the
-        # pipeline taps only one full-res crop/frame (the primary's); the ratio is a
-        # content-scale constant that survives the resolution drop (module notes) -- but
-        # only if measured in the curve's own units, hence _coarse_pair_score rather than
-        # a bare focus_measure. It does NOT survive a change of metric definition: the
-        # raw variance scales with brightness^2 where the full-res metric divides it out.
+        # While BOTH objects are visible, sample their SAME-FRAME scores to build the
+        # A/B calibration the next handover uses -- at the same resolution as the curve
+        # the ratio will be applied to. See :meth:`_pair_scores`.
         if len(rs.objects) >= 2 and rs.cross_cal is not None:
-            rs.cross_cal.add(
-                self._coarse_pair_score(frame, rs.objects[0].roi),
-                self._coarse_pair_score(frame, rs.objects[1].roi),
-            )
+            a, b = self._pair_scores(frame, rs.objects[0].roi, rs.objects[1].roi,
+                                     [rs.objects[0].oid, rs.objects[1].oid])
+            rs.cross_cal.add(a, b)
+            # One line per overlap frame, not just the median at the seam: the seam value
+            # alone cannot say whether the ratio depends on the old patch's age or on how
+            # far apart the two sit in the field, and both are live hypotheses for its
+            # systematic sub-1 bias. Also carries the two RAW scores so an affine (scale
+            # AND offset) stitch can be fitted offline against the plain ratio.
+            if b is not None:
+                self._log_object(rs.objects[1], b)
+            if a is not None and b is not None:
+                p, d = rs.objects[0], rs.objects[1]
+                log.info("af2-xcal pos=%+dc agep=%d aged=%d a=%.5g b=%.5g r=%.4f "
+                         "oidp=%d oidd=%d yp=%d yd=%d",
+                         int(round(self._axis.position)),
+                         rs.frames - p.born, rs.frames - d.born, a, b,
+                         (a / b) if b else float("nan"),
+                         p.oid, d.oid, p.roi[1], d.roi[1])
 
         # Normalise the primary's full-res score onto the anchor object's scale so the
         # whole climb curve (and the peak compare below) is continuous across handovers.
         raw = self._score_primary(frame)
+        if rs.objects:
+            self._log_object(rs.objects[0], raw)
         score = raw * rs.cumulative_scale if raw is not None else None
         if score is not None:
             self._sample(pos, score, True)  # every raw frame -> scatter graph (normalized)
@@ -1046,6 +1462,7 @@ class AutoFocusEngineV2:
                     rs.best_score = agg
                     rs.best_pos = pos
                     rs.best_oid = rs.primary_oid
+                    rs.best_roi = rs.objects[0].roi if rs.objects else None
                     rs.fell_count = 0
                 elif rs.best_score > 1e-6 and agg < rs.best_score * (1 - cfg.peak_fall_frac):
                     rs.fell_count += 1
@@ -1077,11 +1494,14 @@ class AutoFocusEngineV2:
         # scale, so this spans objects -- an actual cross-object improvement figure.
         start_score = rs.climb_samples[0][1] if rs.climb_samples else 0.0
         improvement = (smax / start_score) if start_score > 1e-6 else 0.0
+        # peak_roi, not the acquire ROI: on a moving scene the patch pans across the
+        # frame and may be a later handover's object entirely, so where the peak was
+        # actually measured is the only position a field-map correction can use.
         log.info("af2-climb %s n=%d best_pos=%+dc best=%.2f contrast=%.2f "
-                 "handovers=%d improvement=%.2fx",
+                 "handovers=%d improvement=%.2fx peak_roi=%s",
                  "peak" if bracketed else "cap", n,
                  rs.best_pos if rs.best_pos is not None else 0, smax, contrast,
-                 rs.handovers, improvement)
+                 rs.handovers, improvement, rs.best_roi)
         if rs.handovers:
             self._status(
                 f"autofocus v2: climbed through {rs.handovers + 1} objects "
@@ -1090,6 +1510,14 @@ class AutoFocusEngineV2:
         if rs.best_pos is None or contrast < self.cfg.min_contrast:
             self._fail(
                 f"no focus peak found (contrast={contrast:.2f} < {self.cfg.min_contrast})"
+            )
+            return
+        if improvement < self.cfg.min_climb_improvement:
+            # Failing leaves the lens where the climb ended, which is near the run's
+            # start -- far safer than parking on a peak this curve doesn't contain.
+            self._fail(
+                f"climb never rose above its start (improvement={improvement:.2f}x < "
+                f"{self.cfg.min_climb_improvement}x after {rs.handovers} handovers)"
             )
             return
         best = int(rs.best_pos)
@@ -1115,8 +1543,45 @@ class AutoFocusEngineV2:
                            log_domain=self.cfg.peak_fit_log)
             if xv is not None:
                 fit = int(round(xv))
-                log.info("af2-climb peak refine argmax=%+dc fit=%+dc", best, fit)
-                best = fit
+                lo, hi = self._fit_window_span(best)
+                xs = [p for p, _s, _f in rs.climb_samples]
+                swept_lo, swept_hi = (min(xs), max(xs)) if xs else (fit, fit)
+                if lo <= fit <= hi:
+                    log.info("af2-climb peak refine argmax=%+dc fit=%+dc", best, fit)
+                    best = fit
+                elif swept_lo <= fit <= swept_hi:
+                    # Outside the fit's own window but still inside ground the climb
+                    # actually covered -- interpolation, not extrapolation. TRUST IT.
+                    #
+                    # The argmax is the fragile estimator on curves this broad, and two
+                    # FROZEN-scene runs 17 minutes apart settle it (2026-08-13). Both
+                    # measured the same motionless scene. Their fits landed at raw -1062
+                    # and -1039: 23 counts apart. Their argmaxes disagreed by 712. The
+                    # second run's fit was rejected by this gate, so it parked on the
+                    # argmax and looked like 712 counts of focus drift that never
+                    # happened.
+                    #
+                    # Why: half-width here is ~1700c, so a sample 700c off the peak
+                    # still scores 0.87 of it. A few percent of noise on a flat top and
+                    # the single highest sample wanders hundreds of counts, while a
+                    # parabola over peak_fit_window=20 either side (41 samples) averages
+                    # that away. Same finding as the field map in HANDOFF 32.5, which is
+                    # why its window went 3 -> 20.
+                    log.warning(
+                        "af2-climb peak refine fit=%+dc is outside its window "
+                        "%+dc..%+dc but inside the swept range %+dc..%+dc -- using it "
+                        "(argmax %+dc, %+dc away; a wide fit beats a lone sample on a "
+                        "patch-stepped curve)", fit, lo, hi, swept_lo, swept_hi, best,
+                        fit - best)
+                    best = fit
+                else:
+                    # Genuine extrapolation off the end of everything measured. Live
+                    # 2026-08-13 (crushed curve): argmax +307c, fit -3006c, and the lens
+                    # drove to the dive floor. Unbounded, so never followed.
+                    log.warning(
+                        "af2-climb peak refine REJECTED argmax=%+dc fit=%+dc outside "
+                        "the swept range %+dc..%+dc -- keeping argmax", best, fit,
+                        swept_lo, swept_hi)
         self._gate("climb", "PARK-descend", lambda: self._begin_park(best))
 
     # %% park + hold %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -1312,6 +1777,61 @@ class AutoFocusEngineV2:
             self._begin_dive()
 
     # %% scoring %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    def _fit_window_span(self, argmax_pos: int) -> tuple:
+        """Positions bracketing the samples :func:`_fit_peak` was allowed to see.
+
+        A parabola fitted over [argmax-w, argmax+w] must put its vertex INSIDE that
+        span. Land outside and the fit is extrapolating from something that is not a
+        parabola -- a crushed or seam-broken climb -- and the extrapolation is
+        unbounded. Live 2026-08-13: argmax=+307c, fit=-3006c, 3313 counts apart, and
+        the lens drove to the fit and parked at the dive floor."""
+        xs = [p for p, _s, _f in self._rs.climb_samples]
+        if not xs:
+            return argmax_pos, argmax_pos
+        i = min(range(len(xs)), key=lambda k: abs(xs[k] - argmax_pos))
+        w = max(1, int(self.cfg.peak_fit_window))
+        lo = xs[max(0, i - w)]
+        hi = xs[min(len(xs) - 1, i + w)]
+        return (lo, hi) if lo <= hi else (hi, lo)
+
+    def _pair_scores(self, frame, roi_a: Roi, roi_b: Roi, labels=None) -> tuple:
+        """Same-frame scores for the two cross-cal patches, at the SAME resolution as
+        the curve the resulting ratio gets applied to.
+
+        This used to score both patches on the 4x-decimated coarse frame, because the
+        pipeline could ship only one full-res crop per frame -- the primary's. That is
+        no longer true (it crops N pinned ROIs out of one held slot), and the coarse
+        ratio was never the right number: the metric IS high-frequency energy, and
+        decimation removes and aliases exactly that. A ratio measured coarse equals the
+        full-res ratio only if both patches have the same SHAPE of spatial-frequency
+        spectrum. Two city blocks roughly do; a city block and a ploughed field do not,
+        so the error is systematic in a direction set by content -- and it compounds,
+        because every handover multiplies it into ``cumulative_scale``. The engine
+        already refuses to LOCATE focus on coarse frames for this reason
+        (:meth:`_score_primary`); measuring the scale that ties the curve together on
+        them was the same mistake one layer down.
+
+        Falls back to the coarse pair when no full-res pair path is wired -- sim and
+        the self-checks, where there is no pipeline and both patches live in ``frame``
+        at its only resolution, so the ratio is self-consistent anyway.
+        """
+        if self._full_res_pair is not None:
+            try:
+                # Labels so the app can tell whether the lagging batch still answers THESE
+                # two objects; a same-size turnover of the pair would otherwise cross the
+                # two scores and invert the ratio the stitch is built from.
+                a, b = self._full_res_pair(roi_a, roi_b, labels)
+            except Exception:
+                log.exception("full_res_pair failed")
+                a = b = None
+            # None = no fresh same-frame pair yet; skip rather than mixing one
+            # patch's full-res score with the other's coarse one.
+            if a is not None and b is not None:
+                return a, b
+            return None, None
+        return (self._coarse_pair_score(frame, roi_a),
+                self._coarse_pair_score(frame, roi_b))
 
     def _coarse_pair_score(self, frame, roi: Roi) -> float:
         """Coarse score for one half of a cross-cal pair, in the SAME units the climb

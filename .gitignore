@@ -40,3 +40,29 @@ log.sbf*.txt
 gps_correlation*.csv
 tools/taps/
 
+# Google Drive writes one of these into every synced directory
+desktop.ini
+
+# Vendor SDKs, reference designs and bench imagery -- not source, and large
+KAYA Instruments/
+RefDesign/
+Duplications/
+Running TIF/
+Training pictures/
+Ziv matlab code/
+assets/
+docs/*.pdf
+
+# Scratch outputs and stray files from mistyped shell redirects
+_scratch/
+_scratch*.png
+af_*.png
+af3_*.png
+af_review_out/
+mem_trace.csv
+session_summary_*.txt
+*.canvas.tsx
+$null
+query
+g-My-Drive-Micky-WORK-Cursor-TileBasedFocus/
+

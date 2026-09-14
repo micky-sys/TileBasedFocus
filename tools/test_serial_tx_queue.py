@@ -132,7 +132,10 @@ def test_full_queue_drops_instead_of_growing() -> None:
         for _ in range(50):
             ctrl.focus_step("+", 1)  # far more than the queue can hold
         assert ctrl._tx_q.qsize() <= 4, f"queue grew past cap: {ctrl._tx_q.qsize()}"
-        assert ctrl._tx_dropped >= 46, f"expected drops, got {ctrl._tx_dropped}"
+        # 45, not 46: the TX thread can have dequeued one command and be parked inside
+        # the blocked write still holding it, so the 50 split as 4 queued + 1 in hand +
+        # 45 dropped. Asserting 46 made this fail about half the time on timing alone.
+        assert ctrl._tx_dropped >= 45, f"expected drops, got {ctrl._tx_dropped}"
     finally:
         ser.unblock()
         _teardown(ctrl)

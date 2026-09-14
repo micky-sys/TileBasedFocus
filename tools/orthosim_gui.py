@@ -1,8 +1,8 @@
 r"""OrthoSim -- orthophoto screen bench rig display app.
 
-Full-screen PySide6 app that scrolls a high-resolution orthophoto at a
-calibrated, keyboard-controllable speed (and zoom = simulated height) to
-simulate flight in front of a stationary Iron661 camera. It renders:
+Full-screen PySide6 app that advances a high-resolution orthophoto past a
+stationary Iron661 camera at a calibrated, keyboard-controllable speed (and
+zoom = simulated height) to simulate flight. It renders:
 
 * the scrolling orthophoto (GPU-accelerated via a QOpenGLWidget viewport),
 * four ArUco corner fiducials so the capture side can homography-crop the
@@ -13,6 +13,13 @@ simulate flight in front of a stationary Iron661 camera. It renders:
 
 A CSV of the same ground-truth is written alongside as a cross-check.
 
+The scene is STEPPED, not scrolled: it holds one position until the capture app
+reports a captured frame (loopback UDP, see ``orthosim_codec.STEP_PORT``), then
+advances by the interval that frame took. Every exposure therefore lands on a
+settled panel, which is what removes the one-refresh overdrive ghost that a
+continuously scrolling panel showed on moving scenes and never on static ones.
+With no capture app running the scene stands still and the HUD says so.
+
 Run from source::
 
     py -3 tools/orthosim_gui.py PATH\TO\ortho.tif --gsd 5.0
@@ -20,24 +27,30 @@ Run from source::
     py -3 tools/orthosim_gui.py ortho.png --gsd 5 --windowed   # for bring-up
 
 Controls: Up/Down = +/- speed, +/- or PageUp/PageDown = zoom (height),
-Space = pause, H = HUD, C = calibration overlay, R = reset distance,
-S = save config, Esc/Q = quit.
+Space = pause, H = HUD, A = alignment pattern + tilt readout, C = calibration
+overlay, R = reset distance, S = save config, Esc/Q = quit.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
+import queue
+import socket
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import QElapsedTimer, QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QGuiApplication,
     QImage,
     QKeyEvent,
     QPainter,
@@ -51,6 +64,15 @@ try:
 except Exception:  # pragma: no cover - platform without GL widget
     from PySide6.QtWidgets import QWidget as QOpenGLWidget  # type: ignore
     _HAVE_GL = False
+
+# Before cv2, because it reads this once at import and never again. OpenCV refuses any
+# image over 2**30 pixels as a decompression-bomb guard, and this tool exists to display
+# gigapixel orthophotos: Bnei Brak is 1.17 G, Pardes Hana 2.02 G, so the guard rejects the
+# only inputs the program has. It is NOT a memory limit -- `--reduce` is what bounds RAM,
+# and the guard fires on the file's header size regardless of how little we decode. Left
+# unset it works only from a shell that happens to export the variable, which is a trap
+# that reads as a corrupt file ("Assertion failed: pixels <= CV_IO_MAX_IMAGE_PIXELS").
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(1 << 33))  # 8.6 G px
 
 import cv2
 
@@ -68,9 +90,107 @@ from orthosim_core import (  # noqa: E402
     scroll_speed_screen_px_s,
     screen_gsd_cm,
     simulated_gsd_cm,
+    step_dt,
 )
 
 _TILE_MAX = 4096  # max pixmap tile edge (safe below GPU texture limits)
+
+# Bubble-level scaling. Full scale is 2 deg because the tilt actually measured on the
+# rig was ~1.9 deg, so the dot starts on the dial rather than pinned to the rim. The
+# inner ring is the acceptance threshold: under it the residual focus ramp across a
+# frame is ~0.1 depth of field, i.e. no longer the thing limiting the field map.
+_ALIGN_SCALE_DEG = 2.0
+_ALIGN_OK_DEG = 0.36
+
+
+# ── Frame-step sync ──────────────────────────────────────────────────────────
+class StepListener(threading.Thread):
+    """Receives per-frame step nudges from the capture app on loopback UDP.
+
+    A plain socket on a daemon thread rather than ``QUdpSocket``: the frozen
+    build (``OrthoSim.spec``) would otherwise need QtNetwork pulled in as a
+    hidden import, and this costs the same eight lines without the packaging
+    risk. A ``SimpleQueue`` rather than an integer counter because the GUI
+    thread reads-and-zeroes while this thread increments, and ``+=`` is not
+    atomic -- the queue makes a dropped step impossible instead of merely
+    unlikely, for the same amount of code.
+    """
+
+    def __init__(self, host: str = codec.STEP_HOST, port: int = codec.STEP_PORT) -> None:
+        super().__init__(daemon=True, name="orthosim-step")
+        self.nudges: "queue.SimpleQueue[float]" = queue.SimpleQueue()
+        # Lockstep requests are a QUEUE, not a latest-wins attribute, because a repeat
+        # of a seq is a meaningful EVENT: it means the app's READY went missing and it
+        # is asking again. Collapsing it would leave the app waiting for an answer that
+        # the display already considers delivered, i.e. a deadlock.
+        self.lockstep: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
+        self.received = 0
+        self.error: Optional[str] = None
+        # Latest screen-tilt reading, plus when it landed. A plain attribute rather
+        # than a queue: unlike a step, a stale angle is worthless, so the GUI only
+        # ever wants the newest one and dropping the rest is the correct behaviour.
+        self.align: Optional[codec.AlignReading] = None
+        self.align_t = 0.0
+        self._sock: Optional[socket.socket] = None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Deliberately NO SO_REUSEADDR. On Windows it lets a second socket bind
+            # this same UDP port, and the two then split the datagrams arbitrarily --
+            # a zombie OrthoSim would quietly steal half the steps and the live one
+            # would crawl. UDP has no TIME_WAIT, so an honest bind always succeeds
+            # after a clean or unclean exit; a failure here means something really is
+            # still holding the port, which is worth being told about.
+            sock.bind((host, port))
+        except OSError as exc:
+            self.error = f"step port {host}:{port} unavailable ({exc}) -- already running?"
+            print(f"[OrthoSim] {self.error}", flush=True)
+            sock.close()
+            return
+        self._sock = sock
+
+    def run(self) -> None:
+        if self._sock is None:
+            return
+        while True:
+            try:
+                data, _ = self._sock.recvfrom(128)
+            except OSError:      # socket closed on shutdown
+                return
+            # Two message types share the port. Check the prefixed one first, since
+            # the bare float is the fallback that swallows anything numeric.
+            reading = codec.decode_align(data)
+            if reading is not None:
+                self.align = reading
+                self.align_t = time.monotonic()
+                continue
+            request = codec.decode_step(data)
+            if request is not None:
+                self.received += 1
+                self.lockstep.put(request)
+                continue
+            try:
+                dt = float(data)
+            except ValueError:   # someone else on the port; not ours, ignore
+                continue
+            self.received += 1
+            self.nudges.put(dt)
+
+    def drain(self) -> List[float]:
+        """Every open-loop nudge that arrived since the last call."""
+        return _drain(self.nudges)
+
+    def drain_lockstep(self) -> List[tuple]:
+        """Every lockstep ``(seq, dt)`` request that arrived since the last call."""
+        return _drain(self.lockstep)
+
+
+def _drain(q: "queue.SimpleQueue") -> list:
+    out: list = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            return out
 
 
 def build_date() -> str:
@@ -198,15 +318,32 @@ class OrthoView(QOpenGLWidget):
         self._calibration = False
         self._scale = bool(getattr(cfg, "scale_enabled", False))
         self._seam_visible = False
+        self._align_mode = bool(getattr(cfg, "align_mode", False))
+        self._align_pixmap: Optional[QPixmap] = None
 
         self._aruco = make_aruco_pixmaps(cfg.aruco_dict, cfg.fiducial_px)
 
-        self._clock = QElapsedTimer()
-        self._clock.start()
-        self._last_ns = self._clock.nsecsElapsed()
+        # The scene advances on camera frames, not on wall-clock time, so the
+        # simulation runs on a virtual clock fed by this listener. Started before
+        # the repaint timer so a nudge arriving during bring-up is queued, not lost.
+        self._steps = StepListener()
+        self._steps.start()
+        self._steps_taken = 0
+
+        # Lockstep state. _ls_seq is the request being served; it is kept AFTER the
+        # answer goes out so a re-sent STEP is recognised as a duplicate rather than
+        # advancing the scene a second time.
+        self._ls_seq: Optional[int] = None
+        self._ls_ready_at: Optional[float] = None    # monotonic deadline, None = nothing due
+        self._ls_awaiting_paint = False
+        self._ls_answered = 0
+        self._settle_s = max(0.0, float(getattr(cfg, "settle_ms", codec.SETTLE_MS_DEFAULT))) / 1000.0
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
-        self._timer.start(8)  # ~120 Hz; motion is dt-based so jitter is benign
+        # Still ~120 Hz, but now only to repaint (HUD, key presses, pause state).
+        # Motion happens on nudges, so tick jitter cannot affect the geometry.
+        self._timer.start(8)
 
     # ── helpers ──────────────────────────────────────────────────────────
     def _ensure_zoom(self) -> None:
@@ -224,18 +361,19 @@ class OrthoView(QOpenGLWidget):
 
     # ── per-frame update ─────────────────────────────────────────────────
     def _on_tick(self) -> None:
-        now = self._clock.nsecsElapsed()
-        dt = (now - self._last_ns) / 1e9
-        self._last_ns = now
-        if dt <= 0:
-            return
         self._ensure_zoom()
-        if not self._paused:
-            self._speed = max(0.0, min(self.cfg.max_speed_mps, self._speed))
-            self._distance_m += self._speed * dt
-            v_px = scroll_speed_screen_px_s(self._speed, self.cfg.ortho_gsd_cm, self._zoom)
-            self._scroll += v_px * dt
-            self._tick = (self._tick + 1) % (1 << 20)
+        # Step-and-hold: the scene is motionless between camera frames, so every
+        # 250 us exposure lands on a settled panel. Advancing by the interval the
+        # capture app measured (rather than a configured rate) keeps the simulated
+        # aircraft honest when a frame is late or conflated -- it covers that ground
+        # instead of quietly falling behind its own ground-truth log.
+        # Closed loop first. It is a no-op unless the app is actually sending STEP, so
+        # the two channels coexist and the display needs no mode of its own -- whichever
+        # the app speaks drives the scene, and there is no flag to fall out of sync.
+        self._lockstep_tick()
+        dt = step_dt(self._steps.drain(), self._paused)
+        if dt > 0:
+            self._advance_scene(dt)
         if self._logger is not None:
             self._logger.maybe_log(
                 tick=self._tick,
@@ -249,6 +387,58 @@ class OrthoView(QOpenGLWidget):
                 flags=self._current_flags(),
             )
         self.update()
+
+    def _advance_scene(self, dt: float) -> None:
+        """Move the scene by ``dt`` simulated seconds. The one place motion happens."""
+        self._speed = max(0.0, min(self.cfg.max_speed_mps, self._speed))
+        self._distance_m += self._speed * dt
+        v_px = scroll_speed_screen_px_s(self._speed, self.cfg.ortho_gsd_cm, self._zoom)
+        self._scroll += v_px * dt
+        # One tick per camera frame, so the tick in the optical bar IS the frame index:
+        # the capture side can tie a frame to a scene position by reading it out of the
+        # image, with no clock to correlate.
+        self._tick = (self._tick + 1) % (1 << 20)
+        self._steps_taken += 1
+
+    # ── lockstep handshake ───────────────────────────────────────────────
+    def _lockstep_tick(self) -> None:
+        """Advance on STEP, answer READY once the panel has settled.
+
+        The settle window is started by ``paintGL``, not here. Starting it at the
+        advance would have it overlap the wait for Qt to actually paint, and the whole
+        point of the margin is to cover what the PANEL does after it receives the new
+        frame -- charging the wrong side of the swap would quietly shorten it.
+        """
+        for seq, dt in self._steps.drain_lockstep():
+            if seq == self._ls_seq:
+                # A re-send: our READY went missing, not their STEP. Answer again
+                # without advancing -- a duplicate must never double-step the scene.
+                if self._ls_ready_at is None:
+                    self._ls_ready_at = 0.0     # already settled; answer on this tick
+                continue
+            # Paused forfeits the ground rather than banking it, but must still be
+            # ANSWERED: a display that goes quiet while paused deadlocks the app.
+            if not self._paused:
+                self._advance_scene(dt)
+            self._ls_seq = seq
+            self._ls_awaiting_paint = True
+            self._ls_ready_at = None
+        if self._ls_ready_at is not None and time.monotonic() >= self._ls_ready_at:
+            self._send_ready(self._ls_seq)
+            self._ls_ready_at = None
+            self._ls_answered += 1
+
+    def _send_ready(self, seq: int) -> None:
+        """Tell the app the picture for ``seq`` is up and settled. Never blocks/raises."""
+        sock = getattr(self, "_ls_sock", None)
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            self._ls_sock = sock
+        try:
+            sock.sendto(codec.encode_ready(seq), (codec.STEP_HOST, codec.READY_PORT))
+        except OSError:
+            pass    # app down or buffer full; its timeout is the recovery path
 
     def _current_flags(self) -> int:
         flags = 0
@@ -266,16 +456,67 @@ class OrthoView(QOpenGLWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(0, 0, 0))
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        self._draw_ortho(p)
-        if self._calibration:
-            self._draw_calibration(p)
-        if self._scale:
-            self._draw_scale(p)
+        if self._align_mode:
+            # The pattern replaces the scene rather than overlaying it: the capture
+            # side localises corners sub-pixel, and imagery showing through would
+            # only add texture for the detector to reject.
+            self._draw_alignment_pattern(p)
+        else:
+            self._draw_ortho(p)
+            if self._calibration:
+                self._draw_calibration(p)
+            if self._scale:
+                self._draw_scale(p)
         self._draw_fiducials(p)
         self._draw_bar(p)
+        if self._align_mode:
+            self._draw_align_hud(p)
         if self._hud:
             self._draw_hud(p)
         p.end()
+        # The new scene position has now been handed to the compositor, so this is
+        # where the panel's own transition starts and where the settle margin has to
+        # be measured from. Timing it from the advance instead would spend part of the
+        # margin waiting for Qt to paint and hand the camera a panel still in motion.
+        if self._ls_awaiting_paint:
+            self._ls_awaiting_paint = False
+            self._ls_ready_at = time.monotonic() + self._settle_s
+
+    def _draw_alignment_pattern(self, p: QPainter) -> None:
+        """Static ChArUco board, blitted 1:1, for the capture app to measure tilt off.
+
+        Two details carry the whole thing:
+
+        * **1:1, smoothing off.** Any resample rounds the square edges, and the edge
+          IS the measurement -- corner localisation is what buys the 0.02 deg. Drawn
+          at its native size and centred; if it does not fit the window it is clipped,
+          which costs coverage but never accuracy.
+        * **Centred, not inset below the bar.** ``paintGL`` draws the fiducials and the
+          bar after this, and both lay down their own opaque backing, so they occlude a
+          handful of the board's markers instead of being occluded by it -- the bar
+          stays decodable without giving up any board. Reserving their band at both
+          ends would clip ~14% of the rows, and it is the outermost rows that carry
+          most of the keystone signal, since tilt sensitivity grows with field angle.
+          ChArUco identifies every corner by marker ID, so losing the covered ones
+          costs a little precision and nothing else. On a panel smaller than the board
+          the edges clip, which costs coverage the same way and is reported back as a
+          lower corner count.
+        """
+        if self._align_pixmap is None:
+            b = codec.charuco_board()
+            nx, ny = codec.ALIGN_SQUARES
+            img = np.ascontiguousarray(
+                b.generateImage((nx * codec.ALIGN_SQUARE_PX,
+                                 ny * codec.ALIGN_SQUARE_PX)))
+            h, w = img.shape[:2]
+            self._align_pixmap = QPixmap.fromImage(
+                QImage(img.data, w, h, w, QImage.Format.Format_Grayscale8).copy())
+        pm = self._align_pixmap
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        x = (self.width() - pm.width()) / 2.0
+        y = (self.height() - pm.height()) / 2.0
+        p.drawPixmap(QRectF(x, y, pm.width(), pm.height()), pm, QRectF(pm.rect()))
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     # Reuse paintGL for the non-GL fallback widget.
     def paintEvent(self, event) -> None:  # type: ignore[override]
@@ -417,13 +658,31 @@ class OrthoView(QOpenGLWidget):
             f"OrthoSim  (build {build_date()})",
             f"speed: {self._speed:6.1f} m/s{'  [PAUSED]' if self._paused else ''}",
             f"distance: {self._distance_m/1000.0:8.3f} km   tick: {self._tick}",
+            # Spelled out because a stepped rig with no camera attached looks
+            # broken rather than idle: nothing moves and there is no other clue.
+            (
+                f"STEP CHANNEL DOWN -- {self._steps.error}"
+                if self._steps.error
+                # Lockstep is worth calling out rather than folding into the step
+                # count: "stepped by camera" is true in both, but only here is the
+                # panel guaranteed static through the exposure, and if the settle
+                # margin is what someone is tuning they need to see it on the screen.
+                else f"LOCKSTEP: {self._steps_taken} frames, "
+                     f"{self._ls_answered} answered, settle {self._settle_s*1000:.0f} ms"
+                if self._ls_seq is not None
+                else f"stepped by camera (open loop): {self._steps_taken} frames"
+                if self._steps.received
+                else "WAITING FOR CAMERA -- scene steps on captured frames, "
+                     "not on a timer"
+            ),
             f"zoom: {self._zoom:.4f} screen-px/ortho-px   ortho GSD: {self.cfg.ortho_gsd_cm:.3f} cm/px",
             f"screen GSD: {s_gsd:.4f} cm/screen-px",
             (
                 f"sim camera GSD: {c_gsd:.4f} cm/cam-px (M={self.cfg.magnification:g})"
                 if c_gsd > 0 else "sim camera GSD: set --M from fiducial calibration"
             ),
-            "Up/Down speed  +/- zoom  Space pause  H hud  C calib  G scale  R reset  S save  Esc quit",
+            "Up/Down speed  +/- zoom  Space pause  H hud  A align  C calib  G scale  "
+            "R reset  M screen  S save  Esc quit",
         ]
         p.setFont(QFont("Consolas", 12))
         fm = p.fontMetrics()
@@ -436,6 +695,104 @@ class OrthoView(QOpenGLWidget):
         for s in lines:
             p.drawText(28, int(y), s)
             y += fm.height()
+
+    def _draw_align_hud(self, p: QPainter) -> None:
+        """Bubble level plus signed degrees, for an operator with both hands on the rig.
+
+        A bubble is the primary readout because it has no axis label to get backwards.
+        Which angle is "pitch" depends on a camera roll that is ~90 deg on this rig and
+        could change the next time it is remounted; "drive the dot to the middle" does
+        not. The numbers are there for the record and for judging how close is close.
+
+        Drawn over the CENTRE of the pattern on purpose. It has to be read from across
+        the room while the platform is being adjusted, and the centre is the cheapest
+        place to occlude: tilt sensitivity grows with field angle, so the corners it
+        covers are the ones contributing least.
+        """
+        vw, vh = self.width(), self.height()
+        r = self._steps.align
+        age = time.monotonic() - self._steps.align_t if r is not None else 0.0
+        stale = r is None or age > 2.0
+        if stale:
+            ink = QColor(105, 105, 105)
+        elif r.magnitude_deg <= _ALIGN_OK_DEG:
+            ink = QColor(0, 235, 110)
+        elif r.magnitude_deg <= 1.0:
+            ink = QColor(240, 190, 40)
+        else:
+            ink = QColor(240, 80, 60)
+
+        big, small = QFont("Consolas", 64), QFont("Consolas", 22)
+        headline = ("waiting for the capture app -- press Align" if r is None else
+                    f"v {r.tilt_v_deg:+6.2f}\u00b0  h {r.tilt_h_deg:+6.2f}\u00b0")
+        if r is None:
+            big = QFont("Consolas", 34)
+        # Corner count rides along so a degraded reading can never pass for a good one:
+        # the same angle off 40 corners is worth roughly 6x less than off 312.
+        note = ("" if r is None else
+                f"STALE {age:.0f} s -- capture app stopped sending" if stale else
+                f"{r.n_corners} corners   {r.distance_mm / 1000.0:.2f} m standoff")
+
+        # Size the panel from the text rather than from guessed fractions of R: at 64 pt
+        # the headline is ~1600 px wide on the 4K panel, so a box scaled to the dial
+        # alone would spill the numbers across the pattern.
+        R = min(vw, vh) * 0.13
+        p.setFont(big)
+        fm_big = p.fontMetrics()
+        p.setFont(small)
+        fm_small = p.fontMetrics()
+        pad = 28
+        text_h = fm_big.height() + (fm_small.height() if note else 0)
+        box_w = max(2 * R + 4 * pad, fm_big.horizontalAdvance(headline) + 2 * pad,
+                    (fm_small.horizontalAdvance(note) + 2 * pad) if note else 0)
+        box_h = 2 * R + text_h + 3 * pad
+        cx = vw / 2.0
+        box_x, box_y = cx - box_w / 2.0, vh / 2.0 - box_h / 2.0
+        # Opaque, not translucent: pattern showing through halves the contrast of the
+        # one thing being read from across the room, and the squares under the panel
+        # are lost to the detector either way.
+        p.fillRect(QRectF(box_x, box_y, box_w, box_h), QColor(0, 0, 0))
+        p.setPen(ink)
+        p.drawRect(QRectF(box_x, box_y, box_w, box_h))
+
+        # The dial. Inner ring is the acceptance threshold, outer is full scale.
+        cy = box_y + pad + R
+        for frac, col, label in ((_ALIGN_OK_DEG / _ALIGN_SCALE_DEG,
+                                  QColor(0, 200, 90), f"{_ALIGN_OK_DEG:g}\u00b0"),
+                                 (1.0, QColor(120, 120, 120),
+                                  f"{_ALIGN_SCALE_DEG:g}\u00b0")):
+            p.setPen(ink if stale else col)
+            p.drawEllipse(QRectF(cx - R * frac, cy - R * frac,
+                                 2 * R * frac, 2 * R * frac))
+            p.setFont(QFont("Consolas", 14))
+            p.drawText(int(cx + R * frac + 6), int(cy - 6), label)
+        p.setPen(QColor(105, 105, 105) if stale else QColor(150, 150, 150))
+        p.drawLine(int(cx - R), int(cy), int(cx + R), int(cy))
+        p.drawLine(int(cx), int(cy - R), int(cx), int(cy + R))
+
+        if r is not None:
+            # The dot moves the way the panel is tipping: the screen's vertical axis
+            # tipping in depth drives it up/down, the horizontal axis left/right. The
+            # SIGNS are deliberately unverified against the rig -- nulling a bubble
+            # does not need them, and asserting one would be asserting how the camera
+            # happens to be mounted today.
+            k = R / _ALIGN_SCALE_DEG
+            dx = max(-R, min(R, r.tilt_h_deg * k))
+            dy = max(-R, min(R, r.tilt_v_deg * k))
+            p.setBrush(ink)
+            p.setPen(ink)
+            p.drawEllipse(QRectF(cx + dx - 15, cy + dy - 15, 30, 30))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+
+        y = cy + R + pad + fm_big.ascent()
+        p.setFont(big)
+        p.setPen(QColor(200, 200, 60) if r is None else ink)
+        p.drawText(int(cx - fm_big.horizontalAdvance(headline) / 2), int(y), headline)
+        if note:
+            p.setFont(small)
+            p.setPen(QColor(150, 150, 150) if stale else QColor(185, 185, 185))
+            p.drawText(int(cx - fm_small.horizontalAdvance(note) / 2),
+                       int(y + fm_small.height()), note)
 
     def _draw_calibration(self, p: QPainter) -> None:
         vw, vh = self.width(), self.height()
@@ -527,16 +884,39 @@ class OrthoView(QOpenGLWidget):
             self._hud = not self._hud
         elif k == Qt.Key.Key_C:
             self._calibration = not self._calibration
+        elif k == Qt.Key.Key_A:
+            self._align_mode = not self._align_mode
         elif k == Qt.Key.Key_G:
             self._scale = not self._scale
         elif k == Qt.Key.Key_R:
             self._scroll = 0.0
             self._distance_m = 0.0
             self._tick = 0
+            self._steps_taken = 0
         elif k == Qt.Key.Key_S:
             self._save_config()
+        elif k == Qt.Key.Key_M:
+            self._cycle_screen()
         else:
             super().keyPressEvent(e)
+
+    def _cycle_screen(self) -> None:
+        """Hop the window to the next monitor.
+
+        ``--screen`` is decided once at startup and silently falls through to the
+        primary if the target panel was asleep at that moment, which lands the rig on
+        a 1920x1080 Dell instead of the 4K screen and quietly breaks every
+        layout-dependent decode. This is the recovery that doesn't cost a
+        1.17-gigapixel reload."""
+        win = self.window()
+        screens = QGuiApplication.screens()
+        if len(screens) < 2:
+            print("[OrthoSim] only one screen attached", flush=True)
+            return
+        i, scr = next_screen(screens, win.screen())
+        show_on_screen(win, scr)
+        print(f"[OrthoSim] moved to screen {i} {scr.name()!r}, "
+              f"geometry={win.geometry().getRect()}", flush=True)
 
     def _save_config(self) -> None:
         self.cfg.zoom = self._zoom
@@ -547,6 +927,31 @@ class OrthoView(QOpenGLWidget):
             print(f"[OrthoSim] saved config -> {path}")
         except OSError as exc:
             print(f"[OrthoSim] save config failed: {exc}")
+
+
+def next_screen(screens: list, current) -> Tuple[int, object]:
+    """The screen after ``current``, wrapping. Falls back to the first when the
+    window's screen isn't in the list -- Qt drops a monitor from ``screens()`` when
+    it sleeps, which is exactly when you want the key that gets you off it."""
+    i = screens.index(current) if current in screens else -1
+    j = (i + 1) % len(screens)
+    return j, screens[j]
+
+
+def show_on_screen(win, scr) -> None:
+    """Put ``win`` full-screen on ``scr``.
+
+    Move BEFORE going full-screen so Qt picks the target monitor, and drop out of
+    full-screen first because Windows ignores move() on a window that is already in
+    it. setScreen then pins the choice on platforms that would otherwise re-enter
+    full-screen on the window's original monitor."""
+    if win.isFullScreen():
+        win.showNormal()
+    win.move(scr.geometry().topLeft())
+    win.showFullScreen()
+    wh = win.windowHandle()
+    if wh is not None:
+        wh.setScreen(scr)
 
 
 class OrthoSimWindow(QMainWindow):
@@ -578,6 +983,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="screen-px per ortho-px (default: fit width)")
     ap.add_argument("--dir", dest="scroll_dir", choices=["up", "down", "left", "right"],
                     default=None, help="scroll direction (content flow)")
+    ap.add_argument("--settle-ms", type=int, default=codec.SETTLE_MS_DEFAULT,
+                    help="lockstep: ms to wait after painting before reporting READY, "
+                         "covering the PANEL's own transition (the artefact being "
+                         "removed). Only used when the capture app drives the closed "
+                         "loop; ignored on the open-loop nudge channel")
     ap.add_argument("--config", type=str, default=None, help="config JSON to load")
     ap.add_argument("--log", type=str, default=None,
                     help="ground-truth CSV output path (default: next to ortho)")
@@ -607,6 +1017,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.panel_pitch_mm = args.panel_pitch
     if args.M is not None:
         cfg.magnification = args.M
+    # Not a declared OrthoSimConfig field on purpose: it is a rig-tuning knob set per
+    # launch, and adding it would put it in the saved config JSON as if it were a
+    # property of the scene.
+    cfg.settle_ms = args.settle_ms
     if args.speed is not None:
         cfg.ground_speed_mps = args.speed
     if args.zoom is not None:
@@ -650,16 +1064,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         screens = app.screens()
         if args.screen is not None and 0 <= args.screen < len(screens):
-            # Move onto the target monitor BEFORE going full-screen so Qt picks
-            # that screen; setScreen pins it on platforms that otherwise
-            # full-screen on the window's original screen.
-            scr = screens[args.screen]
-            win.move(scr.geometry().topLeft())
-            win.showFullScreen()
-            wh = win.windowHandle()
-            if wh is not None:
-                wh.setScreen(scr)
+            show_on_screen(win, screens[args.screen])
         else:
+            if args.screen is not None:
+                # Almost always a sleeping monitor: Qt hasn't enumerated it yet, so
+                # the index is out of range and we'd land on the primary without
+                # saying so. Press M once the panel wakes.
+                print(f"[OrthoSim] --screen {args.screen} out of range "
+                      f"({len(screens)} attached); using primary -- press M to move",
+                      flush=True)
             win.showFullScreen()
         win.setCursor(Qt.CursorShape.BlankCursor)
     print(f"[OrthoSim] window shown, geometry={win.geometry().getRect()}, "

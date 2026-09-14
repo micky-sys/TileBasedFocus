@@ -73,6 +73,7 @@ from .frame_buffer_pool import (
     WriteJob,
 )
 from .attitude import compute_attitude_dict
+from .autofocus import PatchTracker
 from .gps_fix import GpsFix
 from .kyfg_backend import KyfgCamera
 from .mode_controller import ModeController
@@ -285,6 +286,7 @@ class FocusJob:
     crop_u16: np.ndarray
     when: _dt.datetime
     gps: Optional[GpsFix] = None
+    tag: str = ""  # filename suffix; several patches can share one timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +490,11 @@ class AcquisitionThread(QThread):
     # None where a pane has no object), cropped from the same held full-res slot as the
     # AF ROI so the split preview shows sensor-native detail instead of the 8x-decimated
     # coarse tap. Display-only; independent of AF.
-    raw_focus_preview_crops = Signal(object, str)  # (list[np.ndarray|None], ISO timestamp)
+    # (list[np.ndarray|None], ISO timestamp, src_ts of the pin these crops were cut with).
+    # The pin travels WITH the batch because the GUI cannot infer it: the pin is posted
+    # from the GUI thread and picked up by this one whenever it next reads it, so a batch
+    # can answer the pin before last. Guessing mislabels the crop by one object.
+    raw_focus_preview_crops = Signal(object, str, object)
     fetch_timeout_count = Signal(int)
     # Cumulative count of sweep frames AcquisitionThread had to drop
     # rather than submit to the writer subprocess. Reasons include
@@ -601,6 +607,30 @@ class AcquisitionThread(QThread):
         # the GUI queue any more than the coarse tap can. Set from the GUI thread.
         self._preview_rois: list = []
         self._preview_crops_inflight = False
+        # Motion-following crops. The GUI pins an ROI from the coarse frame it just
+        # received, but by then this thread has already cropped that frame -- so a pin
+        # can only ever be applied to a LATER frame, one full frame of scene travel out
+        # of date. On the stepped rig that was 315 coarse px against a 476 px box, i.e.
+        # two thirds of the scored tile was not the tracked object (measured 2026-09-01:
+        # content displaced 604-692 crop rows between consecutive samples of one patch).
+        # Fixed by measuring the travel HERE, on the frame about to be cropped, and
+        # shifting the stale pin by it. A measurement, not a prediction -- which is why
+        # it holds for smooth flight motion and for the bench's stop-go alike.
+        self._roi_follow = False              # opt-in: the field map wants FIXED tiles
+        self._roi_tracker: Optional[PatchTracker] = None
+        # Travel owed to the current pin, in coarse-frame px. Accumulates rather than
+        # resetting per frame because a conflated frame never reaches the GUI, so its
+        # travel is not in the next pin either and has to be carried.
+        self._roi_debt_x = 0.0                # last computed debt (diagnostic)
+        self._roi_debt_y = 0.0
+        # (rois, follow, src_ts) published in ONE write. src_ts names the frame the GUI
+        # derived the pin from, which is what makes the correction independent of HOW
+        # STALE the pin is -- see _accrue_roi_travel.
+        self._roi_pin: tuple = ([], False, None)
+        self._roi_travel_x = 0.0              # odometer: cumulative travel, never reset
+        self._roi_travel_y = 0.0
+        self._roi_travel_at: dict = {}        # frame ts -> odometer reading at that frame
+        self._roi_shift_max = 0.0             # diag: largest shift applied, coarse px
         # State-transition logging for "why we couldn't write": a
         # missing project name + a busy trigger would otherwise emit
         # ~40 lines/sec into the log, freezing the GUI's QPlainTextEdit.
@@ -664,16 +694,97 @@ class AcquisitionThread(QThread):
         letting the 8 MB payloads accumulate."""
         self._focus_frame_inflight = False
 
-    def set_preview_rois(self, rois: list) -> None:
+    def set_preview_rois(self, rois: list, follow: bool = False,
+                         src_ts: Optional[str] = None) -> None:
         """Two-object preview: pin the full-res ROIs (sensor-pixel coords, one per pane,
         None where a pane is empty) to crop from the held slot each frame. List
-        assignment is atomic under the GIL, so no lock is needed."""
-        self._preview_rois = list(rois) if rois else []
+        assignment is atomic under the GIL, so no lock is needed.
+
+        ``follow`` compensates the one-frame pinning lag by shifting these ROIs by the
+        scene travel measured on each frame before it is cropped, so the crop lands where
+        the object IS rather than where it was when the GUI last saw it. Off by default:
+        the field map wants its tiles nailed to fixed sensor pixels on a frozen scene,
+        which is the opposite requirement.
+
+        ``src_ts`` is the ``acquire_ts_iso`` of the frame this pin was derived from. Pass
+        it whenever ``follow`` is set: it is what lets the acq thread charge exactly the
+        travel since that frame, however many frames the GUI took to answer. Without it
+        the correction silently assumes a one-frame turnaround.
+
+        The whole Bayer rectangle is cut, even though every scoring consumer immediately
+        reduces it to ``[0::2, 1::2]``. Cutting the green sub-grid here instead was tried
+        on 2026-09-10 and reverted: it does make the cut cheaper (9.5 -> 5.6 ms on a
+        live-sized patch) but the cut is only a quarter of a patch's ~30 ms, the score is
+        the rest, and the column stride reads the same cache lines while losing the
+        per-row memcpy -- so the total was a wash. See ``tools/bench_af_cost.py``.
+
+        Published as ONE object so the acq thread reads the ROIs, the follow flag and the
+        source frame in a single read; separate assignments left a window (the full-res
+        slot fetch) in which a crop could pair a new pin with the old pin's travel."""
+        self._roi_pin = (list(rois) if rois else [], bool(follow), src_ts)
+        self._preview_rois, self._roi_follow = self._roi_pin[0], self._roi_pin[1]
 
     def note_preview_crops_consumed(self) -> None:
         """GUI-thread ack for a ``raw_focus_preview_crops`` batch (see
         ``note_focus_frame_consumed``); releases the crop conflation latch."""
         self._preview_crops_inflight = False
+
+    def _accrue_roi_travel(self, small_u16, ts: str) -> tuple:
+        """Advance the odometer; return ``(rois, src_ts, debt_x, debt_y)``: the pin to
+        crop, WHICH pin it is, and how far the scene moved since the frame it came from.
+
+        The caller must crop the returned list rather than re-reading the attribute: the
+        pin and its debt are only a consistent pair at this instant.
+
+        Charged against the pin's OWN source frame rather than reset whenever a new pin
+        appears. Resetting silently assumes the GUI answers in one frame; when it falls
+        behind -- it conflates frames under load -- the reset discarded travel that was
+        still owed and the crop window lagged the object, then over-shot catching up.
+        Measured on the 14:18 run, oid 1: window moved 278 px while the scene moved 564,
+        then 1100 against 768 three frames later. Totals matched to 2 px in 2688, so
+        nothing was lost -- it was pure delay, which is what an odometer removes.
+
+        Runs here, on the acq thread, because this is the only place that sees the frame
+        BEFORE it is cropped -- which is the whole point. ~27 ms on a 3350x2382 coarse
+        frame, 13% of a 200 ms frame budget, and it is work moved rather than added: the
+        engine's own tracker does the same phase correlation one thread later, on the
+        thread that is already conflating ~28% of frames.
+
+        A low correlation means the picture changed for some reason other than panning
+        (an AF excursion blurred it), so hold the ROI rather than shifting it by a
+        meaningless vector -- the same call ``_advance_objects`` makes on the engine side.
+
+        ponytail: one global translation for the whole frame, so it corrects pan but not
+        per-object parallax or rotation. That is the motion model the tracker and the AF
+        engine already assume; the upgrade path is a per-ROI refinement pass, which needs
+        the previous frame's crops kept alive to correlate against.
+        """
+        rois, follow, src_ts = self._roi_pin        # ONE read: pin and travel must pair
+        if not follow or not rois:
+            return rois, src_ts, 0.0, 0.0
+        if small_u16 is not None and getattr(small_u16, "ndim", 0) >= 2:
+            if self._roi_tracker is None:
+                self._roi_tracker = PatchTracker()
+            try:
+                dx, dy, response = self._roi_tracker.update(small_u16)
+                if response >= 0.05:                # AutoFocusConfig.min_track_response
+                    self._roi_travel_x += dx
+                    self._roi_travel_y += dy
+            except Exception as exc:                # never let a diagnostic stall acq
+                log.warning("%s ROI travel measure failed: %s", self.label, exc)
+        # Stamp the odometer for THIS frame, so a pin derived from it can later be charged
+        # the exact distance travelled since -- no assumption about how long the GUI took.
+        self._roi_travel_at[ts] = (self._roi_travel_x, self._roi_travel_y)
+        if len(self._roi_travel_at) > 64:           # dict keeps insertion order
+            for k in list(self._roi_travel_at)[:-32]:
+                del self._roi_travel_at[k]
+        base = self._roi_travel_at.get(src_ts)      # unknown pin => no correction
+        bx, by = base if base is not None else (self._roi_travel_x, self._roi_travel_y)
+        self._roi_debt_x = self._roi_travel_x - bx
+        self._roi_debt_y = self._roi_travel_y - by
+        self._roi_shift_max = max(
+            self._roi_shift_max, abs(self._roi_debt_x), abs(self._roi_debt_y))
+        return rois, src_ts, self._roi_debt_x, self._roi_debt_y
 
     def set_fine_focus_enabled(self, enabled: bool) -> None:
         """M4 only: when True, focus tap reads full-res from pool and emits RGB."""
@@ -1055,6 +1166,8 @@ class AcquisitionThread(QThread):
 
                 if want_focus_tap:
                     self._last_focus_tap_t = now_t
+                    pinned_rois, pin_src_ts, debt_x, debt_y = self._accrue_roi_travel(
+                        small_u16, acquire_ts_iso)
                     try:
                         if (
                             self._fine_focus
@@ -1116,9 +1229,8 @@ class AcquisitionThread(QThread):
                                 y0 = max(0, min(int(y0), fh2 - 2))
                                 x1 = max(x0 + 2, min(int(x1), fw2))
                                 y1 = max(y0 + 2, min(int(y1), fh2))
-                                crop = np.ascontiguousarray(
-                                    fv[y0:y1, x0:x1]
-                                ).copy()
+                                # One copy, always owned -- see the batch path below.
+                                crop = np.array(fv[y0:y1, x0:x1], order="C")
                                 self.raw_focus_roi_u16.emit(crop, acquire_ts_iso)
                                 self._focus_roi_crops_shipped += 1
                             # Two-object preview: crop each pinned ROI from the SAME
@@ -1127,28 +1239,48 @@ class AcquisitionThread(QThread):
                             # up the GUI queue. Slot release is unchanged (the single
                             # release in the finally covers this read too).
                             if (
-                                self._preview_rois
+                                pinned_rois
                                 and slot_for_fine is not None
                                 and self._pool is not None
                                 and not self._preview_crops_inflight
                             ):
                                 fvp = self._pool.slot_view(slot_for_fine)
                                 fhp, fwp = fvp.shape[:2]
+                                # Coarse-frame travel -> sensor px, and snapped even so the
+                                # crop keeps landing on the same Bayer quad (an odd origin
+                                # samples a different colour plane and shifts the score).
+                                sub = KyfgCamera.SUBSAMPLE_FACTOR
+                                shx = int(round(debt_x * sub)) & ~1
+                                shy = int(round(debt_y * sub)) & ~1
                                 crops: list = []
-                                for proi in self._preview_rois:
+                                for proi in pinned_rois:
                                     if proi is None:
                                         crops.append(None)
                                         continue
                                     px0, py0, px1, py1 = proi
+                                    px0 += shx
+                                    px1 += shx
+                                    py0 += shy
+                                    py1 += shy
                                     px0 = max(0, min(int(px0), fwp - 2))
                                     py0 = max(0, min(int(py0), fhp - 2))
                                     px1 = max(px0 + 2, min(int(px1), fwp))
                                     py1 = max(py0 + 2, min(int(py1), fhp))
-                                    crops.append(
-                                        np.ascontiguousarray(fvp[py0:py1, px0:px1]).copy()
-                                    )
+                                    # ONE copy. `ascontiguousarray(view).copy()` made
+                                    # two: on a strided ROI view the first call already
+                                    # allocates an owned contiguous array, and .copy()
+                                    # then duplicated it -- so every AF patch paid its
+                                    # memory traffic twice, per patch, per frame, on the
+                                    # thread that delivers frames. Not written as a bare
+                                    # `.copy()` on the view: this must ALWAYS own its
+                                    # data, and ascontiguousarray returns the input
+                                    # untouched when a slice happens to be contiguous
+                                    # (a full-width ROI), which would hand the GUI a live
+                                    # view of a slot that the finally-block recycles.
+                                    crops.append(np.array(fvp[py0:py1, px0:px1], order="C"))
                                 self._preview_crops_inflight = True
-                                self.raw_focus_preview_crops.emit(crops, acquire_ts_iso)
+                                self.raw_focus_preview_crops.emit(
+                                    crops, acquire_ts_iso, pin_src_ts)
                             # Conflate: only emit if the GUI has consumed the
                             # previous 8 MB frame. Otherwise drop this one so the
                             # queued-event backlog can't grow unbounded (the crash).
@@ -2081,6 +2213,7 @@ class FocusWriterThread(QThread):
                     project_raw=project_raw,
                     camera_serial=self._camera_serial,
                     when=job.when,
+                    tag=job.tag,
                 )
                 ensure_directory(fname)
                 path = fname.full_path()
@@ -2669,10 +2802,22 @@ class CameraPipeline:
         ``None`` to restore the default winning-tile auto-pick."""
         self.acq.set_focus_roi(roi)
 
-    def set_preview_rois(self, rois: list) -> None:
+    def set_preview_rois(self, rois: list, follow: bool = False,
+                         src_ts: Optional[str] = None) -> None:
         """Two-object preview: pin the full-res ROIs (sensor pixels, one per pane,
-        None where empty) cropped from the held slot for the split preview."""
-        self.acq.set_preview_rois(rois)
+        None where empty) cropped from the held slot for the split preview.
+
+        ``follow=True`` corrects the pinning lag by shifting these ROIs by the scene
+        travel measured since ``src_ts`` -- the frame this pin was derived from -- before
+        cropping. Scoring wants that; the field map, which nails tiles to fixed pixels on
+        a frozen scene, does not."""
+        self.acq.set_preview_rois(rois, follow=follow, src_ts=src_ts)
+
+    @property
+    def roi_shift_max(self) -> float:
+        """Largest motion correction applied to a followed ROI, in coarse px. Zero over a
+        whole run means the correction never engaged and the crops are the stale ones."""
+        return self.acq._roi_shift_max
 
     def note_preview_crops_consumed(self) -> None:
         """GUI-thread ack releasing the two-object-preview crop conflation latch."""
@@ -2685,6 +2830,7 @@ class CameraPipeline:
         crop_u16: np.ndarray,
         when: Optional[_dt.datetime] = None,
         gps: Optional[GpsFix] = None,
+        tag: str = "",
     ) -> bool:
         """Queue a focus-view crop for writing.
 
@@ -2702,7 +2848,7 @@ class CameraPipeline:
         if not self._modes.is_focus_mode():
             return False
         when = when or _dt.datetime.now()
-        job = FocusJob(crop_u16=crop_u16.copy(), when=when, gps=gps)
+        job = FocusJob(crop_u16=crop_u16.copy(), when=when, gps=gps, tag=tag)
         try:
             self.focus_queue.put_nowait(job)
         except queue.Full:

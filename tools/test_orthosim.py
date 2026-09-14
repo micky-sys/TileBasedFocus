@@ -17,10 +17,13 @@ for _p in (str(_TOOLS), str(_ROOT), str(_HOST)):
 
 import orthosim_codec as codec  # noqa: E402
 from orthosim_core import (  # noqa: E402
+    MAX_STEP_S,
+    MIN_STEP_S,
     OrthoSimConfig,
     screen_gsd_cm,
     scroll_speed_screen_px_s,
     simulated_gsd_cm,
+    step_dt,
 )
 from tile_geometry import TileGrid  # noqa: E402
 
@@ -105,6 +108,139 @@ def test_scroll_speed_mapping() -> None:
     # zoom 2 doubles the on-screen speed
     assert abs(scroll_speed_screen_px_s(40.0, 5.0, 2.0) - 1600.0) < 1e-6
     assert scroll_speed_screen_px_s(40.0, 0.0, 1.0) == 0.0
+
+
+def test_step_dt_sums_a_batch_and_clamps_each_nudge() -> None:
+    # Two frames arrived between repaints: the scene owes both, not just the last.
+    assert abs(step_dt([0.24, 0.24]) - 0.48) < 1e-9
+    # A host-side stall must not teleport the scene across the orthophoto.
+    assert abs(step_dt([30.0]) - MAX_STEP_S) < 1e-9
+    # ...nor may a garbage sub-millisecond interval stall it.
+    assert abs(step_dt([0.0]) - MIN_STEP_S) < 1e-9
+    assert step_dt([]) == 0.0
+
+
+def test_pausing_discards_pending_steps_rather_than_banking_them() -> None:
+    """The whole point of the stepped rig is that the panel is never moving during
+    an exposure. Banking nudges while paused would replay the backlog as one
+    enormous jump on un-pause -- a worse smear than the one we are removing."""
+    assert step_dt([0.24, 0.24, 0.24], paused=True) == 0.0
+
+
+def test_the_lockstep_handshake_round_trips() -> None:
+    assert codec.decode_step(codec.encode_step(7, 0.25)) == (7, 0.25)
+    assert codec.decode_ready(codec.encode_ready(7)) == 7
+    assert codec.decode_step(codec.encode_step(0, 0.0)) == (0, 0.0)
+
+
+def test_lockstep_will_not_mistake_a_message_for_a_different_one() -> None:
+    """The three message types are not interchangeable and two of them SHARE a port.
+
+    STEP and ALIGN both go app -> display on STEP_PORT, so the display's receive loop
+    tells them apart by prefix alone; getting that wrong would feed a tilt reading in
+    as a scene advance. And ``decode_step`` deliberately refuses a bare float -- that
+    is the OPEN-LOOP channel's payload, and accepting it would let a stale sender
+    advance a lockstep display with no handshake at all, which is exactly the
+    behaviour lockstep replaces, coming back as an invisible mixed mode."""
+    align = codec.encode_align(codec.AlignReading(1.5, -0.5, 312, 1234.0))
+    assert codec.decode_step(align) is None
+    assert codec.decode_align(codec.encode_step(1, 0.2)) is None   # shared port
+    assert codec.decode_step(b"0.208") is None                     # open-loop nudge
+    assert codec.decode_ready(codec.encode_step(3, 0.2)) is None
+    assert codec.decode_step(codec.encode_ready(3)) is None
+    for junk in (b"", b"STEP ", b"STEP x y", b"STEP 1", b"STEPPED 1 0.2"):
+        assert codec.decode_step(junk) is None, junk
+    for junk in (b"", b"READY", b"READY z", b"READYISH 1"):
+        assert codec.decode_ready(junk) is None, junk
+
+
+class _LockstepStub:
+    """Just the attributes ``OrthoView._lockstep_tick`` touches.
+
+    A stub rather than a real widget because the handshake is pure state machine and
+    the interesting cases (a duplicate request, a paused display) are awkward to
+    provoke through Qt but trivial here.
+    """
+
+    def __init__(self, requests, paused=False, settle_s=0.05):
+        self._steps = type("S", (), {"drain_lockstep": lambda s: requests})()
+        self._paused = paused
+        self._settle_s = settle_s
+        self._ls_seq = None
+        self._ls_ready_at = None
+        self._ls_awaiting_paint = False
+        self._ls_answered = 0
+        self.advanced = []
+        self.readied = []
+
+    _advance_scene = lambda self, dt: self.advanced.append(dt)      # noqa: E731
+    _send_ready = lambda self, seq: self.readied.append(seq)        # noqa: E731
+
+    def paint(self):
+        """Stand in for paintGL handing the frame to the compositor."""
+        if self._ls_awaiting_paint:
+            self._ls_awaiting_paint = False
+            self._ls_ready_at = 0.0        # settled already, for a deterministic test
+
+
+def test_a_lockstep_step_is_answered_only_after_the_panel_has_painted() -> None:
+    """READY must not go out on the same tick as the advance. The app treats READY as
+    permission to open the shutter, so answering before the frame is even painted would
+    hand it the exact mid-transition panel that lockstep exists to prevent."""
+    from orthosim_gui import OrthoView
+
+    reqs = [(1, 0.2)]
+    s = _LockstepStub(reqs)
+    OrthoView._lockstep_tick(s)
+    assert s.advanced == [0.2], s.advanced
+    assert s.readied == [], "answered before the scene was even painted"
+    assert s._ls_awaiting_paint is True
+
+    reqs.clear()
+    s.paint()
+    OrthoView._lockstep_tick(s)
+    assert s.readied == [1], s.readied
+
+
+def test_a_resent_lockstep_step_is_answered_again_but_never_advances_twice() -> None:
+    """The app re-sends STEP when READY goes missing, so a duplicate seq is expected
+    traffic. Advancing on it would double-step the scene -- reintroducing the very
+    250-row double-jump (HANDOFF 36.17) this handshake removes. Ignoring it instead
+    would deadlock the app, which is waiting for an answer already considered sent."""
+    from orthosim_gui import OrthoView
+
+    reqs = [(1, 0.2)]
+    s = _LockstepStub(reqs)
+    OrthoView._lockstep_tick(s)
+    reqs.clear()
+    s.paint()
+    OrthoView._lockstep_tick(s)
+    assert (s.advanced, s.readied) == ([0.2], [1])
+
+    reqs.append((1, 0.2))                  # the app asks again
+    OrthoView._lockstep_tick(s)
+    assert s.advanced == [0.2], f"a duplicate advanced the scene twice: {s.advanced}"
+    assert s.readied == [1, 1], f"a duplicate went unanswered: {s.readied}"
+
+    reqs[:] = [(2, 0.2)]                   # a genuinely new step still moves
+    OrthoView._lockstep_tick(s)
+    assert s.advanced == [0.2, 0.2], s.advanced
+
+
+def test_a_paused_lockstep_display_still_answers() -> None:
+    """Pausing forfeits the ground rather than banking it (see step_dt), but a display
+    that goes quiet while paused would hang the app on its timeout instead of just
+    holding the scene still."""
+    from orthosim_gui import OrthoView
+
+    reqs = [(1, 0.2)]
+    s = _LockstepStub(reqs, paused=True)
+    OrthoView._lockstep_tick(s)
+    reqs.clear()
+    s.paint()
+    OrthoView._lockstep_tick(s)
+    assert s.advanced == [], "paused display moved the scene"
+    assert s.readied == [1], "paused display went silent and would deadlock the app"
 
 
 def test_config_json_roundtrip(tmp_path) -> None:
@@ -432,3 +568,19 @@ def test_gt_logger_survives_a_failing_sink(tmp_path) -> None:
 
     log._last_perf = 0.0                    # defeat the rate limit
     log.maybe_log(**kw)                     # and stay quiet forever after
+
+
+def test_next_screen_wraps_and_recovers_from_a_screen_that_vanished() -> None:
+    """The M hotkey's only real logic. The recovery case is the one that matters: Qt
+    drops a monitor from screens() while it sleeps, so the window can be sitting on a
+    screen that is no longer in the list -- which is precisely when the operator is
+    reaching for the key. Landing on index 0 beats raising ValueError at them."""
+    from orthosim_gui import next_screen
+
+    dell, panel4k, tv = "DELL U2417H", "AAA", "spare"
+    screens = [dell, panel4k, tv]
+
+    assert next_screen(screens, dell) == (1, panel4k)
+    assert next_screen(screens, tv) == (0, dell)            # wraps off the end
+    assert next_screen(screens, "asleep") == (0, dell)      # gone -> first, no throw
+    assert next_screen([dell], dell) == (0, dell)           # single screen: no-op

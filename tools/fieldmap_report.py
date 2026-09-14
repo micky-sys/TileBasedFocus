@@ -104,6 +104,9 @@ def read_tiles(path: str, window: int):
             "width": (max(above) - min(above)) if above else 0.0,
             "contrast": contrast,
             "n_above": len(above),
+            # The curve itself, for callers that need the score at an arbitrary
+            # parked position rather than just the vertex (flatness_report).
+            "scores": s,
         }
     return pos, out
 

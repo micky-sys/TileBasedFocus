@@ -69,6 +69,12 @@ class OrthoSimConfig:
     fiducial_margin_px: int = 24
     aruco_dict: str = "DICT_4X4_50"
 
+    # Screen-tilt nulling: replace the scene with a static ChArUco board so the capture
+    # app can measure the camera-to-panel angle and send it back for display. This is
+    # only the STARTUP value; 'A' toggles the live state without writing back, the same
+    # way H and G do, so an 'S' save can't strand the next launch in a setup aid.
+    align_mode: bool = False
+
     # Ground-distance scale (human-readable ruler along the scroll axis)
     scale_enabled: bool = False        # toggled live with 'G'
     scale_target_px: int = 200         # desired tick spacing (screen px)
@@ -120,6 +126,27 @@ def scroll_speed_screen_px_s(
         return 0.0
     ortho_px_s = ground_speed_mps * 100.0 / ortho_gsd_cm  # m/s -> ortho-px/s
     return ortho_px_s * zoom
+
+
+# Per-nudge clamp on the reported inter-frame interval. The capture app measures
+# it live, so a GUI-thread stall, a breakpoint or a mode change can hand us an
+# arbitrarily long gap; the scene should cover the ground the aircraft would have
+# covered, not teleport across the orthophoto because someone paused a debugger.
+MIN_STEP_S = 0.01
+MAX_STEP_S = 2.0
+
+
+def step_dt(nudges, paused: bool = False,
+            lo: float = MIN_STEP_S, hi: float = MAX_STEP_S) -> float:
+    """Simulated seconds owed to the scene for a batch of frame-step nudges.
+
+    ``paused`` returns 0 but the caller still has to have *drained* the nudges:
+    holding them would make un-pausing lurch the scene forward by the whole
+    backlog, in one repaint, which is precisely the smear the stepped rig exists
+    to avoid. Pausing means the scene stands still and that ground is forfeit.
+    """
+    total = sum(min(max(float(n), lo), hi) for n in nudges)
+    return 0.0 if paused else total
 
 
 def simulated_height_hint_m(
@@ -273,6 +300,14 @@ class GroundTruthLogger:
             try:
                 self._fh.flush()
                 self._fh.close()
+            except OSError as exc:
+                # Same Errno 22 the write path above already tolerates: the handle
+                # lives on a virtual drive that rejects flush. Swallowing it here too
+                # is the point -- close() runs on the way out of main(), so an
+                # exception makes a normal operator shutdown exit non-zero and look
+                # like a crash. Seen live 2026-09-09.
+                print(f"[OrthoSim] ground-truth CSV close failed, ignoring: {exc}",
+                      flush=True)
             finally:
                 self._fh = None
                 self._writer = None

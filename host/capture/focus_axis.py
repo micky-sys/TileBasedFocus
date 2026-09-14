@@ -319,7 +319,14 @@ class EncoderAxis(FocusAxis):
         Two uses: telling 'the tracker is frozen' apart from 'the origin maths
         cancelled the move', and comparing results ACROSS AF runs -- this is the
         only position that survives :meth:`reset`, so it is the common frame for
-        e.g. checking a moving-scene run against a frozen-scene reference."""
+        e.g. checking a moving-scene run against a frozen-scene reference.
+
+        WITHIN ONE APP SESSION ONLY. It survives reset(), not a reconnect: the
+        ClearCore re-references on connect, so the same physical lens position reads
+        differently after a relaunch. Measured 2026-08-13 -- a run ended at raw=-366,
+        the app was closed and reopened with nothing driving the focus in between, and
+        the next sweep started at raw=-3391. Rebasing runs from two sessions onto raw
+        silently invents ~3000 counts of drift that never happened."""
         return float(self._read())
 
     def _backlash(self) -> int:

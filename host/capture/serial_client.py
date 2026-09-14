@@ -129,6 +129,13 @@ class SerialClient(QObject):
         """
         self._ctrl.test_trigger()
 
+    def set_external_trigger(self, on: bool) -> None:
+        """``$X1*``/``$X0*``: M4 fires only on host ``$T*``, or on its own timer.
+
+        Bench only -- see :meth:`FocusController.set_external_trigger`.
+        """
+        self._ctrl.set_external_trigger(on)
+
     # ── internal ────────────────────────────────────────────────────────
 
     def _on_line(self, line: str) -> None:

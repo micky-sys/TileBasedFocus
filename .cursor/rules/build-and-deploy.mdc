@@ -1,0 +1,62 @@
+---
+description: How to build, deploy, and launch the Iron661 / Parallax PySide6 apps (PyInstaller)
+globs: **/*.spec,**/install_parallax_desktop.ps1,**/build_windows_release.ps1
+alwaysApply: false
+---
+# Building & Deploying the Apps
+
+PySide6 desktop apps (Iron661Capture, Parallax Export Studio, OrthoSim) packaged with
+**PyInstaller onedir**. Environment: Windows, Python **3.14** (`py -3`). Install deps from
+`host/`: `py -3 -m pip install -r requirements.txt -r requirements-build.txt`.
+See [HANDOFF.md](mdc:HANDOFF.md) §2–4 and [pkg_issue.md](mdc:docs/pkg_issue.md).
+
+## ⛔ Never build onto Google Drive
+
+The repo lives on `G:\My Drive\…` (a streamed virtual filesystem). If PyInstaller's
+`COLLECT` writes the EXE there, the embedded PKG tail is corrupted and the EXE dies at
+launch with *"Could not load PyInstaller's embedded PKG archive"*. Smoking gun: COLLECT
+takes ~160 s on `G:` vs <30 s on `C:`. **Always redirect `--distpath`/`--workpath` to
+local NTFS.** Only the output bytes must be local — the `.spec` can stay on Drive.
+
+```powershell
+# ✅ Good: build to local NTFS, then mirror to the deploy folder
+$r = Join-Path $env:LOCALAPPDATA 'Iron661Build'
+py -3 -m PyInstaller --noconfirm --clean --distpath "$r\dist" --workpath "$r\build" Iron661Capture.spec
+.\install_parallax_desktop.ps1   # robocopy /MIR to "C:\Parallax Apps\Iron661 Capture" + desktop shortcut
+
+# ❌ Bad: bare build writes COLLECT onto G:\ → corrupt PKG, dead EXE
+py -3 -m PyInstaller Iron661Capture.spec
+```
+
+- Run these from `host/`. `install_parallax_desktop.ps1` prefers the local build output
+  and mirrors it to `C:\Parallax Apps\…` (note the spaces).
+- Do **not** use `build_windows_release.ps1` as-is: `$ErrorActionPreference='Stop'` makes
+  it abort when `pip` prints its upgrade notice to stderr. Run the steps above directly.
+
+## Smoke-test the EXE for real
+
+The PKG-corruption popup leaves the process **alive**, so a bare "did it exit?" check
+passes on a broken build. Confirm the window actually came up:
+
+```powershell
+(Get-Process -Id <pid>).MainWindowTitle   # must be non-empty (e.g. "Iron 661 Capture + Focus (build …)")
+```
+
+## Launching a Qt GUI from the agent shell
+
+The agent/automation shell sets `QT_QPA_PLATFORM=offscreen`, so Qt renders invisibly (no
+window) even though the process is healthy. Override it when launching for display:
+
+```powershell
+$env:QT_QPA_PLATFORM = "windows"
+py -3 host/main_capture.py
+```
+
+A normal interactive terminal needs no override.
+
+## Git
+
+Commit with `git.exe commit` from `cmd` (the harness appends a `Co-authored-by: … <…>`
+trailer whose `<` breaks PowerShell parsing). Stage only intended files — the tree has
+pre-existing untracked junk (`Training pictures/`, `RefDesign/`, captures) that must not
+be committed. Generated `build/`/`dist/`, logs, and captures are gitignored.

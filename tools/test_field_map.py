@@ -131,6 +131,66 @@ def test_tiles_stay_inside_the_given_region() -> None:
     print("ok: tiles confined to the fiducial region (and would escape without it)")
 
 
+def test_the_tile_cross_is_centred_and_clears_the_bar_at_either_end() -> None:
+    """Two properties, both learned the hard way on 2026-08-31.
+
+    The box used to be trimmed on the single edge the DISPLAY config named. But the
+    display names a screen edge and the optics invert, so the bar drawn at the screen's
+    top images at the frame's BOTTOM: the trim cut the clean end and left the bar inside
+    the box. The operator saw it as "the field map is not symmetric" -- the cross sat
+    9.2% of the frame height below centre, measured against 9.5% predicted.
+
+    That is not cosmetic. ``five_tile_rois`` distinguishes a tilted subject plane (top
+    and bottom fall on OPPOSITE sides of centre) from a curved field (same side), and
+    that reading is only valid if the two are equidistant from centre. It also cost
+    baseline: the truncated span reported a 525c vertical tilt where the earlier, even
+    more truncated one reported 301c -- the number moved with the geometry, not the
+    optics.
+
+    So: symmetric about the frame centre, and clear of a bar band at EITHER end."""
+    from capture.field_map import inset_box
+
+    W, H = 13400, 9528
+    ship = FieldMapConfig()
+    BAR = 0.085                      # measured strip height, fraction of frame height
+
+    box = inset_box((0, 0, W, H), ship.box_inset)
+    rois = five_tile_rois(W, H, ship, tuple(int(v) for v in box))
+    named = dict(zip(TILE_NAMES, rois))
+
+    def centre(roi):
+        return 0.5 * (roi[0] + roi[2]), 0.5 * (roi[1] + roi[3])
+
+    (cx, cy) = centre(named["centre"])
+    (_, ty) = centre(named["top"])
+    (_, by) = centre(named["bottom"])
+    (lx, _) = centre(named["left"])
+    (rx, _) = centre(named["right"])
+
+    # Centred: the cross's own centre tile sits on the frame centre, and each pair
+    # straddles it by equal amounts. One-sided trimming broke exactly this.
+    assert abs(cy - H / 2) <= 2, f"centre tile is {cy - H / 2:+.0f}px off frame centre"
+    assert abs(cx - W / 2) <= 2
+    assert abs((cy - ty) - (by - cy)) <= 2, (
+        f"top is {cy - ty:.0f}px above centre but bottom {by - cy:.0f}px below -- "
+        "an off-centre cross reads a tilt as a curvature and vice versa")
+    assert abs((cx - lx) - (rx - cx)) <= 2
+
+    # Clear of the bar at EITHER end, since which end it images on is not knowable
+    # from the display config. This is the assertion the old one-sided trim failed.
+    for name in ("top", "bottom"):
+        y0, y1 = named[name][1], named[name][3]
+        assert y1 <= (1.0 - BAR) * H, f"{name} tile reaches into a bottom-edge bar"
+        assert y0 >= BAR * H, f"{name} tile reaches into a top-edge bar"
+
+    # Close to the edges: the tilt baseline is the measurement, and compounding three
+    # insets had squeezed it to 40% of the frame height.
+    span = (by - ty) / H
+    assert span > 0.60, f"vertical baseline only {span * 100:.0f}% of frame height"
+    print(f"ok: cross centred, bar cleared both ends, baseline {span * 100:.0f}% "
+          f"of frame height (was 40%)")
+
+
 def test_a_flat_field_gives_every_tile_the_same_vertex() -> None:
     """Control: identical true focus everywhere -> spread is fit noise, not signal.
     If this fails, any spread the tool reports on the rig is the tool's own."""
@@ -292,6 +352,7 @@ def main() -> int:
         test_tiles_stay_inside_the_given_region,
         test_a_flat_field_gives_every_tile_the_same_vertex,
         test_tilted_field_recovers_each_tile_vertex_and_their_differences,
+        test_the_tile_cross_is_centred_and_clears_the_bar_at_either_end,
         test_a_tile_with_no_focus_hump_is_flagged_and_excluded,
         test_abort_walks_the_lens_back_to_the_start,
         test_a_peak_at_the_edge_of_the_sweep_is_refused,

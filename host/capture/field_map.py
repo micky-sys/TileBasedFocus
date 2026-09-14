@@ -60,10 +60,31 @@ class FieldMapConfig:
     """Square tile side in FULL-RES sensor pixels. Ample for a Laplacian variance
     and small enough that K of them stay cheap: the AF winning-tile ROI is ~2820 x
     2004 (11 MB), which at five tiles would copy 56 MB per frame."""
-    inset: float = 0.15
-    """Edge tiles sit this fraction in from the frame edge -- far enough out to see
-    real field variation, far enough in to clear the bench screen's bezel and the
-    optical ground-truth strip."""
+    inset: float = 0.05
+    """Edge tiles sit this fraction in from the *box* edge. Small on purpose: the box
+    is already inset by ``box_inset``, so anything spent here is spent twice and the
+    tilt baseline is what pays. Was 0.15, which compounded with the box inset and a
+    one-sided bar trim to leave the five tiles spanning only 40% of the frame height
+    -- measuring a 525c tilt where the full span carried nearly twice that.
+
+    Cannot usefully go below ``tile_px / 2`` as a fraction of the box (0.039 at the
+    600 px tile and a 0.13 box), because ``five_tile_rois`` clamps the tile inside the
+    box and the centre stops moving."""
+
+    box_inset: float = 0.13
+    """Symmetric inset applied to BOTH ends of BOTH axes of the tile box.
+
+    Sized to clear the optical ground-truth strip (~8% of frame height on this rig)
+    without needing to know which edge it landed on. The display draws the bar at the
+    screen's top, but the optics invert, so it images at the frame's BOTTOM -- and the
+    old one-sided trim, taking the display's word for it, cut the clean end and left
+    the bar inside the box. Trimming both ends is orientation-agnostic and costs only
+    the far edge, which no measurement here needs.
+
+    It also keeps the tile cross centred on the frame, and that is a correctness
+    requirement rather than cosmetics: ``five_tile_rois`` separates a tilted subject
+    plane from a curved field by whether top and bottom fall on OPPOSITE sides of
+    centre or the same side, which only reads true if the two are equidistant from it."""
 
     dive_strength: int = 3
     """str3 for the dive: ~850 counts/pulse, so the sweep floor is reached in a few
@@ -125,6 +146,20 @@ class FieldMapConfig:
     noise on a broad flat top. Measured across the two good sweeps, the wide-window
     vertex sits within 9% of the width of it every time, while the argmax strays to
     16%; checking against the argmax would therefore flag good fits as suspect."""
+
+
+def inset_box(box: Roi, frac: float) -> tuple[float, float, float, float]:
+    """Shrink *box* by *frac* of its own size at BOTH ends of BOTH axes.
+
+    Symmetric on purpose; see ``FieldMapConfig.box_inset``. The caller used to trim one
+    named edge instead, which was wrong twice over: it took the edge name from the
+    DISPLAY config while the optics invert the image, so it cut the clean end and left
+    the ground-truth bar inside; and a one-sided trim shifts the tile cross off centre,
+    which confounds the tilt-vs-curvature reading top and bottom exist to give."""
+    x0, y0, x1, y1 = (float(v) for v in box)
+    frac = min(max(float(frac), 0.0), 0.45)
+    bw, bh = (x1 - x0) * frac, (y1 - y0) * frac
+    return (x0 + bw, y0 + bh, x1 - bw, y1 - bh)
 
 
 def five_tile_rois(

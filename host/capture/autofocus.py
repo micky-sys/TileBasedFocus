@@ -221,6 +221,13 @@ class AutoFocusConfig:
 
     # Leading-edge target selection
     edge_band: float = 0.25
+    acquire_lane_frac: float = 0.0
+    """Restrict acquisition to the middle fraction of the frame ACROSS the travel
+    axis (0 = off, the flight default). A patch that crosses the frame down the left
+    edge and one that crosses down the middle traverse different slices of a curved
+    field, so their profiles are not the same measurement. AF3 medians several
+    traverses per station, and mixing lanes puts field curvature into that spread --
+    which is repeatability lost for nothing, since the lane is free to choose."""
     tiles_per_frame: float = 5.0  # TileGrid zoom -> tile ~ frame/this
     select_subsample: int = 2
     """Subsample for the tile-selection texture score. The default whole-pipeline
@@ -424,6 +431,37 @@ def _tiles_in_lead_band(tiles, lead_edge: str, edge_band: float) -> list[Tile]:
     return [t for t, c in zip(tiles, centres) if c >= limit]
 
 
+def _tiles_in_centre_lane(tiles, lead_edge: str, lane_frac: float) -> list[Tile]:
+    """The tiles in the middle ``lane_frac`` of the candidates' spread ACROSS the
+    flow axis, i.e. the lane an object will travel down.
+
+    Cross axis is the one the object does NOT move along: for ``top``/``bottom`` flow
+    it travels in y, so the lane is selected on x, and vice versa. Measured against
+    the candidate tiles rather than the frame for the same reason as
+    :func:`_tiles_in_lead_band` -- interior masking plus grid quantisation means the
+    usable area is a sub-rectangle, and a frame-relative band would silently match
+    nothing. Never returns empty: falls back to the single most central tile, because
+    a lane preference that can starve acquisition is worse than a wide lane.
+    """
+    tiles = list(tiles)
+    if not tiles:
+        return []
+    vertical = lead_edge in ("top", "bottom")   # flows along y -> lane picked on x
+    centres = [
+        (t.x0 + t.x1) / 2.0 if vertical else (t.y0 + t.y1) / 2.0 for t in tiles
+    ]
+    lo, hi = min(centres), max(centres)
+    if hi - lo <= 0:
+        return tiles
+    mid = 0.5 * (lo + hi)
+    half = 0.5 * (hi - lo) * max(0.0, min(1.0, float(lane_frac)))
+    kept = [t for t, c in zip(tiles, centres) if abs(c - mid) <= half]
+    if kept:
+        return kept
+    nearest = min(range(len(tiles)), key=lambda i: abs(centres[i] - mid))
+    return [tiles[nearest]]
+
+
 def select_leading_edge_roi(
     frame: np.ndarray,
     lead_edge: Optional[str],
@@ -481,6 +519,12 @@ def select_leading_edge_roi(
             lead_edge=lead_edge,
             edge_band=cfg.edge_band,
         )
+    # Applied AFTER the lead band so the two compose: leading edge picks WHEN a patch
+    # is taken, the lane picks WHERE across the flow. Needs a known flow axis, so it
+    # is skipped when there is no lead edge (static bench).
+    lane = float(getattr(cfg, "acquire_lane_frac", 0.0) or 0.0)
+    if lane > 0.0 and lead_edge is not None:
+        grid = _tiles_in_centre_lane(grid, lead_edge, lane)
     if len(grid) == 0:
         # Degenerate frame/tile sizing -- fall back to a centred ROI.
         tw = max(2, fw // 4) & ~1
@@ -649,16 +693,24 @@ def focus_measure_full_res(crop: np.ndarray) -> float:
     The crop origin is the winning-tile ROI x SUBSAMPLE_FACTOR, i.e. a multiple
     of the (even) decimation stride, so the Bayer phase is preserved and
     ``crop[0::2, 1::2]`` lands on the same colour every frame.
+
+    Having the pipeline cut that sub-grid instead, so this gather disappears, was
+    tried on 2026-09-10 and reverted: it is a wash. The gather is ~11 ms of a
+    ~30 ms patch, but a column stride reads the same cache lines it would have
+    read anyway and gives up the vectorised copy, so what the cut saves the score
+    pays back. See ``tools/bench_af_cost.py``.
     """
     if crop is None or crop.ndim < 2 or crop.size == 0:
         return 0.0
     green = crop[0::2, 1::2]
     if green.size == 0:
         return 0.0
-    if green.dtype == np.uint16:
-        green = (green >> 6).astype(np.float32)
-    else:
-        green = green.astype(np.float32)
+    # One pass, not two. The old form shifted right by 6 into a fresh uint16 array and
+    # then converted THAT to float, gathering the strided sub-grid twice. The shift was
+    # also pointless: the result below divides by mean^2, so any constant scaling of the
+    # input cancels exactly -- all >>6 contributed was a truncation that threw away the
+    # bottom 6 bits of a 14-bit sample. Measured 11.3 ms -> ~7 ms on a live-sized crop.
+    green = green.astype(np.float32)
     # Light pre-blur before the Laplacian: sensor read/shot noise is broadband
     # and the Laplacian (a high-pass) amplifies it hard, which is what put a
     # ~10-15% frame-to-frame spread on the score at a *fixed* lens position
@@ -672,8 +724,13 @@ def focus_measure_full_res(crop: np.ndarray) -> float:
     # cancels it. Without this, auto-exposure hunting makes the score swing
     # wildly on a *static* scene (~900-1600 seen live), so the hill-climb has no
     # trustworthy gradient and bails at pos +0. +1 guards a near-black tile.
-    mean = float(green.mean())
-    return float(lap.var() / (mean * mean + 1.0) * 1e4)
+    # cv2's reductions, not numpy's: np.var on a 1.3 Mpx float32 plane measured 13.1 ms
+    # against ~2 ms for meanStdDev, and this runs on every AF frame for every patch.
+    # meanStdDev is the population sigma, matching np.var's default ddof=0.
+    _, lap_sd = cv2.meanStdDev(lap)
+    mean = float(cv2.mean(green)[0])
+    var = float(lap_sd[0][0]) ** 2
+    return float(var / (mean * mean + 1.0) * 1e4)
 
 
 def _smooth3(values: list[float]) -> list[float]:
@@ -1778,6 +1835,10 @@ try:  # pragma: no cover - exercised only inside the GUI app
             select_camera_cb: Optional[Callable[[int], None]] = None,
             set_roi_cb: Optional[Callable[[Optional[Roi]], None]] = None,
             full_res_score_cb: Optional[Callable[[Roi], Optional[float]]] = None,
+            full_res_pair_cb: Optional[Callable[[Roi, Roi], tuple]] = None,
+            full_res_multi_cb: Optional[Callable[[list], Optional[list]]] = None,
+            observe_row_cb: Optional[Callable[[dict], None]] = None,
+            profile_cb: Optional[Callable[[dict], None]] = None,
             config: Optional[AutoFocusConfig] = None,
             algorithm: str = "sweep_and_hold",
             encoder_read: Optional[Callable[[], float]] = None,
@@ -1790,6 +1851,10 @@ try:  # pragma: no cover - exercised only inside the GUI app
             self._select_camera_cb = select_camera_cb
             self._set_roi_cb = set_roi_cb
             self._full_res_score_cb = full_res_score_cb
+            self._full_res_pair_cb = full_res_pair_cb
+            self._full_res_multi_cb = full_res_multi_cb
+            self._observe_row_cb = observe_row_cb
+            self._profile_cb = profile_cb   # AF3 only: live station-profile preview
             self._config = config
             self._encoder_read = encoder_read
             self._encoder_present = encoder_present
@@ -1802,11 +1867,12 @@ try:  # pragma: no cover - exercised only inside the GUI app
 
         @staticmethod
         def _normalise_algorithm(name: str) -> str:
-            return (
-                "sweep_and_hold"
-                if str(name).lower() in ("sweep_and_hold", "sweep-and-hold", "v2")
-                else "legacy"
-            )
+            key = str(name).lower()
+            if key in ("field_profile", "field-profile", "af3", "v3"):
+                return "field_profile"
+            if key in ("sweep_and_hold", "sweep-and-hold", "v2"):
+                return "sweep_and_hold"
+            return "legacy"
 
         def _build_engine(self, algorithm: str):
             """Construct the selected AF engine, bound to the same plumbing.
@@ -1824,14 +1890,33 @@ try:  # pragma: no cover - exercised only inside the GUI app
                 full_res_score=self._full_res_score_cb,
                 sample=self.sample.emit,
             )
-            if algorithm == "sweep_and_hold":
+            if algorithm == "field_profile":
+                # AF3: same skeleton as v2 (it subclasses it), but the climb measures
+                # the across-field profile instead of one patch's score. Kept a
+                # separate algorithm string so reverting to v2 is a one-line change.
+                from .autofocus_v3 import AutoFocusConfigV3, AutoFocusEngineV3
+
+                cfg = self._config if isinstance(self._config, AutoFocusConfigV3) else None
+                engine = AutoFocusEngineV3(
+                    config=cfg, axis=self._maybe_encoder_axis(cfg),
+                    full_res_pair=self._full_res_pair_cb,
+                    full_res_multi=self._full_res_multi_cb,
+                    observe_row=self._observe_row_cb,
+                    profile_cb=self._profile_cb, **common
+                )
+            elif algorithm == "sweep_and_hold":
                 # Lazy import breaks the autofocus <-> autofocus_v2 cycle (v2 reuses
                 # this module's tracker/metrics at import time).
                 from .autofocus_v2 import AutoFocusConfigV2, AutoFocusEngineV2
 
                 cfg = self._config if isinstance(self._config, AutoFocusConfigV2) else None
+                # full_res_pair is v2-only: the legacy engine has no cross-object
+                # handover, so there is no A/B ratio for it to calibrate.
                 engine = AutoFocusEngineV2(
-                    config=cfg, axis=self._maybe_encoder_axis(cfg), **common
+                    config=cfg, axis=self._maybe_encoder_axis(cfg),
+                    full_res_pair=self._full_res_pair_cb,
+                    full_res_multi=self._full_res_multi_cb,
+                    observe_row=self._observe_row_cb, **common
                 )
             else:
                 cfg = self._config if isinstance(self._config, AutoFocusConfig) else None
@@ -1944,6 +2029,21 @@ try:  # pragma: no cover - exercised only inside the GUI app
             self.run_state_changed.emit(True)
             self._select_for_sequence()
             self._engine.start(lead_edge_hint=lead_edge_hint, continuous=False)
+            return True
+
+        def start_observe(self, *, lead_edge_hint: Optional[str] = None) -> bool:
+            """Diagnostic: watch several patches at a fixed lens position (v2 only)."""
+            if not hasattr(self._engine, "start_observe"):
+                self.status.emit("observe: needs the v2 engine")
+                return False
+            if not self._guard():
+                return False
+            self._sequence = []
+            self._continuous = False
+            self._seq_lead_hint = lead_edge_hint
+            self._refresh_encoder_axis()
+            self.run_state_changed.emit(True)
+            self._engine.start_observe(lead_edge_hint=lead_edge_hint)
             return True
 
         def stop(self, reason: str = "stopped by operator") -> None:
