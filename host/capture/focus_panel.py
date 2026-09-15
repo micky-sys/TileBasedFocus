@@ -587,7 +587,7 @@ class FocusPanel(QWidget):
     dual_track_toggled = Signal(bool)    # two-object tracking overlay (green boxes) on/off
     orthosim_toggled = Signal(bool)      # OrthoSim ground-truth decode + AF interior masking on/off
     lockstep_toggled = Signal(bool)      # closed-loop display/camera handshake on/off (bench only)
-    deraster_toggled = Signal(bool)      # notch the display's pixel grid out of the metric (bench only)
+    m4_record_toggled = Signal(bool)     # arm/disarm .bay14line writing while in M4
 
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
@@ -635,6 +635,20 @@ class FocusPanel(QWidget):
             self._last_fine_rgb = None
             self._last_fine_meta = None
         self._sync_fine_toggle_caption()
+
+    def set_dwell_info(self, text: str) -> None:
+        """Show which tracked object is in the Fine view and how long it lasts."""
+        self._dwell_label.setText(text)
+
+    def sync_m4_record_toggle(self, on: bool) -> None:
+        """Align the Record checkbox with :class:`ModeController` state.
+
+        Silent: a mode change disarms recording in the controller, and the box
+        has to follow without re-emitting and re-closing an already-closed line.
+        """
+        self._m4_record_toggle.blockSignals(True)
+        self._m4_record_toggle.setChecked(bool(on))
+        self._m4_record_toggle.blockSignals(False)
 
     def _sync_fine_toggle_caption(self) -> None:
         """Button shows the mode you get when you click (unchecked=Fine, checked=Coarse)."""
@@ -874,17 +888,6 @@ class FocusPanel(QWidget):
     def orthosim_active(self) -> bool:
         return self._ortho_toggle.isChecked()
 
-    def deraster_active(self) -> bool:
-        return self._deraster_toggle.isChecked()
-
-    def set_deraster_active(self, on: bool) -> None:
-        """Force the toggle, without re-emitting -- the app snaps it back off when
-        there is no calibration to apply, and a box that says ON while nothing is
-        filtered is worse than no box at all."""
-        blocked = self._deraster_toggle.blockSignals(True)
-        self._deraster_toggle.setChecked(bool(on))
-        self._deraster_toggle.blockSignals(blocked)
-
     def ortho_screen_wh(self) -> tuple[int, int]:
         return int(self._ortho_w.value()), int(self._ortho_h.value())
 
@@ -1051,6 +1054,20 @@ class FocusPanel(QWidget):
         self._tile_info_label.setMinimumWidth(220)
         row.addWidget(self._tile_info_label, 0)
 
+        self._dwell_label = QLabel("")
+        self._dwell_label.setStyleSheet(
+            "font-family:Consolas, monospace; font-size:11px; color:#8cf;"
+        )
+        self._dwell_label.setMinimumWidth(190)
+        self._dwell_label.setToolTip(
+            "The tracked object in Fine view: which one (obj), how many frames it\n"
+            "has been held, and roughly how many are left before it reaches the\n"
+            "trailing edge and a fresh leading-edge object is picked.\n\n"
+            "Watch the object number: if it changes while you are adjusting, the\n"
+            "sharpness you are judging belongs to different ground."
+        )
+        row.addWidget(self._dwell_label, 0)
+
         row.addSpacing(4)
         row.addWidget(QLabel("Strength"))
         self._strength_group = QButtonGroup(self)
@@ -1072,6 +1089,20 @@ class FocusPanel(QWidget):
             row.addWidget(rb)
 
         row.addSpacing(8)
+        self._m4_record_toggle = QCheckBox("Record")
+        self._m4_record_toggle.setToolTip(
+            "Write full .bay14line containers while in M4, exactly as M0/M1 do.\n\n"
+            "For capturing a focus bracket to analyse on the ground: every frame's\n"
+            "chunk JSON carries the lens encoder count, so a run from out-of-focus\n"
+            "through focus and out again can be sorted by lens position afterwards.\n\n"
+            "Manual arm, because M4 is where idle time is spent and always-on would\n"
+            "fill the drive. Disarms itself on any mode change. Set drive, project\n"
+            "and line first -- the same prerequisites as M0/M1."
+        )
+        self._m4_record_toggle.setStyleSheet("QCheckBox:checked { color:#f55; }")
+        self._m4_record_toggle.toggled.connect(self.m4_record_toggled.emit)
+        row.addWidget(self._m4_record_toggle)
+
         self._save_toggle = QCheckBox("Save focus view")
         self._save_toggle.setToolTip(
             "When checked in M4 Fine mode, each best-tile crop is written\n"
@@ -1094,24 +1125,6 @@ class FocusPanel(QWidget):
         )
         self._lockstep_toggle.toggled.connect(self.lockstep_toggled.emit)
         row.addWidget(self._lockstep_toggle)
-
-        self._deraster_toggle = QCheckBox("De-raster")
-        self._deraster_toggle.setToolTip(
-            "OrthoSim bench rig only. Notches the DISPLAY'S OWN PIXEL GRID out of\n"
-            "the focus metric before scoring.\n\n"
-            "The camera oversamples the panel ~3.36:1, so its pixel and subpixel\n"
-            "grid is imaged as real, periodic detail at the same conjugate as the\n"
-            "picture. It is more uniform across the field than terrain is, so it\n"
-            "drives the metric BETTER than the scene: on 2026-09-14 a blank grey\n"
-            "panel bracketed harder than the orthophoto and parked 2 counts away.\n\n"
-            "With this on, a blank panel should score flat and AF should refuse to\n"
-            "arm on it -- that is the check that it is working.\n\n"
-            "Needs a calibration measured on THIS geometry (tools/raster_spectrum.py\n"
-            "--calibrate); recalibrate if the camera, lens or panel moves. Leave OFF\n"
-            "in flight: there is no screen there, so it is cost with no benefit."
-        )
-        self._deraster_toggle.toggled.connect(self.deraster_toggled.emit)
-        row.addWidget(self._deraster_toggle)
 
         self._csv_log_toggle = QCheckBox("Log CSV")
         self._csv_log_toggle.setToolTip(

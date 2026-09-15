@@ -9,9 +9,14 @@ so it always knows the commanded mode. Per the operator's spec:
 * M3 (CollectionON) records only between manual ``?``/``!`` line brackets.
   The host sets ``m3_collecting`` when the operator presses Start line and
   clears it on End line (after the in-progress sweep finishes).
-* M4 is the *focus* mode -- frames are previewed but not written by default.
-  An optional toggle ("Save focus view") in the GUI can opt in to saving
-  best-tile focus crops while in M4; that path is independent of this gate.
+* M4 is the *focus* mode -- frames are previewed and not written by default.
+  Two separate opt-ins exist. "Save focus view" writes best-tile focus crops
+  as TIFFs, independent of this gate. "Record" sets ``m4_recording`` and does
+  go through this gate, writing full ``.bay14line`` containers exactly as a
+  recording mode would -- that is how a focus bracket gets captured for
+  ground analysis, since every frame's chunk JSON carries the lens encoder
+  count. It is a manual arm (unlike M0/M1) because M4 is where the operator
+  spends idle time, and always-on would fill the drive.
 
 Keeping the recording decision in one place lets the UI, capture pipeline,
 sweep counters, and writer threads all agree without duplicating logic.
@@ -88,6 +93,7 @@ class ModeController:
         self._mode = Mode.UNKNOWN
         self._focus_submode = FocusSubMode.COARSE
         self._m3_collecting = False
+        self._m4_recording = False
 
     @property
     def mode(self) -> Mode:
@@ -99,6 +105,11 @@ class ModeController:
             self._mode = mode
             if mode != Mode.M3:
                 self._m3_collecting = False
+            # Unconditional, including M4 -> M4: the GUI's mode-state apply
+            # closes every line container for any mode that is not M0/M1/M6,
+            # so re-selecting M4 has already thrown the containers away. An arm
+            # that survived that would claim to be recording into no file.
+            self._m4_recording = False
 
     def set_m3_collecting(self, active: bool) -> None:
         with self._lock:
@@ -108,9 +119,19 @@ class ModeController:
         with self._lock:
             return self._m3_collecting and self._mode == Mode.M3
 
+    def set_m4_recording(self, active: bool) -> None:
+        with self._lock:
+            self._m4_recording = bool(active) and self._mode == Mode.M4
+
+    def m4_recording(self) -> bool:
+        with self._lock:
+            return self._m4_recording and self._mode == Mode.M4
+
     def _is_recording_locked(self) -> bool:
         if self._mode in _RECORDING_MODES:
             return True
+        if self._mode == Mode.M4:
+            return self._m4_recording
         return self._mode == Mode.M3 and self._m3_collecting
 
     def can_write(self) -> bool:

@@ -5139,3 +5139,94 @@ passes: dome and bowl recovered at 13 and 39 sigma, the 4.9 deg rotated pair sti
 and the flat null still reports no field. NOT yet re-run against the flight frames -- the first
 thing the new export should do is reproduce `pairs_f678.csv`'s coefficients, since 8-bit
 quantisation of the search image could in principle move the registration.
+
+## 48. Autofocus shelved; collect the data instead (2026-09-15)
+
+Operator's call, and the right one on the evidence of sections 46-47: **AF is not working for
+us, and there is not enough signal in one pass to correlate anything with focus.** So stop
+trying to close the loop in the air. Fly, save a great many full-res frames from out-of-focus
+through focus and out the other side on every camera, and work it out on the ground.
+
+Everything below section 47 stands as the reason, not as work in progress. `tools/field_pairs.py`
+and friends survive because the offline analysis is now the *point*; what got retired is the
+live-loop machinery and its bench scaffolding.
+
+Commit `0f1c809` is the save point taken before any of this was cleared, so nothing here is
+lost -- `git checkout 0f1c809 -- <path>` brings any of it back, including the notch and the two
+cached analysis CSVs.
+
+### 48.1 M4 can now record .bay14line, manually armed
+
+The metadata half was already done (section 45): every `WriteJob` carries
+`focus: {encoder_count, encoder_epoch}` into the chunk JSON. What was missing was only the
+*arm*, because `ModeController.can_write()` covered M0/M1/M6 and M3-while-collecting, and M4 was
+deliberately excluded.
+
+M4 now takes the same shape as M3's Start/End line: a `m4_recording` flag, a **Record**
+checkbox in the focus panel, and the same sequence on arm -- full-res emission first (so a slot
+exists to submit), then the mode gate, then open the containers. There is no PCB bracket to send;
+M4 already self-triggers, so arming is purely host-side.
+
+It is a manual arm and not automatic because M4 is where all the idle ground time is spent, and
+always-on would fill the drive. **Any** mode change disarms it, including re-selecting M4 --
+`_apply_mode_state_after_uart` closes every container for any mode that is not M0/M1/M6, so an
+arm that survived that would claim to be recording into no file. The checkbox is re-synced on
+every mode change so it cannot lie about the state.
+
+`tools/test_m4_record_gate.py` covers the gate: both failure directions are silent and
+expensive (a whole bracket flight landing nothing, or M4 filling the drive), and it caught the
+M4 -> M4 disarm case during development.
+
+### 48.2 The Fine tracker never re-acquired -- one-line class of bug, whole-feature effect
+
+Chasing the "object tracking manual focus" request turned up a real bug rather than missing
+work: **`FineFocusTracker` already does everything that was asked** -- leading-edge winning-tile
+pick, `PatchTracker` follow, handover when the object leaves -- and it is already wired into M4
+Fine. Except the handover never fired.
+
+`_clamp_roi` returns `None` only for an invalid ROI *size*; it always pulls a valid ROI back
+inside the frame. So testing `clamped is None` alone never detects the exit case. The AF engine,
+`autofocus_v2` and `dual_tracker` all pair it with `_roi_pinned_against_flow`, whose own
+docstring says it is "what detects 'the object left the FOV', not an overlap/None check."
+`FineFocusTracker` was the one caller that did not, so after its first object reached the
+trailing edge the tile sat stuck against the border with ground sliding under it, for the rest
+of the session. Fixed at the tracker, which is the one place all Fine-view callers share.
+
+Also added, because hand-focusing needs them:
+
+* `object_id` and `frames_on_object` -- if the object changes mid-adjustment, the sharpness
+  being judged belongs to different ground, and the operator has to be able to see that.
+* `frames_left()` -- advisory frames until the patch pins against the trailing edge, from the
+  ROI's distance to the outflow border over the per-frame flow. Answers "is there time to creep
+  focus on this one, or wait for the next".
+* Both surfaced in a panel readout next to the tile info: `obj #7 from left  held 12f  ~9f left`.
+
+**Lock tile was also half-wired** and is now honest. It pins a FIXED sensor ROI while the
+tracker wants a MOVING one, and both wrote `set_focus_roi`, so the tracker silently overwrote
+the lock on the very next coarse frame -- the lock never held. `_update_fine_leading_edge` now
+leaves the pipeline ROI to the lock while still running the tracker, so the motion estimate and
+dwell readout stay live. The two features are opposites and should stay that way: Lock tile
+holds a place on the sensor, the tracker holds an object on the ground.
+
+`tools/test_fine_focus_tracker.py` grew three cases: that panning a full frame width forces a
+new `object_id` with a reset dwell and an in-frame ROI (this is the regression that matters),
+that `frames_left()` falls as the object approaches the edge, and that a static scene reports no
+estimate rather than inventing one.
+
+### 48.3 Cleared out
+
+* **The display-raster notch, entirely.** `set_raster_notch`/`apply_raster_notch`/`_notch_mask`
+  and the call inside `focus_measure_green` (96 lines of `autofocus.py`), the De-raster toggle
+  and its handler, `tools/raster_spectrum.py`, `host/capture/raster_notch.json`. It only ever
+  mattered for the OrthoSim bench monitor, and its whole value -- proving the bench D was the
+  panel's pixel grid, not the lens -- is already banked in section 45. Removing the call also
+  takes ~15 ms/patch back off the metric.
+* **Analysis artifacts**, ~17 MB: twelve `_scratch_*.py`, the montage PNGs, the superseded
+  `field_*` CSVs/PNGs/run logs, `fieldmap_fits.png`, `trails_F7.png`.
+* `_json` and `_Path` imports in `app.py`, orphaned by the notch handler.
+
+Kept deliberately: `focus_measure_green`, `PatchTracker`, `FineFocusTracker`,
+`select_leading_edge_roi` and `leading_edge_from_motion`, all of which the manual focus view
+depends on; and the `tools/field_*.py` offline estimators, which the new plan needs.
+
+After all of it: 191 tests pass across the AF, tracker, field-map, M4 and bay14line suites.

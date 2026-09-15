@@ -25,13 +25,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import json as _json
 import logging
 import os
 import socket
 import sys
 import time
-from pathlib import Path as _Path
 from typing import Optional
 
 import serial_comm
@@ -64,7 +62,6 @@ from PySide6.QtWidgets import (
 
 from .autofocus import AutoFocusController, FineFocusTracker
 from .autofocus import focus_measure_full_res as af_full_res_measure
-from .autofocus import set_raster_notch
 from .dual_tracker import DualObjectTracker
 from .autofocus_v3 import AutoFocusConfigV3
 from .orthosim_decode import ScreenLayout, SpeedDistanceTracker, decode_frame
@@ -2195,7 +2192,7 @@ class MainWindow(QMainWindow):
         self._focus_panel.dual_track_toggled.connect(self._on_dual_track_toggled)
         self._focus_panel.orthosim_toggled.connect(self._on_orthosim_toggled)
         self._focus_panel.lockstep_toggled.connect(self._on_lockstep_toggled)
-        self._focus_panel.deraster_toggled.connect(self._on_deraster_toggled)
+        self._focus_panel.m4_record_toggled.connect(self._on_m4_record_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2835,6 +2832,27 @@ class MainWindow(QMainWindow):
             ok and collecting and not self._pending_end_line
         )
 
+    def _recording_prerequisites_missing(self) -> list[str]:
+        """What is still unset that would make an armed line write nothing.
+
+        ``_open_lines_for_active_pipelines`` skips pipelines without a drive or
+        project silently by design, so every manual arm (M3 Start line, M4
+        Record) warns up front instead of letting the operator discover it from
+        an empty drive afterwards.
+        """
+        missing: list[str] = []
+        if not (self._context.project or "").strip():
+            missing.append("project name")
+        cams_without_drive = [
+            p.camera_number
+            for p in self._pipelines
+            if self._drive_roots.get(p.camera_number) is None
+        ]
+        if cams_without_drive:
+            cams_str = ", ".join(f"cam{c}" for c in cams_without_drive)
+            missing.append(f"target drive ({cams_str})")
+        return missing
+
     @Slot()
     def _on_start_line_clicked(self) -> None:
         """M3-only: send ``?`` and begin host-side collection for the line."""
@@ -2848,17 +2866,7 @@ class MainWindow(QMainWindow):
             self._log("Start line: a line is already open -- ignored.")
             return
 
-        missing: list[str] = []
-        if not (self._context.project or "").strip():
-            missing.append("project name")
-        cams_without_drive = [
-            p.camera_number
-            for p in self._pipelines
-            if self._drive_roots.get(p.camera_number) is None
-        ]
-        if cams_without_drive:
-            cams_str = ", ".join(f"cam{c}" for c in cams_without_drive)
-            missing.append(f"target drive ({cams_str})")
+        missing = self._recording_prerequisites_missing()
         if missing:
             self._log(
                 "WARN Start line: nothing will be saved until you set: "
@@ -2950,6 +2958,48 @@ class MainWindow(QMainWindow):
                 )
         self._log("End line: sweep finished -- line closed, cameras idle.")
         self._refresh_line_buttons_enabled()
+
+    @Slot(bool)
+    def _on_m4_record_toggled(self, on: bool) -> None:
+        """M4 'Record': write .bay14line containers while focusing.
+
+        The M4 analogue of M3's Start/End line, and deliberately the same
+        sequence: full-res emission first (so a slot exists to submit), then the
+        mode gate, then open the containers. Unlike M3 there is no PCB bracket
+        to send -- M4 already self-triggers, so arming is purely host-side.
+
+        Every frame written here carries the lens encoder count in its chunk
+        JSON, which is the point: a focus bracket flown through focus and out
+        the other side can be sorted by lens position on the ground.
+        """
+        if self._modes.mode != Mode.M4:
+            self._log("Record: ignored (only valid in M4).")
+            self._focus_panel.sync_m4_record_toggle(False)
+            return
+
+        if on:
+            missing = self._recording_prerequisites_missing()
+            if missing:
+                self._log(
+                    "WARN Record: nothing will be saved until you set: "
+                    + "; ".join(missing) + "."
+                )
+        for p in self._pipelines:
+            try:
+                p.set_full_res_emission(bool(on))
+            except Exception as exc:
+                self._log(
+                    f"cam{p.camera_number}: set_full_res_emission({on}) "
+                    f"failed: {exc}"
+                )
+        self._modes.set_m4_recording(on)
+        if on:
+            self._gps_correlator.reset_stats()
+            self._open_lines_for_active_pipelines()
+            self._log("Record ARMED in M4: writing .bay14line with encoder stamps.")
+        else:
+            self._close_all_lines()
+            self._log("Record disarmed in M4: lines closed.")
 
     @Slot()
     def _on_test_trigger_clicked(self) -> None:
@@ -3382,13 +3432,30 @@ class MainWindow(QMainWindow):
     def _update_fine_leading_edge(self, pipeline: CameraPipeline, coarse_raw) -> None:
         """Track a leading-edge tile on coarse frames; pin Fine tap to full-res ROI."""
         roi_coarse = self._fine_tracker.update(coarse_raw)
+        held = self._fine_tracker.frames_on_object
+        left = self._fine_tracker.frames_left()
+        if self._locked_fine_roi is not None:
+            # Lock tile pins a FIXED sensor ROI, and the tracker wants a MOVING
+            # one; both wrote set_focus_roi, so the tracker silently overwrote the
+            # lock on the very next coarse frame and the lock never held. Keep
+            # tracking (the motion estimate and dwell readout stay live) but let
+            # the lock own the pipeline ROI.
+            self._focus_panel.set_dwell_info("LOCKED to sensor patch")
+            return
         scale = KyfgCamera.SUBSAMPLE_FACTOR
         try:
             if roi_coarse is None:
                 pipeline.set_focus_roi(None)
+                self._focus_panel.set_dwell_info("no object yet (too bland)")
             else:
                 pipeline.set_focus_roi(
                     tuple(int(v * scale) for v in roi_coarse)
+                )
+                edge = self._fine_tracker.lead_edge or "static"
+                self._focus_panel.set_dwell_info(
+                    f"obj #{self._fine_tracker.object_id} from {edge}  "
+                    f"held {held}f  "
+                    + (f"~{left}f left" if left is not None else "no flow")
                 )
         except Exception as exc:
             self._log(f"set_focus_roi failed: {exc}")
@@ -3432,42 +3499,6 @@ class MainWindow(QMainWindow):
         self._dual_tracker.reset()
         if not on:
             self._focus_panel.set_track_rois([])
-
-    RASTER_NOTCH_FILE = "raster_notch.json"
-
-    def _on_deraster_toggled(self, on: bool) -> None:
-        """Arm/disarm the display-raster notch in the focus metric (bench only).
-
-        The calibration is geometry-specific, so it is loaded here rather than at
-        import: the operator can recalibrate and re-tick without restarting, which
-        on this rig matters -- a restart means tearing the grabber down and back up.
-        """
-        if not on:
-            set_raster_notch(None)
-            self._log("De-raster: OFF (focus metric sees the panel's pixel grid).")
-            return
-        path = _Path(__file__).resolve().parent / self.RASTER_NOTCH_FILE
-        try:
-            cfg = _json.loads(path.read_text(encoding="utf-8"))
-            spikes = cfg["spikes"]
-            if not spikes:
-                raise ValueError("calibration lists no spikes")
-            set_raster_notch(spikes, float(cfg.get("radius", 0.012)))
-        except Exception as exc:
-            # Refuse rather than pretend. A checked box over an unfiltered metric
-            # would silently invalidate every run measured under it.
-            set_raster_notch(None)
-            self._focus_panel.set_deraster_active(False)
-            self._log(
-                f"De-raster: NOT armed -- cannot read {path.name} ({exc}). "
-                "Capture blank-grey crops with 'Save focus view', then run "
-                "tools/raster_spectrum.py <folder> --calibrate."
-            )
-            return
-        self._log(
-            f"De-raster: ON ({len(spikes)} spikes notched from the focus metric). "
-            "A blank panel should now score flat and refuse to arm."
-        )
 
     def _on_orthosim_toggled(self, on: bool) -> None:
         """Arm/disarm OrthoSim bench mode: (1) flip AF interior/edge masking on the
@@ -5551,6 +5582,9 @@ class MainWindow(QMainWindow):
         prev_mode = self._modes.mode
         self._modes.set_mode(mode)
         self._mode_status_label.setText(f"Current: {mode_display_label(mode)}")
+        # set_mode just cleared m4_recording (any mode change disarms it, including
+        # re-entering M4), so the checkbox has to follow or it would lie.
+        self._focus_panel.sync_m4_record_toggle(False)
 
         # Any mode transition (the PCB re-homes on setMode) aborts an
         # in-progress autofocus run.
