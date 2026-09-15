@@ -19,6 +19,7 @@ Run: ``py -3 tools/test_autofocus_v3.py``
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -470,6 +471,57 @@ def test_too_few_stations_fails_rather_than_parking_on_noise() -> None:
     _walk(eng, cfg)
     assert eng.state == AFStateV2.FAILED, \
         f"a sweep with <3 usable stations must FAIL, not park; got {eng.state}"
+
+
+def test_synthetic_motion_traverses_patches_on_a_frame_with_no_content() -> None:
+    """The whole point of the mode, and its control, in one place.
+
+    The experiment it exists for asks whether D rides the imagery or the panel's own
+    pixel raster, which means running AF on a BLANK screen -- where the real tracker
+    cannot work, so patches would never traverse and no D would ever be produced. If
+    the control half of this ever started passing too (a blank frame advancing through
+    the normal path), the experiment would silently be measuring the tracker instead
+    of the screen, so both halves are asserted together.
+    """
+    blank = np.full((FH, FW), 2000, np.uint16)       # flat: no texture, no gradient
+
+    class _NoTracker:
+        def update(self, _frame):
+            raise AssertionError("tracker consulted while synthetic motion is on")
+
+    cfg = _cfg(synth_travel_px_s=540.0, min_texture_score=0.0)
+    eng = _engine(cfg)
+    eng._tracker = _NoTracker()
+
+    # -- rate: the traverse has to match the rig, or the control is not comparable
+    eng._rs.synth_t = time.monotonic() - 0.5
+    dx, dy, resp = eng._synth_travel()
+    assert dx == 0.0 and resp == 1.0, f"expected a pure-down, trusted vector: {dx},{resp}"
+    assert 250.0 < dy < 290.0, f"0.5 s at 540 px/s should be ~270 px, got {dy:.1f}"
+
+    # -- first frame has no interval yet and must not invent one
+    eng._rs.synth_t = None
+    assert eng._synth_travel()[1] == 0.0, "first frame advanced the roster"
+
+    # -- a GUI stall must not teleport every patch off the frame at once
+    eng._rs.synth_t = time.monotonic() - 30.0
+    assert eng._synth_travel()[1] <= 540.0, "a 30 s stall was not clamped"
+
+    # -- and the advance actually lands on a tracked patch
+    eng.state = AFStateV2.CLIMB
+    eng._rs.objects = [_TrackedObject(oid=0, roi=(100, 50, 200, 150), born=0)]
+    eng._advance_objects(blank, 0.0, 270.0, 1.0)
+    assert eng._rs.objects, "the patch was dropped instead of advanced"
+    assert eng._rs.objects[0].roi[1] == 320, \
+        f"y0 50 + 270 should be 320, got {eng._rs.objects[0].roi[1]}"
+
+    # -- both texture gates share min_texture_score, so zeroing it must open both
+    assert not eng._frame_is_featureless(blank), \
+        "blank frame still reads as featureless with the gate at 0 -- run would fail"
+
+    # -- CONTROL: the normal engine refuses this frame, which is why the mode exists
+    assert _engine(_cfg())._frame_is_featureless(blank), \
+        "a blank frame must be featureless to a normal engine, or there is no control"
 
 
 def main() -> int:

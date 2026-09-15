@@ -239,6 +239,11 @@ EXPECTED_FRAME_WIDTH = 13400
 # GPS metadata" (the preview will say "NO GPS" on the next refresh).
 GpsProvider = Callable[[str, int, int, int], Optional[GpsFix]]
 HeadingProvider = Callable[[], Optional[float]]
+# Returns the ``focus`` block to stamp on this frame, or None when the lens
+# position is unknown. Assembled by the caller (app.py) rather than here,
+# because the encoder and its epoch live on the serial client, which the
+# per-camera pipeline has no business knowing about.
+FocusProvider = Callable[[], Optional[dict]]
 
 
 # What the SDK callback hands to AcquisitionThread via ``frame_queue``.
@@ -516,6 +521,7 @@ class AcquisitionThread(QThread):
         pool: Optional[FrameBufferPool] = None,
         gps_provider: Optional["GpsProvider"] = None,
         heading_provider: Optional["HeadingProvider"] = None,
+        focus_provider: Optional["FocusProvider"] = None,
         full_res_enabled: Optional[Callable[[], bool]] = None,
         line_open_check: Optional[Callable[[], bool]] = None,
         no_frame_warn_s: float = 5.0,
@@ -543,6 +549,7 @@ class AcquisitionThread(QThread):
         self._pool: Optional[FrameBufferPool] = pool
         self._gps_provider = gps_provider
         self._heading_provider = heading_provider
+        self._focus_provider = focus_provider
         self._full_res_enabled = full_res_enabled or (lambda: False)
         # Callback returning True iff a .bay14line container is open on
         # the io_writer side. Used to gate ``_submit_to_writer`` so we
@@ -1459,6 +1466,13 @@ class AcquisitionThread(QThread):
             except Exception:
                 log.debug("%s heading provider raised", self.label, exc_info=True)
 
+        focus_dict: Optional[dict] = None
+        if self._focus_provider is not None:
+            try:
+                focus_dict = self._focus_provider()
+            except Exception:
+                log.debug("%s focus provider raised", self.label, exc_info=True)
+
         attitude_dict: Optional[dict] = None
         try:
             attitude_dict = compute_attitude_dict(
@@ -1487,6 +1501,7 @@ class AcquisitionThread(QThread):
             capture_kind="sweep",
             gps=gps_dict,
             attitude=attitude_dict,
+            focus=focus_dict,
         )
         if not pool.submit(job):
             self._dropped_due_to_queue_full += 1
@@ -2315,6 +2330,7 @@ class CameraPipeline:
         get_drive_root: Callable[[], Optional[str]],
         gps_provider: Optional[GpsProvider] = None,
         heading_provider: Optional[HeadingProvider] = None,
+        focus_provider: Optional[FocusProvider] = None,
     ) -> None:
         self._backend = backend
         self._config = config
@@ -2395,6 +2411,7 @@ class CameraPipeline:
             pool=self.pool,
             gps_provider=gps_provider,
             heading_provider=heading_provider,
+            focus_provider=focus_provider,
             full_res_enabled=lambda b=self._backend: b.full_res_emission,
             line_open_check=lambda: self.line_open,
         )

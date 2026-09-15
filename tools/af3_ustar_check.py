@@ -88,8 +88,17 @@ def analyse(path: Path):
     # score peaks later than D, so this is the expected case rather than a rare one.
     censored = bool(s_peak and s_peak[0] in (s_pts[0][0], s_pts[-1][0]))
 
+    # Did D actually PEAK, or just wander? Judged by the engine's own arming
+    # threshold, station_arm_rise -- the climb it demands out of D's pedestal before
+    # it will believe a fall. Below that the "peak" is a noise max and its offset from
+    # the score peak is meaningless: the aborted 7-station runs of 2026-09-10 report
+    # gaps of +711 and +155 off D peaks of -0.136 and +0.075, and averaging those in
+    # moved the median 128 and the spread to 649.
+    d_rise = d_peak[1] - min(d for _, d in d_pts)
+
     return {
         "name": path.name, "n_walk": len(walk), "axis": axis,
+        "d_rise": d_rise, "armed": d_rise >= cfg.station_arm_rise,
         "lo": walk[0]["pos"], "hi": walk[-1]["pos"],
         "d_peak": d_peak, "d_vertex": xv, "u_cross": u_cross,
         "s_peak": s_peak, "censored": censored,
@@ -105,7 +114,9 @@ def report(a) -> None:
     print(f"\n== {a['name']}")
     print(f"   walk        : {a['n_walk']} stations, raw {a['lo']:.0f} .. {a['hi']:.0f}"
           f"  (travel axis {a['axis']})")
-    print(f"   D peak      : raw {a['d_peak'][0]:>8.0f}   D={a['d_peak'][1]:+.3f}")
+    print(f"   D peak      : raw {a['d_peak'][0]:>8.0f}   D={a['d_peak'][1]:+.3f}"
+          f"   (rose {a['d_rise']:.2f}"
+          f"{'' if a['armed'] else ' -- NOT a real peak, run rejected'})")
     print(f"   D vertex    : raw "
           + ("     n/a   (parabola did not fit)" if a["d_vertex"] is None
              else f"{a['d_vertex']:>8.0f}   <- what the engine parks on"))
@@ -156,9 +167,14 @@ def main(argv: list[str]) -> int:
         out.append(a)
         report(a)
 
-    usable = [a for a in out if a["s_peak"] and not a["censored"]
-              and a["u_cross"] is not None]
-    print(f"\n\n== {len(out)} runs analysed, {len(usable)} with an UNCENSORED score peak")
+    # Two SEPARATE requirements, and conflating them hid a good run: measuring the D
+    # bias needs only an uncensored score peak, while comparing u* additionally needs
+    # u* to actually cross 0.5 -- which on this rig it often never does.
+    usable = [a for a in out if a["s_peak"] and not a["censored"] and a["armed"]]
+    print(f"\n\n== {len(out)} runs analysed; "
+          f"{sum(1 for a in out if not a['armed'])} rejected (D never rose "
+          f"station_arm_rise out of its pedestal), "
+          f"{len(usable)} left with an UNCENSORED score peak")
     if not usable:
         print("   No run saw the centre score turn over, so neither the D bias nor the")
         print("   u* rule can be scored yet. That is structural: the walk stops ~3")
@@ -168,16 +184,23 @@ def main(argv: list[str]) -> int:
         return 0
     dgaps = [(a["d_vertex"] if a["d_vertex"] is not None else a["d_peak"][0])
              - a["s_peak"][0] for a in usable]
-    ugaps = [a["u_cross"][0] - a["s_peak"][0] for a in usable]
     print(f"   D  - score peak: {['%+.0f' % g for g in dgaps]}")
-    print(f"   u* - score peak: {['%+.0f' % g for g in ugaps]}")
-    if len(usable) >= 2:
+    if len(dgaps) >= 2:
         print(f"   D  gap: median {st.median(dgaps):+.0f}  spread "
               f"{max(dgaps) - min(dgaps):.0f}  <- park_bias_counts candidate")
-        print(f"   u* gap: median {st.median(ugaps):+.0f}  spread "
-              f"{max(ugaps) - min(ugaps):.0f}")
         print("   A bias is only usable if its SPREAD is small; a tight median with a")
         print("   wide spread means the offset is not a constant and cannot be baked in.")
+
+    ucomp = [a for a in usable if a["u_cross"] is not None]
+    print(f"\n   of those, {len(ucomp)} also have a u* crossing to compare")
+    if not ucomp:
+        print("   u* never reached frame centre on any of them -- no comparison possible")
+        return 0
+    ugaps = [a["u_cross"][0] - a["s_peak"][0] for a in ucomp]
+    print(f"   u* - score peak: {['%+.0f' % g for g in ugaps]}")
+    if len(ugaps) >= 2:
+        print(f"   u* gap: median {st.median(ugaps):+.0f}  spread "
+              f"{max(ugaps) - min(ugaps):.0f}")
     return 0
 
 

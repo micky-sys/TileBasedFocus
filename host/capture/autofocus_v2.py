@@ -568,6 +568,32 @@ class AutoFocusConfigV2:
     min_texture_score: float = 1.5
     max_low_texture_frames: int = 40
 
+    # %% Synthetic scene motion -- bench diagnostic, 0 = off %%%%%%%%%%%%%%
+    synth_travel_px_s: float = 0.0
+    """Pretend the scene scrolls down at this many COARSE px/s instead of measuring it.
+
+    For one experiment: on a BLANK panel the only structure left in an AF crop is the
+    display's own pixel raster, which the camera oversamples 3.4x and which therefore
+    lands squarely in the band the Laplacian scores. Whether D rides that raster or the
+    imagery cannot be told apart on a textured scene, and on a blank one the real
+    tracker cannot run at all -- phaseCorrelate has nothing to lock onto, so patches
+    never traverse and no D is ever produced. Driving the traverse from the clock
+    instead makes the contentless control measurable with the rest of the engine
+    untouched.
+
+    Per SECOND, which is right for OPEN LOOP only. Measured straight off the tracker's
+    own boxes: 544 coarse px/s (10-90% 494-587, n=144) on the 15:09 open-loop run.
+    Lockstep is a different regime, not just a slower one -- there the panel advances
+    once per camera trigger, so the scene moves a fixed amount per FRAME and only
+    230 px/s (10-90% 223-237, n=160, 15:02 run) despite identical OrthoSim settings.
+    Per frame the two agree (124 vs 134 px), per second they differ 2.4x. So run the
+    synthetic-scene experiment in OPEN LOOP, or this rate walks patches off their
+    features. It only has to match the scene at all on a scene that HAS features --
+    for the blank arm any sane rate does, since there is nothing to drift off.
+
+    Only useful with ``min_texture_score`` at 0 -- a blank frame fails both texture
+    gates otherwise. ``IRON661_AF_SYNTH`` in app.py sets the pair together."""
+
     # %% Leading-edge target selection (consumed by select_leading_edge_roi) %
     edge_band: float = 0.25
     tiles_per_frame: float = 5.0
@@ -627,6 +653,7 @@ class _RunState:
     lurch_frames: int = 0
     travel_hist: list = field(default_factory=list)  # recent |dy|, for the lurch reference
     travel_ref: float = 0.0                          # the reference it was last judged against
+    synth_t: Optional[float] = None                  # last clock read, synth_travel_px_s only
     objects: list = field(default_factory=list)  # objects[0] = the scored target
     next_oid: int = 0
     # cross-object handover (climb): objects[0] is the scored primary, objects[1] the
@@ -852,7 +879,12 @@ class AutoFocusEngineV2:
         rs = self._rs
         rs.frames += 1
 
-        dx, dy, response = self._tracker.update(frame)
+        # One seam for the whole synthetic-scene mode: everything downstream -- the lead
+        # direction, _advance_objects, the roster refill gate -- reads only this triple,
+        # so substituting it here makes the engine behave as though the scene moved
+        # without any of those paths knowing the difference.
+        dx, dy, response = (self._synth_travel() if self.cfg.synth_travel_px_s
+                            else self._tracker.update(frame))
         rs.motion_dx, rs.motion_dy = dx, dy
         rs.motion_response = response
         # Which way the scene flows is a property of the SCENE, so remember it rather
@@ -971,6 +1003,21 @@ class AutoFocusEngineV2:
         return obj
 
     # %% object tracking %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    def _synth_travel(self) -> tuple[float, float, float]:
+        """Scene motion off the clock instead of off the image. See synth_travel_px_s.
+
+        Returns full confidence, because a synthetic vector is not an estimate -- the
+        response floors downstream exist to reject a phaseCorrelate result that might
+        be garbage, and this one cannot be.
+        """
+        now = time.monotonic()
+        prev, self._rs.synth_t = self._rs.synth_t, now
+        # First frame advances nothing (no interval yet). The clamp matters because the
+        # GUI thread does stall -- a 5 s hitch would otherwise teleport every patch off
+        # the frame at once and empty the roster mid-station.
+        dt = 0.0 if prev is None else min(now - prev, 1.0)
+        return 0.0, self.cfg.synth_travel_px_s * dt, 1.0
 
     def _frame_lurched(self, dy: float) -> bool:
         """Did the scene jump further this frame than the run's own recent rhythm?

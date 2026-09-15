@@ -587,6 +587,7 @@ class FocusPanel(QWidget):
     dual_track_toggled = Signal(bool)    # two-object tracking overlay (green boxes) on/off
     orthosim_toggled = Signal(bool)      # OrthoSim ground-truth decode + AF interior masking on/off
     lockstep_toggled = Signal(bool)      # closed-loop display/camera handshake on/off (bench only)
+    deraster_toggled = Signal(bool)      # notch the display's pixel grid out of the metric (bench only)
 
     # Emitted at low cadence whenever the panel receives a coarse frame or a
     # fine tile. Used by the MainWindow to surface the M4 focus-tap chain.
@@ -873,6 +874,17 @@ class FocusPanel(QWidget):
     def orthosim_active(self) -> bool:
         return self._ortho_toggle.isChecked()
 
+    def deraster_active(self) -> bool:
+        return self._deraster_toggle.isChecked()
+
+    def set_deraster_active(self, on: bool) -> None:
+        """Force the toggle, without re-emitting -- the app snaps it back off when
+        there is no calibration to apply, and a box that says ON while nothing is
+        filtered is worse than no box at all."""
+        blocked = self._deraster_toggle.blockSignals(True)
+        self._deraster_toggle.setChecked(bool(on))
+        self._deraster_toggle.blockSignals(blocked)
+
     def ortho_screen_wh(self) -> tuple[int, int]:
         return int(self._ortho_w.value()), int(self._ortho_h.value())
 
@@ -1082,6 +1094,24 @@ class FocusPanel(QWidget):
         )
         self._lockstep_toggle.toggled.connect(self.lockstep_toggled.emit)
         row.addWidget(self._lockstep_toggle)
+
+        self._deraster_toggle = QCheckBox("De-raster")
+        self._deraster_toggle.setToolTip(
+            "OrthoSim bench rig only. Notches the DISPLAY'S OWN PIXEL GRID out of\n"
+            "the focus metric before scoring.\n\n"
+            "The camera oversamples the panel ~3.36:1, so its pixel and subpixel\n"
+            "grid is imaged as real, periodic detail at the same conjugate as the\n"
+            "picture. It is more uniform across the field than terrain is, so it\n"
+            "drives the metric BETTER than the scene: on 2026-09-14 a blank grey\n"
+            "panel bracketed harder than the orthophoto and parked 2 counts away.\n\n"
+            "With this on, a blank panel should score flat and AF should refuse to\n"
+            "arm on it -- that is the check that it is working.\n\n"
+            "Needs a calibration measured on THIS geometry (tools/raster_spectrum.py\n"
+            "--calibrate); recalibrate if the camera, lens or panel moves. Leave OFF\n"
+            "in flight: there is no screen there, so it is cost with no benefit."
+        )
+        self._deraster_toggle.toggled.connect(self.deraster_toggled.emit)
+        row.addWidget(self._deraster_toggle)
 
         self._csv_log_toggle = QCheckBox("Log CSV")
         self._csv_log_toggle.setToolTip(

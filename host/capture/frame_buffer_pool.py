@@ -125,6 +125,9 @@ class WriteJob:
     # subprocess reconstitutes it via ``GpsFix(**gps_dict)``.
     gps: Optional[dict] = None
     attitude: Optional[dict] = None
+    # Lens focus at capture: encoder count + the epoch it is counted from.
+    # See :attr:`SerialClient.encoder_epoch` for why the epoch travels with it.
+    focus: Optional[dict] = None
     extras: dict = field(default_factory=dict)
     # Warmup jobs exercise the packer's full encode pipeline
     # (slot read -> blosc2 compress) WITHOUT pushing a result to the
@@ -172,6 +175,7 @@ class PackedResult:
     capture_kind: str = "sweep"
     gps: Optional[dict] = None
     attitude: Optional[dict] = None
+    focus: Optional[dict] = None
     # Per-frame stats the packer measured; the io_writer folds them
     # into its periodic rate report.
     encode_s: float = 0.0

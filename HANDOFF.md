@@ -4568,3 +4568,574 @@ So lockstep is a debugging aid, not the operating mode. Nothing about AF3 needs 
 14:58:54 (405 frames) and 15:07:40 (594 frames). The 15:09 open-loop run above happened
 *because* lockstep failed, not because anyone disabled it. Harmless for AF3 per 44.2, but it
 means any measurement that assumes lockstep held for a whole run must check that it did.
+
+## 45. The bench was measuring the monitor (2026-09-14)
+
+Every AF3 number in this document up to today was measured against a 4K LCD that the camera
+oversamples ~3.36:1. The panel's own subpixel grid is imaged as real, periodic detail at the
+same conjugate as the picture, and it turns out to be the DOMINANT focus signal. On a blank
+grey panel with every overlay suppressed, AF3 bracketed *harder* than on the orthophoto and
+parked 2 counts from where the imagery put focus. There was no image content in frame.
+
+`tools/raster_spectrum.py` measures it, `De-raster` removes it, and the metric is unchanged in
+flight -- there is no screen there, so the notch is off by default and the flight path is
+bit-for-bit what it was.
+
+### 45.1 What the raster is -- measured, not derived
+
+The spectrum of a blank grey panel (green sub-grid, the only plane AF scores) is DC plus a
+lattice of narrow spikes and **nothing else**. No broadband content, because there is no
+content. Fundamental **0.2016 cyc/px on both axes** (period 4.96 px), 2x harmonics at ~0.404,
+diagonal sum/difference terms, lattice rotated ~1 deg off the sensor axes.
+
+That works back to the LCD's RGB stripe: the subpixel pitch is 3x finer than the pixel pitch,
+so at M cam px per screen px it sits at 3/M = 0.894 c/cam-px, ABOVE the sensor's Nyquist, and
+aliases down to 0.106 -- which is 0.2016 in the 2x-decimated green plane. Solving back gives
+M = 3.336 against the 3.3553 the bench is configured for.
+
+Two things make those positions impossible to derive on paper, which is why the tool measures:
+
+* the green sub-grid is a 2x decimation with **no prefilter**, so anything above 0.25
+  cyc/sensor-px folds back and lands somewhere else entirely;
+* the RGB stripe is already aliased at the sensor before the sub-grid touches it.
+
+**Trap, cost me a wrong calibration:** the TIFs that 'Save focus view' writes are ALREADY the
+green sub-grid (`_save_af_crops` saves `crop[0::2, 1::2]`), not raw Bayer. Re-scoring them
+through `focus_measure_full_res` decimates a SECOND time and measures an image the engine
+never sees. `focus_measure_green()` was split out of `focus_measure_full_res()` for exactly
+this and is the entry point anything on-disk must use. Note `tools/af_crop_review.py` still has
+this bug -- its scores are not the engine's.
+
+### 45.2 The notch
+
+An FFT spike-kill in `autofocus.py`, applied to the green plane before the existing blur +
+Laplacian, so the metric downstream is untouched. DC is preserved, so the `mean^2` divide still
+normalises the same brightness.
+
+* `set_raster_notch(spikes, radius)` / `raster_notch_enabled()` / `apply_raster_notch(green)`.
+* Calibration lives in `host/capture/raster_notch.json` -- **173 spikes, radius 0.012 cyc/px**.
+  Frequencies are cycles per GREEN-SUB-GRID pixel, so they are crop-size independent and masks
+  are rebuilt per shape on demand.
+* Scoring is a `ThreadPoolExecutor`, same process, so a module-level toggle reaches the workers
+  with no plumbing.
+
+**Why an FFT and not a cheap separable kernel.** The lattice is rotated off-axis and
+harmonic-rich; nothing separable reaches it. This only ever runs on the bench, where ~36 ms on
+top of a 7.4 s station is free. If it is ever wanted in flight, that is the point to spend
+effort on a steerable IIR comb.
+
+**Cost: 51 ms/patch against 15 ms un-notched.** It was 124 ms first: a live crop is 1340 px
+wide, 1340 factors as 2^2 x 5 x 67, and that prime 67 puts numpy's FFT on its slow path. Padded
+to `cv2.getOptimalDFTSize` (1350 x 960, both smooth) and run through `cv2.dft`. The pad is
+`BORDER_REFLECT`, not zeros -- a frequency-domain multiply wraps around, and a hard seam smears
+broadband energy back across the spectrum being cleaned.
+
+**Toggle: `De-raster`, next to Lockstep.** It loads the calibration on every tick rather than at
+import, so you can recalibrate and re-arm WITHOUT restarting -- which matters here, because a
+restart is a grabber teardown. If the file is missing or empty it refuses, logs why, and
+un-ticks itself; a checked box over an unfiltered metric would silently invalidate the run.
+It does NOT survive a restart -- re-tick it.
+
+**Recalibrate whenever the camera, lens or panel geometry moves.** Capture blank-grey crops
+with 'Save focus view', then:
+
+```powershell
+py -3 tools/raster_spectrum.py "<focus crop folder>"            # look: where are the spikes?
+py -3 tools/raster_spectrum.py "<folder>" --calibrate           # BLANK GREY crops only
+py -3 tools/raster_spectrum.py "<folder>" --verify              # score with and without
+py -3 tools/raster_spectrum.py --self-check                     # synthetic grid, known truth
+```
+
+### 45.3 The evidence -- a clean 2x2
+
+Same session, same synth motion, same target; only the toggle differs:
+
+| target | notch | D rise | D peak | outcome | centre score at focus |
+|---|---|---|---|---|---|
+| grey panel | off | 1.218 | +0.923 | brackets, 20 stations | 506 |
+| grey panel | **on** | **0.277** | **-0.012** | **never arms** (backstop, vertex extrapolated) | **27** |
+| Pardes Hana | off | 0.658 | +0.597 | brackets, 15 stations | 1082 |
+| Pardes Hana | **on** | **0.637** | +0.283 | **brackets, 25 stations** | **983** |
+
+`station_arm_rise` is 0.35, so 0.277 cannot arm and 0.637 can. The notched grey run walked all
+40 stations straight THROUGH focus (past raw -222, out to -1403) and found no hill, with
+per-station IQRs of 0.02-0.11 -- genuinely flat, not noisy.
+
+**94.7% of the focus score at best focus on a blank panel was the monitor** (506 -> 27). On
+content it is ~10% (1082 -> 983). The picture was carrying the focus signal all along; it was
+being drowned out.
+
+Offline, scoring saved crops predicted this before the live run: grey score swing across a walk
+10.76x -> 1.41x, content 2.51x -> 2.59x (preserved). Live and offline agreeing is what makes
+this trustworthy rather than a lucky threshold.
+
+The notch does not zero grey, it puts it under the threshold: ~0.20 of D rise survives near
+focus. That is harmonics below the detection threshold plus spikes broadening as defocus smears
+them past a fixed notch. "Flat" here means "below arming", not "absent".
+
+### 45.4 This reopens 43.1 -- `park_bias_counts` was measured through the raster
+
+In every run before the notch, grey or content, **D's vertex and the raw centre score's peak
+were +0 counts apart**. 43.1 read that as a property of the optics and concluded there is no
+resolvable park bias.
+
+It is not a property of the optics. The raster is perfectly uniform across the field, so while
+it dominated, a centre-vs-edge measure (D) and a plain centre score were forced to peak at the
+same lens position. Remove it and run on real terrain and they separate: **598 counts apart**
+(score peaks raw -1360, D at raw -762), in the direction the module docstring predicts.
+
+So 43.1's +62/+71/+152c were all measured through the contaminant. The conclusion needs redoing
+de-rastered -- and 43.3 still applies: `station_descend_stop = 3` censors the score peak, so it
+needs relaxing for any run used to calibrate a park offset. Treat the 598 as provisional: one
+run, n=5 per station.
+
+### 45.5 Two traps found on the way, both still live
+
+**45.5.1 Synthetic scene motion is wall-clock based, so lockstep starves it.**
+`_synth_travel` returns `synth_travel_px_s * dt`, so the slower the frames, the bigger the jump:
+
+| | frame interval | jump/frame | frames per traverse |
+|---|---|---|---|
+| open loop, 4.7 fps | 0.21 s | 116 px | ~20 |
+| lockstep, 1.5 fps | 0.67 s | 363 px | **~6.6** |
+
+`profile_metric` rejects any trail under 6 points, so at lockstep cadence essentially every
+traverse is discarded and the station reports `banked NOTHING in 45s -- skipped`. It also
+invents lurches on any GUI hitch (`dy=+510 against a recent 144`, i.e. the 1.0 s clamp), and
+with content on screen it never consults the tracker at all -- ROIs visibly drift off the
+terrain. **Do not use synth motion with lockstep, or on a scene that has content.**
+
+Consequence for the record: the 10:46 baseline and the 13:03/13:07 notched content runs all
+carry that drift plus ~10% conflated crops (`roi_crops=4083, conflated=409`). They share the
+artefact, so the like-for-like comparison stands, but their absolute D values are soft. The
+13:46 run in 45.3 is the clean one -- real tracker, lockstep, no drift, no doubling.
+
+**45.5.2 The dive's 40%-of-peak collapse test is marginal on low-contrast targets.**
+On grey, run 1 collapsed at 36% on burst 4; run 2 scored 40.1% on burst 5 -- **missing the
+threshold by 4 counts of 2436.8** -- then wandered to 8 bursts and dove to -6951c instead of
+-3496c. That nearly invalidated the grey test: starting 3455c lower, it only just reached focus
+inside the ~38-station cap. On a longer target it would have hit the backstop BEFORE reaching
+focus and produced a false confirmation.
+
+Note the dive scores the 4x-decimated COARSE frame (`_coarse_pair_score` ->
+`focus_measure_normalized`), NOT the full-res green plane, so the notch does not touch it. A
+doubled dive time after enabling De-raster is this, not the notch.
+
+## 46. The flight field is a saddle, and F6/F8 is what made it measurable (2026-09-15)
+
+Section 43 parked `park_bias_counts` at 0 and section 45 reopened it: with the raster notched
+out, bench and de-rastered runs both show a **598 count** gap between the D vertex and the
+score peak, and the first flight analysis (`tools/field_flatness.py`) said the flight field was
+flat, leaving 598c unexplained. It is no longer unexplained. It is also not fixable with a park
+offset.
+
+### 46.1 The mirror step overlaps, and the first two probes said it did not
+
+Operator called this: "there is totally overlap between F6, F7 and between F7 and F8, I can
+see it with my crooked eyes." Three probes had just concluded the opposite. They were all
+wrong the same way -- **they searched for translation only.**
+
+A mirror step turns the field as well as moving it. Measured by SIFT + RANSAC on 129 frames:
+
+| pair | rotation | scale | dy (rows) | dx (cols) | RANSAC inliers |
+|---|---|---|---|---|---|
+| F6->F7 | **+4.77 .. +5.22 deg** | 1.000 | -7584 .. -7929 | -350 .. +530 | 158 .. 1308 |
+| F7->F8 | **+4.78 .. +5.18 deg** | 1.000 | -7718 .. -7876 | +326 .. +528 | 201 .. 326 |
+| F7->F7, next sweep | -0.05 .. +1.82 deg | 0.999 | +824 .. +3437 | -4152 .. -5556 | 625 .. 2448 |
+
+4.9 deg walks the corner of a 512 px template by ~31 px, which drops NCC into the farmland
+noise floor. Worse, farmland *false*-matches a single large template at ncc 0.75-0.91, so the
+probes did not just fail, they returned confident numbers. What exposed them was consistency,
+not correlation strength: F6->F7 plus F7->F8 did not equal F6->F8 (+2832 -2120 vs a claimed
+-2704), and a mechanically fixed mirror step came back as dy=-5952 on one sweep and +4408 on
+another. **On self-similar terrain, NCC height is not evidence. Vote agreement is.**
+
+Geometry now settled, from GPS/DateTime in the frames plus the recovered affines:
+F6/F7/F8 are 0.22 s apart (13.7 m of flight), sweeps are 3.0 s and ~190 m apart at ~62 m/s,
+GSD ~33.8 mm/px, frame 9528 rows across-track (322 m) x 13400 cols (453 m). The F7->F7
+displacement of 5727 px = 194 m matches GPS's 190 m, which validates the sweep pairing.
+The mirror step moves ~7800 rows, leaving **~1730 rows (~18%, ~58 m) of overlap**; two steps
+clear the frame, which is why F6-F8 correctly never matches.
+
+### 46.2 What the second geometry bought
+
+`tools/field_pairs.py` now registers by partial affine (`global_affine`) instead of a constant
+shift, and rotates the **template only** -- scored pixels are still never interpolated. Two
+side effects beyond enabling mirror pairs:
+
+- The old constant-(dy,dx) prediction was quietly losing patches even on sweep pairs: ~0.8 deg
+  of yaw displaces the far end of a 13400 px frame by ~110 px, outside `REFINE_WIN=96`.
+- Patches went 931 -> **7381**, and the design condition number **1e18 -> 8.47**. That is the
+  whole point: one shift direction cannot separate tilt from curvature at any SNR. The mirror
+  pairs shift ~7800 px along the rows against the sweep pairs' ~5000 along the columns, which
+  are near enough orthogonal to break the degeneracy.
+
+Result (`--from-csv pairs_f678.csv`, cluster bootstrap over 204 pairs, residual sd 0.221):
+
+| coefficient | value | bootstrap | sigma |
+|---|---|---|---|
+| tilt_x | +0.1113 | +-0.0276 | 4.0 |
+| tilt_y | -0.0625 | +-0.0173 | 3.6 |
+| curv_x | -0.0284 | +-0.0160 | 1.8 |
+| curv_y | **+0.1411** | +-0.0225 | **6.3** |
+| astig | **+0.0945** | +-0.0126 | **7.5** |
+
+The quadratic part has **negative determinant (-0.0062)**: eigenvalues +0.1534 / -0.0407, i.e.
+**a saddle, not a bowl** -- +17% sharper along an axis 15 deg off across-track, -4% across it.
+Every subset agrees (line 13 det -0.0047, line 19 -0.0068, sweep-only -0.0066).
+
+The cross-check that matters: the two geometries carry different systematics -- sweep pairs
+compare across 3 s at one look angle, mirror pairs across 0.22 s at two look angles ~4.7 deg
+apart -- and they independently agree on `astig` (+0.102+-0.024 vs +0.112+-0.024) and on the
+sign of `curv_y` (+0.160+-0.028 vs +0.083+-0.029). A look-angle artefact would not reproduce
+across both. Vignetting is excluded outright: `focus_measure_green` divides by mean^2, so any
+multiplicative gain cancels exactly.
+
+Do **not** read the mirror-only fit as a field map (cond 1.2e3, `tilt_x` -1.05+-0.55): mirror
+pairs have dx~0, so their `tilt_x` column is ~zero and that coefficient is unconstrained. Its
+value is `curv_y` and `astig`, not the whole surface.
+
+### 46.3 Same question in counts: `tools/fieldmap_counts.py`
+
+Log-score units cannot answer a question posed in counts. The 32 existing bench fieldmap
+sweeps already hold the other half -- five ROIs scored while the lens walks focus, sitting at
+exactly the normalised positions the flight fit uses (centre, +-0.666 on each axis). Fit a
+parabola per ROI and its vertex IS that ROI's best focus, no conversion factor assumed.
+27 of 32 bracket a peak in all five ROIs:
+
+| ROI | median best focus vs centre | IQR |
+|---|---|---|
+| top | -70 c | 432 |
+| bottom | -17 c | 281 |
+| left | -159 c | 800 |
+| right | +224 c | 135 |
+
+Mean edge sag: median **-3 c**, IQR 281, range -104 .. +550 -- and it **drifts by session**,
+not randomly: -104..+11 on 12 Aug, +187..+327 on 31 Aug, +346..+550 on 1 Sep. Suspect the
+bench target's own tilt, which is indistinguishable from field tilt at finite conjugate and
+changes whenever the rig is re-aimed. Treat bench field numbers as unreliable for this purpose;
+the flight measurement has no such confound (same ground, both views, effectively infinite
+conjugate).
+
+Curve width from the same fits: `a` ~ 3.3e-7 per count^2, so **598 c of defocus costs 0.116
+log units (11% of score)**, and the flight field's D of -0.056 log units is worth **~415 c**.
+(The 20260727 `*focus*.csv` sweeps give a=2.4e-8, 10x flatter -- that is the raster holding the
+score up at every lens position. Do not use pre-notch sweeps for curve width.)
+
+### 46.4 So: 598c is explained in size, but a park offset is the wrong tool
+
+- **Magnitude is no longer a mystery.** The flight field's D-equivalent is ~415 c against the
+  598 c gap -- same order. Field curvature of the size actually present can produce a gap like
+  that. Section 45's "flight shows NO field curvature" was a null from insufficient geometry
+  (931 patches, one shift direction), not a flat field.
+- **But the shape forbids the fix.** A saddle cannot be flattened by a scalar park offset:
+  moving focus toward the +0.153 axis moves it away from the -0.041 axis by construction. Only
+  a symmetric bowl or dome would justify a single `park_bias_counts`.
+- **And there is no stable number to bake in.** Bench per-ROI offsets move by hundreds of
+  counts between sessions, and line 13 vs line 19 disagree on `curv_y` at 1.9 sigma.
+
+`park_bias_counts` therefore **stays 0** -- now for a defensible reason (the field is not the
+shape a park offset corrects) rather than because the field looked flat. The in-flight bracket
+(section 43, still pending) remains the only way to measure a park offset, and should chase the
+**centre ROI's own score peak**, not D's vertex. Expect a few hundred counts, and note that at
+a=3.3e-7 the whole 598 c is only 11% of peak score -- well inside depth of focus.
+
+### 46.5 Checks left behind
+
+- `py -3 tools/field_pairs.py --self-check` -- plants a dome and a bowl, recovers both signs at
+  >3 sigma, then registers a **4.9 deg rotated** pair and asserts it (a) keeps most of its
+  patches, which is what pins the template's rotation SIGN down (wrong way doubles the error to
+  ~10 deg and nothing matches at all), and (b) does not invent curvature on a flat field.
+- `py -3 tools/fieldmap_counts.py --self-check` -- plants a -900 c edge sag under 5% score
+  noise and requires every vertex back within 150 c.
+- Synthetic ground had to be rebuilt for this: single-scale noise gave SIFT no scale-space
+  structure (144 keypoints, 13 surviving the ratio test, **1 inlier** on a rotated pair). It is
+  now 1/f noise plus posterised parcels, which registers like farmland.
+
+## 47. D is blind to the field the flight actually has (2026-09-15)
+
+Section 46 measured the flight field. This section answers the question that measurement was
+FOR: **is the D method applicable in real flight data, or only on the bench?** Two separable
+questions hide in that, and they get opposite answers.
+
+### 47.1 Does the content-cancelling mechanism work in flight? Yes.
+
+`profile_metric` tracks ONE patch across the frame and takes centre-band minus both
+edge-bands in log, so the patch's own texture/brightness scale `k` cancels exactly. Confirmed
+against the shipped function, not re-derived: a patch 50x and 0.02x textured returns a
+bit-identical D. Independently confirmed on real terrain by section 46's paired estimator,
+which is the same trick (same ground, two field positions, log difference) and cut the noise
+floor from **0.70 to 0.221 log units**. The principle is sound and it survives real farmland.
+
+### 47.2 Is there anything in flight for D to measure? Essentially no.
+
+Push the fitted flight surface through the real `profile_metric` (`tools/field_to_D.py`). For a
+patch crossing at fixed across-track position `y0`:
+
+    D = f(0,y0) - [f(-1,y0) + f(+1,y0)]/2 = -curv_x
+
+Every other term cancels identically. Both tilts are odd in x and die in the average of the two
+edges; `astig*x*y` is odd in x too; `tilt_y*y` and `curv_y*y^2` carry no x at all and cancel
+against the centre. Verified against the shipped metric over 1000 random surfaces (agrees to
+0.9% of the surface range) and at every `y0` from -0.8 to +0.8 -- D does not move.
+
+The realised D is smaller still. The edge bands are the outer `profile_edge_frac=0.25` of the
+travel axis, so their median sits at |x|~0.73, giving **D = -curv_x * 0.53**, a further factor
+of two thrown away by not reaching the field corners.
+
+Now line that up against what the flight field IS:
+
+| coefficient | flight value | sigma | does D see it? |
+|---|---|---|---|
+| `astig` | +0.0945 | **7.5** | **no** -- D = +0.000000 |
+| `curv_y` | +0.1411 | **6.3** | **no** -- D = +0.000000 |
+| `tilt_x` | +0.1113 | 4.0 | no -- D = +0.000000 |
+| `tilt_y` | -0.0625 | 3.6 | no -- D = +0.000000 |
+| `curv_x` | -0.0284 | **1.8** | yes, this and only this |
+
+**D is blind to all four resolved coefficients and sensitive only to the one that is not
+resolved.** That is not bad luck, it is the shape of the metric meeting the shape of this lens:
+the field's structure runs along an axis 15 deg off ACROSS-track, and D samples ALONG-track.
+
+Numerically, at the position flown: **D = +0.0155 +- 0.0087 log units** (1.8 sigma). AF3 arms
+its stop at a rise of `station_arm_rise = 0.35`. The flight field offers **23x too little to
+arm**. The bench reached 0.277 notched and 0.637 on content -- so the bench D was not measuring
+this lens's along-track field curvature, and the suspect is the bench target's own tilt and
+sag at finite conjugate, which section 46.3 already flagged independently for drifting -104c to
++550c between sessions.
+
+### 47.3 The limit of this conclusion
+
+All 129 frames are at ONE lens position, and it was never logged (the encoder stamping added in
+section 45 postdates this flight). So this measures **D at the park position**, not the D swing
+over a sweep. `curv_x` grows as the lens leaves focus, so a full in-flight sweep could show more
+than 0.0155. What is NOT position-dependent is the blindness: `D = -curv_x * 0.53` holds at
+every lens position, so whatever the sweep does, D still cannot see `curv_y` or `astig`.
+
+### 47.4 So is there a content-invariant in-flight focus signal? Probably, on a different axis
+
+The signal exists -- `curv_y` at 6.3 sigma and `astig` at 7.5 sigma are strong and reproduce
+across two independent geometries. It is simply orthogonal to where D looks. Two ways to point
+the method at it, both using machinery that now exists:
+
+1. **Sample the across-track axis using the mirror step.** F6->F7 puts the same ground ~7800
+   rows apart across-track (section 46.1). A D formed on that axis reads `curv_y`, worth
+   ~0.141*0.53 = **0.075 log units** -- 5x better than along-track, though still under 0.35.
+   `profile_metric` already picks its travel axis from the trail, so it needs no switch; it
+   needs trails that MOVE across-track, which only the mirror step provides.
+2. **Two-point paired D instead of a three-point traverse.** The pairing does not need
+   centre-vs-both-edges; it needs one patch at two field positions with a known displacement,
+   which 59% sweep overlap supplies on every frame. It recovers the whole surface (5
+   coefficients) rather than one, which is how section 46 got 7381 observations out of frames
+   that yielded no usable D at all.
+
+Either way the in-flight bracket (section 43, still pending) is what closes this, and it now has
+a spec: step the park across 5-7 stations on a repeated line, and measure the field on the
+ACROSS-track axis, not along it.
+
+### 47.5 And the crab angle leaks the blind terms straight back in
+
+47.2's blindness assumes the traverse runs PARALLEL to the travel axis. No real traverse does.
+The measured sweep-to-sweep displacements are ~5000 px along the columns but also **824 to
+3437 px along the rows**, so a patch crosses the frame on a diagonal of normalised slope
+`m = dy/dx` between -0.23 and -1.16 (crab, plus the mirror not returning the footprint to
+exactly the same place).
+
+Substituting `y = y0 + m*x` into the surface, the `x^2` coefficient -- the only thing D reads --
+becomes
+
+    curv_x + m^2 * curv_y + m * astig
+
+So the two coefficients D is supposedly blind to come back, **scaled by the crab angle**. Since
+`curv_y` is +0.141 and `astig` is +0.095 while `curv_x` is only -0.028, the leak dominates the
+signal. Through the shipped `profile_metric`, on the slopes actually flown, with the lens never
+moving (so every row MUST read the same D):
+
+| dy, dx (px) | slope | D |
+|---|---|---|
+| +824, -5138 | -0.23 | +0.0232 |
+| +1072, -4422 | -0.34 | +0.0241 |
+| +1704, -5516 | -0.43 | +0.0234 |
+| +1824, -5556 | -0.46 | +0.0229 |
+| +2368, -4960 | -0.67 | +0.0154 |
+| +3424, -4152 | -1.16 | **-0.0282** |
+| +3437, -4152 | -1.16 | **-0.0288** |
+
+**D swings 0.053 log units and changes SIGN, at a fixed lens position, purely from drift
+angle.** That is 3.4x the 0.0155 of real signal. On an astigmatic field, D is a crab-angle
+meter first and a focus meter second.
+
+This is the most damaging finding for D in flight, and note it does not depend on the size of
+`curv_x` at all -- it follows from `astig` being large and well resolved (7.5 sigma), which is
+section 46's most reproducible result. Any per-traverse D on this lens must therefore either
+measure and divide out `m` per traverse (the trail already carries it -- `profile_metric` has
+both cx and cy and currently discards cy), or be replaced by the full-surface paired fit, which
+has no preferred axis and estimates `astig` rather than being fooled by it.
+
+`tools/field_to_D.py --self-check` locks both halves in: a pure-astig field must read D = 0 on
+a parallel traverse and `-m*astig*0.53` on a diagonal one. If that ever reads zero on the
+diagonal, this contamination has silently stopped being real.
+
+### 47.6 What the raw trails look like, and why "no signal" is the right read (2026-09-15)
+
+`tools/track_trails.py` tracks ground patches across the F7 frames and plots `ln(score)` per
+object against along-track position (`trails_F7.png`, trails cached in `trails_F7.csv`). 491
+objects, 1116 sightings. The eyeball verdict on that plot is "noise", and it is correct for the
+quantity AF3 consumes, while an aggregate signal is simultaneously present. Both are true
+because they differ by a factor of 30 in averaging:
+
+- **Between objects**: `ln(score)` spans a factor of 27 (sd 0.575). This is pure terrain and it
+  is exactly what the pairing/de-meaning exists to remove.
+- **In aggregate, after de-meaning**: a clean monotonic **ramp of 0.216 log units** across the
+  frame, slope **+0.136 +- 0.011 (12.6 sigma)**, cluster-bootstrapped over objects. It
+  corroborates section 46's independent `tilt_x = +0.111` from a different estimator. The
+  quadratic term over the same fit is +0.032 +- 0.021 (**1.5 sigma, unresolved**) -- and being a
+  mixture of crab slopes, that term is 47.5's contaminated `curv_x + m^2*curv_y + m*astig`
+  anyway, not `curv_x`.
+- **Per sighting**, after removing both the object mean and the fitted profile: **0.139 log
+  units** of irreducible scatter. That is 64% of the entire profile span, from one look.
+
+So the plot shows the only strong along-track signal there is (a tilt), and **D is built to
+cancel tilt** -- both tilts are odd in x and die in the edge average (47.2). Costing the
+leftover through a realistic 19-sample traverse (4 samples per band after
+`profile_centre_frac`/`profile_edge_frac`, medians ~1.25x noisier than means):
+
+| | per traverse |
+|---|---|
+| D noise from terrain | 0.106 log units |
+| D signal at the park flown | 0.0096 |
+| SNR | **0.09** |
+| traverses for a 2-sigma D | **488** |
+| `station_min_traverses` | 4 |
+
+**Short by 122x.** For contrast, the same traverse pointed at the tilt (far band minus near
+band, no edge averaging) gets SNR 4.4 and resolves in a fraction of one traverse. The
+information in these frames is real and plentiful; D's three-point centre-minus-edges form
+discards all of it and keeps the one term the terrain noise buries. That is the strongest
+single argument for 47.5's second fix option -- replace the per-traverse D with the
+full-surface paired fit, which spends the same photons on 5 coefficients instead of 1.
+
+Reproduce: `_scratch_snr.py` (reads the cached CSV, no frames needed).
+
+## 47.7 Costing the paired fit for flight, and why faster frames make it worse (2026-09-15)
+
+47.4 proposed replacing the per-traverse D with the full-surface paired fit. This sections costs
+that proposal on the real 13400x9528 frames, and the answer changes the design.
+
+### 47.7.1 It does not fit in 210 ms as written, but the compute is not the wall
+
+Timed with the plane already in RAM (no TIFF decode), SIFT cached per frame:
+
+| stage | ms | scales with |
+|---|---|---|
+| /8 + /2 pyramid + 8-bit stretch | 317 | per frame |
+| SIFT detect | 706 | per frame |
+| match + RANSAC | 149 | per pair |
+| patch refine (rotate + NCC) | 11.0 | per patch |
+| `focus_measure_green` | 3.6 | x2 per patch |
+| the lstsq fit, all 7381 rows | 44 | per update |
+
+**1172 ms of fixed cost against 210 ms**, plus 18.2 ms per patch; the offline scan's ~170
+patches/pair costs 3.1 s. The fit itself is free.
+
+Most of it is recoverable. SIFT detection is **insensitive to `nfeatures`** -- 603 ms at 6000 and
+636 ms at 400, because the cost is the scale-space pyramid, not the keypoints. Levers: run on /16
+(181 ms), or **ORB (40 ms, 2781 features)**, 15x faster and 70x `MIN_INLIERS`. The /2 plane is
+178 ms of pure 128 MB allocate-and-copy; as uint8 it is 132 ms (`matchTemplate` takes 8U), and
+building it over the overlap strip only should reach ~25 ms. The percentile stretch goes 36 ms
+to 2 ms sampled at /32 for the same answer. That lands ~120 ms fixed, leaving ~5 patches per
+frame against the 31 the offline set averages.
+
+### 47.7.2 The real limit is frame pairs, not patches or milliseconds
+
+The error bar is set by independent FRAME PAIRS -- every patch in a pair shares one registration,
+which is why section 46 went to a cluster bootstrap. Over 204 frame pairs, `curv_y` is +-0.0223,
+falling as 1/sqrt(pairs): **~41 pairs for +-0.05, ~113 for +-0.03**.
+
+The two geometries arrive at different rates. Mirror pairs every 0.21 s, sweep pairs every ~3 s.
+A 7.4 s station offers ~35 mirror but only **~2 sweep** pairs, and both are needed or tilt and
+curvature collapse together (the 1e18 condition number). Scaled to one station, `curv_y` lands
+near +-0.05 against a true +0.141 -- 2.7 sigma, usable. So this is a **per-station estimator,
+not a per-frame one**: accumulate pairs across the dwell, fit once. Whether 2 sweep pairs is
+enough geometry is answerable offline by refitting `pairs_f678.csv` on station-sized subsets.
+
+### 47.7.3 Shooting every 210 ms would make it 3x WORSE, not better
+
+The instinct is that a 210 ms cadence gives ~97% overlap instead of 59% and therefore more to
+work with. It gives the opposite, because `design_row` is built from **differences**
+(`xa-xb`, `xa^2-xb^2`, ...). Displacement is the lever arm; overlap is not. Two views sitting
+almost on top of each other contribute almost no signal while carrying the full registration and
+terrain-decorrelation noise.
+
+Demonstrated on real pairs with the lever arm artificially shortened -- same dlog, same noise,
+same terrain, only `xb`,`yb` moved back toward `xa`,`ya`:
+
+| displacement | curv_y error per single frame pair |
+|---|---|
+| 1.00x (as flown, 59% overlap) | 0.393 |
+| 0.50x | 0.968 |
+| 0.25x | 2.141 |
+| **0.07x (= 210 ms, 97% overlap)** | **7.818** |
+
+20x worse per pair for 14x more pairs, i.e. **~3x worse per second of flight**.
+
+And the opposite extreme is no better: gap-2 sweep pairs have 2x the lever arm (8942 px vs
+4584 px) but only 15 patches per pair instead of 42 because the overlap has shrunk to 18%, and
+they come out **2.1x worse per pair** (0.849 vs 0.398). So displacement and overlap trade off
+directly and there is an interior optimum. The simple model -- error per second of flight
+proportional to `1/sqrt(dt*(1-dt*v/F))` -- puts it at `dt = F/2v` = 453/(2*62) = **3.65 s, 50%
+overlap**. The sweep repeat already flown is 3.0 s at 59%, within 3% of optimal.
+
+**So no capture change is needed at all.** Normal M-mode already emits both displacements the fit
+wants, large and nearly orthogonal: the mirror step at 0.21 s (~7000 px across-track) and the
+sweep repeat at 3.0 s (~4600 px along-track). Nor does anything need saving at full res -- an
+observation is `(ya,xa,yb,xb,dlog)`, ~50 bytes, so a whole station is ~55 KB against 255 MB for
+one frame. Frames are registered, a few patches scored, then discarded exactly as now. The only
+thing that must change is the LENS: it has to step between parks so the shape can be watched
+moving with focus, which is the in-flight bracket of section 43 -- and section 45's encoder
+stamping now means those parks get logged.
+
+Reproduce: `_scratch_rt.py`, `_scratch_rt2.py` (timings), `_scratch_disp.py` (lever arm).
+
+### 47.7.4 Station-sized windows: conditioning is fine, the error bar is not
+
+47.7.2 guessed a station offers "~2 sweep pairs". That was wrong, and the correction matters:
+EVERY mirror position pairs with itself one sweep later, so a sweep-gap yields as many sweep
+pairs as the sweep has positions. The frames on hand carry only F6/F7/F8, giving 2 mirror + 3
+sweep = 5 pairs per sweep (204 pairs over 43 sweeps confirms it). A real sweep is ~3 s at 210 ms
+per frame, so ~14 positions, i.e. **13 mirror + 14 sweep = ~27 pairs per sweep**, 5.4x richer.
+
+Sliding a window of consecutive sweeps over `pairs_f678.csv`:
+
+| sweeps | windows | pairs | mirror/sweep | cond | curv_y spread | astig spread |
+|---|---|---|---|---|---|---|
+| 2 | 41 | 10 | 4/6 | 12.9 | 0.1724 | 0.0899 |
+| 3 | 39 | 15 | 6/9 | 10.0 | 0.1044 | 0.0485 |
+| 5 | 18 | 24 | 10/14 | 9.2 | 0.0895 | 0.0383 |
+| 8 | 8 | 39 | 16/23 | 8.2 | 0.0513 | 0.0274 |
+
+Against `curv_y = +0.141` and `astig = +0.0945`. **Conditioning was never the problem** -- cond
+stays 8-13 at every window size. The problem is variance: a 5-sweep window puts `curv_y` at only
+1.6 sigma and individual windows come back with the WRONG SIGN. Eight sweeps (24 s) reaches
+2.7 sigma on `curv_y` and 3.4 sigma on `astig`. Extrapolating to a full 14-position sweep, that
+pair count arrives in ~1.5 sweeps (~4.4 s), inside a station -- but that is an extrapolation, and
+it is exactly what the next frame export should test.
+
+**The dangerous finding is that the condition number does not warn you.** On one 5-sweep window,
+dropping the mirror pairs left cond at a healthy-looking 8.7 while the answer moved from
+`curv_y -0.095` to `+0.039` and `tilt_y` from `-0.017` to `+0.234`. A one-geometry fit looks
+perfectly well posed and is simply wrong. Any shipped version must **require both geometries
+present in the window** as a hard precondition; `cond` is not a sufficient health check.
+
+Reproduce: `_scratch_station.py`.
+
+**Prep for that export, done:** `field_pairs.py` assumed 3 mirror positions per sweep in two
+places that would have broken on a full sweep. The /2 refine plane is now uint8 rather than
+float32 (`_frame`), because the rolling window would otherwise retain ~28 x 128 MB = 3.6 GB at
+14 positions; uint8 makes it ~900 MB and `TM_CCOEFF_NORMED` is invariant to the rescale anyway.
+The memmap retention in `scan` keyed off a hardcoded `3` and now keys off the actual frames per
+sweep. The percentile stretch also samples at /32 (36 ms -> 2 ms, same answer). `--self-check`
+passes: dome and bowl recovered at 13 and 39 sigma, the 4.9 deg rotated pair still registers,
+and the flat null still reports no field. NOT yet re-run against the flight frames -- the first
+thing the new export should do is reproduce `pairs_f678.csv`'s coefficients, since 8-bit
+quantisation of the search image could in principle move the registration.

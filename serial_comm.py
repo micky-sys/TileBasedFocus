@@ -230,17 +230,37 @@ class FocusController:
         without disturbing the focus / nav-point motors.
 
         Implemented on the PCB (Parallax_CLRCR_V2_4) as ``testClick()``:
-        drives ``camTrigPin`` high for ``picDelayCurr`` ms, then low for
-        ``picsInPlaceDelay`` ms. End-to-end one click is ~310-1800 ms
-        depending on the current speed setting, but the GUI doesn't
-        block on it -- ``_send`` is a fire-and-forget byte write.
+        waits out the camera's max-FPS floor (``minTimeBetweenFrames``),
+        then drives ``camTrigPin`` high for ``picDelayCurr`` ms and low
+        again. The GUI never blocks on it -- ``_send`` is a fire-and-forget
+        byte write onto the TX thread.
 
         Useful as a non-invasive liveness probe after camera recovery:
         click N times, watch each camera's ``acq:N`` label tick up.
         A camera that doesn't tick is still stuck and needs a deeper
         reset.
+
+        Also the per-frame trigger in M4 lockstep -- see
+        :meth:`set_external_trigger`.
         """
         self._send("$T*\n")
+
+    def set_external_trigger(self, on: bool) -> None:
+        """``$X1*`` / ``$X0*``: hand the M4 trigger timing to the host, or give it back.
+
+        M4 normally times its own triggers (``TakePicsInPlace``, one every
+        ``picsInPlaceDelay`` ms), which means the host cannot choose WHEN a
+        frame is taken. On the OrthoSim bench that left the panel's redraw at
+        an uncontrolled phase relative to the shutter, and some frames came
+        back showing the LCD partway between two scene positions (HANDOFF
+        36.17). With this on, M4 stops self-triggering and every frame comes
+        from a host ``$T*`` fired into a display that has reported itself
+        settled.
+
+        BENCH ONLY. While this is on, nothing triggers the cameras unless the
+        host asks, so leaving it set with no driver means no frames at all.
+        """
+        self._send("$X1*\n" if on else "$X0*\n")
 
     # ── Reader thread ─────────────────────────────────────────────────
 

@@ -13,6 +13,8 @@ background reader thread. This wrapper
 
 from __future__ import annotations
 
+import datetime as _dt
+
 from PySide6.QtCore import QObject, Signal
 
 from serial_comm import FocusController  # repo root; see sys.path bootstrap in app.py
@@ -35,6 +37,7 @@ class SerialClient(QObject):
         # Fed on the reader thread (see _on_line) so EncoderAxis can read a fresh
         # position even while an AF step runs synchronously on the GUI thread.
         self._encoder = EncoderTracker()
+        self._encoder_epoch = ""
 
     # ── encoder (AMT203S motor-shaft absolute position) ──────────────────
 
@@ -47,6 +50,20 @@ class SerialClient(QObject):
     def encoder_present(self) -> bool:
         """True once a valid (non-sentinel) ``$ENC`` reading has arrived."""
         return self._encoder.present
+
+    @property
+    def encoder_epoch(self) -> str:
+        """Token identifying the current encoder zero. Counts are only
+        comparable between two readings carrying the SAME epoch.
+
+        The ClearCore re-references on connect, so the same physical lens
+        position reads differently afterwards -- measured 2026-08-13, a run
+        ended at raw=-366 and the next one after a relaunch started at
+        raw=-3391 with nothing having driven the focus in between. A consumer
+        that rebases across epochs invents thousands of counts of drift that
+        never happened, so the epoch is stamped alongside every count rather
+        than left for the reader to guess at."""
+        return self._encoder_epoch
 
     # ── port enumeration ────────────────────────────────────────────────
 
@@ -66,6 +83,7 @@ class SerialClient(QObject):
 
     def connect_port(self, port: str) -> None:
         self._ctrl.connect(port, on_response=self._on_line)
+        self._encoder_epoch = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.connection_changed.emit(True)
 
     def disconnect_port(self) -> None:

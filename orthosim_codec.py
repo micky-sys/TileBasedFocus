@@ -68,6 +68,134 @@ FLAG_SEAM = 0x1
 FLAG_PAUSED = 0x2
 FLAG_CALIBRATION = 0x4
 
+# ── Frame-step sync channel ──────────────────────────────────────────────────
+# The rig is STEPPED, not scrolled: the display holds one scene position until
+# the capture app reports a frame, then advances by the interval that frame took.
+#
+# Why: a 250 us exposure cannot span two 16.7 ms panel refreshes, so a smeared
+# read was never the camera integrating two frames -- it was the panel caught
+# MID-TRANSITION. LCD overdrive leaves a copy of the previous refresh's content
+# behind the current one, bright plus a dark undershoot, one refresh (~21 ms of
+# scene motion, measured) away. Static scenes never showed it because both
+# copies land in the same place, which is why every frozen-page test came up
+# clean. Holding the scene still through the exposure removes it at the source
+# instead of characterising it.
+#
+# Payload: the measured inter-frame interval in seconds, ASCII float, one
+# datagram per camera frame. Loopback UDP and fire-and-forget in that order of
+# importance -- the capture app must never block, fault, or wait on the display
+# app being up, and a lost datagram costs one step rather than a desync, since
+# the display's own tick and distance ride the optical bar and land in the log
+# by way of the camera.
+STEP_HOST = "127.0.0.1"
+STEP_PORT = 51711
+
+# ── Lockstep channel (closed-loop handshake) ─────────────────────────────────
+# The fire-and-forget step above is open loop: the app says "advance" and hopes.
+# That leaves the panel's redraw at an uncontrolled PHASE relative to the shutter,
+# and 2026-09-07 showed the failure it cannot prevent -- a nudge that lands after
+# the repaint is not lost, ``step_dt`` sums the backlog, so the scene covers two
+# intervals in one jump and a shutter open across it records two scene positions
+# ~250 rows apart. Frame-global, 8 pairs in 117 intervals (HANDOFF 36.17).
+#
+# Lockstep closes the loop instead of guarding it: the display reports when the
+# picture is painted AND settled, the app triggers into a provably static panel,
+# and the display does not move again until the app says the frame is in. There
+# is no phase left to land badly, so the alternating step that dodged it can go,
+# which doubles the frames that become measurements.
+#
+# STEP  app -> display, "advance one step":            b"STEP <seq> <dt>"
+# READY display -> app, "painted and settled":         b"READY <seq>"
+#
+# Sequence-numbered because lockstep inverts the property the open-loop channel
+# was built on. There, a lost datagram cost one step; here it would deadlock the
+# run, and a 90 s run is ~430 round trips. The app is master and owns a timeout:
+# an unanswered STEP is re-sent (the display serves the same seq idempotently, so
+# a duplicate cannot double-advance) and after a few tries the run FAILS loudly
+# rather than hanging. Still UDP on loopback, still non-blocking sends -- the
+# capture app must never block or fault on the display app being up.
+READY_PORT = 51712                  # display -> app; STEP_PORT is app -> display
+STEP_PREFIX = b"STEP "
+READY_PREFIX = b"READY "
+
+# How long the display waits after painting before it calls the panel settled.
+# The pixels keep moving after the frame is presented, and that transition is the
+# artefact we are removing, so the wait has to cover the panel's response, not
+# just the swap. Generous by default because it is nearly free: the old rig had
+# ~188 ms of slack in a 238 ms period, and the acceptance test is the smallest
+# margin that still comes back with no doubled crops.
+SETTLE_MS_DEFAULT = 50
+
+# ── Alignment channel (screen-tilt nulling) ──────────────────────────────────
+# Second message type on the SAME socket, distinguished by an ASCII prefix. The
+# display's listener already does ``float(data)`` inside a try and drops what
+# will not parse, so an old display ignores these and a new one keeps stepping.
+#
+# Why it exists: the camera rides a moving platform aimed at the screen by hand,
+# and the six field maps of 2026-08-31 measured ~1.6 deg of pitch and ~1.1 deg of
+# yaw between sensor and panel (HANDOFF 36.14.1). That is 641 encoder counts of
+# focus ramp across the frame against a ~1460c depth of field, i.e. the top and
+# bottom of one frame cannot be in focus together. The capture app measures the
+# angle off a static pattern and the display shows it, so the operator can null
+# it by hand while watching the very screen being aimed at.
+ALIGN_PREFIX = b"ALIGN "
+
+# ChArUco board spec. Lives here because the two apps MUST agree: the display
+# renders from these numbers and the capture side builds its object points from
+# the same ones, so a mismatch would be a silent geometry error rather than a
+# crash. Sized for the bench 4K panel (3840x2160): 25x14 squares of 150 screen
+# px is 3750x2100, and 312 interior corners.
+ALIGN_SQUARES = (25, 14)            # (x, y) squares
+ALIGN_SQUARE_PX = 150               # screen px per square
+ALIGN_MARKER_FRAC = 0.7             # ArUco side as a fraction of the square
+
+# NOT DICT_4X4_50 (what the four corner fiducials use). A ChArUco board needs
+# ceil(sx*sy/2) distinct markers = 175 here, and DICT_4X4_50 has 50, so the board
+# would fail to construct. 5x5 bits also separate better than DICT_4X4_250 at the
+# same capacity. Being a DIFFERENT dictionary from the corner fiducials is a
+# bonus: orthosim_decode.detect_fiducials() can keep hunting ids 0..3 for the GT
+# readout without the board's markers being mistaken for them.
+ALIGN_DICT = "DICT_5X5_250"
+
+PANEL_PITCH_MM = 0.2646             # 4K bench panel, 1016 mm / 3840 px (HANDOFF 29.6)
+
+# Below this the geometry is too cramped to trust. Placed at the measured accuracy
+# cliff (tools/test_align.py renders the board through the real imaging chain and
+# masks the frame down): 312 corners over the full frame reads to 0.02 deg, 50
+# corners over the central 40% still reads to 0.04 deg, but 30 corners over the
+# central 30% is already 0.33 deg and 12 corners is 0.50 deg, against a 0.36 deg
+# budget. So accept the 40%-coverage case and refuse the 30% one. Refusing beats
+# reporting an angle nobody should believe -- the operator would null a wrong
+# bubble and the focus ramp would survive the whole exercise.
+ALIGN_MIN_CORNERS = 40
+
+_align_board = None
+
+
+def charuco_board():
+    """The one alignment board, built once and shared by both apps.
+
+    Lives here rather than in either app because the display renders from it and the
+    capture side builds its object points from it: two constructions from the same
+    constants would still be two places for the marker fraction or the dictionary to
+    drift, and the failure would be a silent geometry error rather than a crash.
+
+    ``cv2`` is imported lazily so the wire codec itself stays dependency-free -- the
+    bar encode/decode is used in places that have no business needing OpenCV.
+
+    Square length is in MILLIMETRES via the panel pitch, which costs nothing and
+    makes the solved translation a real standoff. Tilt is scale-free, so a wrong
+    pitch would not corrupt the angles.
+    """
+    global _align_board
+    if _align_board is None:
+        import cv2
+        dic = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ALIGN_DICT))
+        sq_mm = ALIGN_SQUARE_PX * PANEL_PITCH_MM
+        _align_board = cv2.aruco.CharucoBoard(
+            tuple(ALIGN_SQUARES), sq_mm, sq_mm * ALIGN_MARKER_FRAC, dic)
+    return _align_board
+
 _DIST_MAX_MM = (1 << 32) - 1
 _VEL_MAX_MMPS = (1 << 20) - 1
 _GSD_MAX_E2 = (1 << 16) - 1
@@ -201,3 +329,95 @@ def decode(cells: List[int]) -> Optional[GroundTruth]:
     if crc8(payload) != crc_rx:
         return None
     return _unpack_payload(payload)
+
+
+@dataclass
+class AlignReading:
+    """One camera-to-screen orientation sample, in the SCREEN's own axes.
+
+    Both angles are zero exactly when the panel is perpendicular to the optical
+    axis. They are named for the screen axis each one tips, not for an image
+    axis, because the camera on this rig is rolled ~90 deg relative to the panel:
+    a reading labelled for the image would need mentally inverting, which is the
+    same trap that made the field map trim the wrong edge of the frame for two
+    weeks (HANDOFF 36.13). The measuring side derives roll from the pattern and
+    rotates into these axes, so the label cannot go stale if the camera is turned.
+    """
+
+    tilt_v_deg: float = 0.0     # screen's VERTICAL axis tipping in depth
+    tilt_h_deg: float = 0.0     # screen's HORIZONTAL axis tipping in depth
+    n_corners: int = 0          # how much evidence stands behind the two angles
+    distance_mm: float = 0.0    # camera-to-panel standoff, a free by-product
+
+    @property
+    def magnitude_deg(self) -> float:
+        """Combined tilt about the resultant axis -- what the bubble's radius shows."""
+        return (self.tilt_v_deg ** 2 + self.tilt_h_deg ** 2) ** 0.5
+
+
+def encode_align(reading: AlignReading) -> bytes:
+    """``b'ALIGN <v_deg> <h_deg> <n_corners> <distance_mm>'``, ASCII, one datagram."""
+    return ALIGN_PREFIX + b"%.4f %.4f %d %.1f" % (
+        float(reading.tilt_v_deg),
+        float(reading.tilt_h_deg),
+        int(reading.n_corners),
+        float(reading.distance_mm),
+    )
+
+
+def decode_align(data: bytes) -> Optional[AlignReading]:
+    """Parse an alignment datagram, or ``None`` if it is not one / is malformed.
+
+    Returns ``None`` rather than raising so the display's receive loop can treat
+    "not for me" and "corrupt" identically and just wait for the next datagram --
+    the sender repeats twice a second, so there is nothing to recover.
+    """
+    if not data.startswith(ALIGN_PREFIX):
+        return None
+    try:
+        v, h, n, dist = data[len(ALIGN_PREFIX):].split()
+        return AlignReading(float(v), float(h), int(n), float(dist))
+    except (ValueError, TypeError):
+        return None
+
+
+# ── Lockstep handshake ───────────────────────────────────────────────────────
+# Both directions return None on anything unparseable, for the same reason
+# decode_align does: a receive loop should not have to tell "not mine" from
+# "corrupt", and the master's timeout is the recovery path for both.
+
+def encode_step(seq: int, dt: float) -> bytes:
+    """``b'STEP <seq> <dt>'`` -- advance the scene one step of ``dt`` simulated seconds."""
+    return STEP_PREFIX + b"%d %.6f" % (int(seq), float(dt))
+
+
+def decode_step(data: bytes) -> Optional[tuple]:
+    """``(seq, dt)`` from a lockstep step request, else ``None``.
+
+    Deliberately does NOT fall back to parsing a bare float. The open-loop channel
+    sends one, and silently accepting it here would let a stale sender advance a
+    lockstep display with no handshake -- the exact open-loop behaviour this
+    replaces, reappearing as a hard-to-see mixed mode.
+    """
+    if not data.startswith(STEP_PREFIX):
+        return None
+    try:
+        seq, dt = data[len(STEP_PREFIX):].split()
+        return int(seq), float(dt)
+    except (ValueError, TypeError):
+        return None
+
+
+def encode_ready(seq: int) -> bytes:
+    """``b'READY <seq>'`` -- the picture for ``seq`` is painted and the panel has settled."""
+    return READY_PREFIX + b"%d" % int(seq)
+
+
+def decode_ready(data: bytes) -> Optional[int]:
+    """The sequence number a READY answers, else ``None``."""
+    if not data.startswith(READY_PREFIX):
+        return None
+    try:
+        return int(data[len(READY_PREFIX):].split()[0])
+    except (ValueError, TypeError, IndexError):
+        return None

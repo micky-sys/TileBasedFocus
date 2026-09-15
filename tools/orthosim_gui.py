@@ -317,6 +317,9 @@ class OrthoView(QOpenGLWidget):
         self._hud = bool(cfg.hud_enabled)
         self._calibration = False
         self._scale = bool(getattr(cfg, "scale_enabled", False))
+        # Normally on -- they are how the capture side recovers M and reads ground
+        # truth. Off only for the blank-panel control; see paintGL.
+        self._overlays = not bool(getattr(cfg, "no_overlays", False))
         self._seam_visible = False
         self._align_mode = bool(getattr(cfg, "align_mode", False))
         self._align_pixmap: Optional[QPixmap] = None
@@ -465,13 +468,19 @@ class OrthoView(QOpenGLWidget):
             self._draw_ortho(p)
             if self._calibration:
                 self._draw_calibration(p)
-            if self._scale:
+            if self._scale and self._overlays:
                 self._draw_scale(p)
-        self._draw_fiducials(p)
-        self._draw_bar(p)
+        # Every overlay here is high-contrast BY DESIGN -- fiducials so detection is
+        # reliable, the bar so the capture side can decode it, the ruler explicitly
+        # "so the camera can resolve it". On the blank-panel AF control they would be
+        # the only content in an otherwise uniform frame and the patch picker would go
+        # straight for them, so this suppresses the set rather than one at a time.
+        if self._overlays:
+            self._draw_fiducials(p)
+            self._draw_bar(p)
         if self._align_mode:
             self._draw_align_hud(p)
-        if self._hud:
+        if self._hud and self._overlays:
             self._draw_hud(p)
         p.end()
         # The new scene position has now been handed to the compositor, so this is
@@ -888,6 +897,8 @@ class OrthoView(QOpenGLWidget):
             self._align_mode = not self._align_mode
         elif k == Qt.Key.Key_G:
             self._scale = not self._scale
+        elif k == Qt.Key.Key_F:
+            self._overlays = not self._overlays
         elif k == Qt.Key.Key_R:
             self._scroll = 0.0
             self._distance_m = 0.0
@@ -994,6 +1005,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--no-log", action="store_true", help="disable CSV ground-truth log")
     ap.add_argument("--scale", action="store_true",
                     help="start with the ground-distance ruler on (toggle: G)")
+    ap.add_argument("--no-overlays", action="store_true",
+                    help="draw the scene ONLY -- no fiducials, ground-truth bar, "
+                         "ruler or HUD (toggle: F). For the blank-panel AF control, "
+                         "where those would be the only content in frame")
     ap.add_argument("--reduce", type=int, choices=[1, 2, 4, 8], default=1,
                     help="decode the ortho at 1/N resolution (much faster / less "
                          "RAM for gigapixel files); GSD is scaled by N so "
@@ -1029,6 +1044,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.scroll_dir = args.scroll_dir
     if args.scale:
         cfg.scale_enabled = True
+    if args.no_overlays:
+        cfg.no_overlays = True
     if args.reduce > 1:
         # 1/N decode -> each ortho pixel now covers N x the ground; scale GSD to
         # match so distance/scale/HUD stay correct.

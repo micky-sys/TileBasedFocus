@@ -77,6 +77,7 @@ class OrthoSimConfig:
 
     # Ground-distance scale (human-readable ruler along the scroll axis)
     scale_enabled: bool = False        # toggled live with 'G'
+    no_overlays: bool = False          # toggled live with 'F'; blank-panel control only
     scale_target_px: int = 200         # desired tick spacing (screen px)
 
     # HUD / logging

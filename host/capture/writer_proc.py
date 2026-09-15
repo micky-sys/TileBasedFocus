@@ -386,6 +386,7 @@ def packer_main(
                         capture_kind=job.capture_kind,
                         gps=job.gps,
                         attitude=job.attitude,
+                        focus=job.focus,
                         encode_s=enc_s,
                     )
                     # Round-robin per-packer: this packer's
@@ -743,6 +744,10 @@ def io_writer_main(
                         "acquire_timestamp": item.acquire_timestamp,
                         "capture_kind": item.capture_kind,
                         "encode_s": float(item.encode_s),
+                        # frame_meta is merged verbatim into the chunk JSON and
+                        # from there into the TIFF ImageDescription on export, so
+                        # a new key needs no writer or exporter change.
+                        **({"focus": item.focus} if item.focus else {}),
                     },
                     gps=item.gps,
                     attitude=item.attitude,

@@ -675,6 +675,102 @@ def focus_measure_normalized(frame: np.ndarray, roi: Roi) -> float:
     return focus_measure(frame, roi) / (mean * mean + 1.0) * 1e4
 
 
+# ---------------------------------------------------------------------------
+# Display-raster notch (bench only)
+# ---------------------------------------------------------------------------
+#
+# On the OrthoSim bench the "scene" is a 4K LCD, and the camera oversamples it
+# ~3.36:1, so the panel's own pixel/subpixel grid is imaged as real, periodic
+# detail. It focuses in the same plane as the displayed scene and is far more
+# uniform across the field than terrain is, so it drives the AF metric *better*
+# than the picture does -- the 2026-09-14 grey-panel runs bracketed on a blank
+# screen and parked 2 counts from the imagery run. Left in, every bench number
+# is partly a measurement of the monitor.
+#
+# The grid lands in the spectrum as a lattice of narrow spikes (fundamentals,
+# harmonics and their sensor-level aliases), so this kills it where it lives:
+# zero those bins, leave the broadband content alone. Real terrain has no such
+# spikes, and IN FLIGHT THERE IS NO SCREEN -- so this is off by default and the
+# flight path is bit-for-bit unchanged.
+#
+# ponytail: an FFT per patch, not a cheap separable kernel. The lattice is
+# rotated off-axis (the panel is not square to the sensor) and harmonic-rich, so
+# a separable notch cannot reach it, and this only ever runs on the bench where
+# ~15 ms/patch against a 7.4 s station is free. If it is ever wanted in flight,
+# that is the point to spend effort on a steerable IIR comb.
+
+_NOTCH_SPIKES: Optional[np.ndarray] = None   # (n, 2) of (fx, fy) in cycles/px
+_NOTCH_RADIUS = 0.012
+_NOTCH_MASKS: dict[tuple[int, int], np.ndarray] = {}
+
+
+def set_raster_notch(spikes, radius: float = 0.012) -> None:
+    """Turn the notch on with ``spikes`` = [(fx, fy), ...], or off with ``None``.
+
+    Frequencies are cycles per GREEN-SUB-GRID pixel (that plane is the only one
+    scored), which makes them independent of crop size -- masks are rebuilt per
+    shape on demand. Calibrate with ``tools/raster_spectrum.py --calibrate``.
+    """
+    global _NOTCH_SPIKES, _NOTCH_RADIUS
+    _NOTCH_MASKS.clear()
+    arr = None
+    if spikes is not None and len(spikes):
+        arr = np.asarray(spikes, dtype=np.float32).reshape(-1, 2)
+    _NOTCH_SPIKES = arr
+    _NOTCH_RADIUS = float(radius)
+
+
+def raster_notch_enabled() -> bool:
+    return _NOTCH_SPIKES is not None
+
+
+def _notch_mask(shape: tuple[int, int]) -> np.ndarray:
+    """Cached keep-mask over the full (fftshift-free) spectrum of ``shape``."""
+    mask = _NOTCH_MASKS.get(shape)
+    if mask is not None:
+        return mask
+    h, w = shape
+    fy = np.fft.fftfreq(h).astype(np.float32)[:, None]
+    fx = np.fft.fftfreq(w).astype(np.float32)[None, :]
+    keep = np.ones((h, w), dtype=np.float32)
+    r2 = _NOTCH_RADIUS * _NOTCH_RADIUS
+    for sx, sy in _NOTCH_SPIKES:
+        # Both signs: the spectrum is conjugate-symmetric, and killing only one
+        # lobe leaves half the sinusoid behind as its mirror.
+        for sign in (1.0, -1.0):
+            # Wrapped difference -- frequency is periodic in 1 cycle/px, so a
+            # spike near Nyquist is adjacent to the opposite edge of the grid.
+            dx = (fx - sign * sx + 0.5) % 1.0 - 0.5
+            dy = (fy - sign * sy + 0.5) % 1.0 - 0.5
+            keep[(dx * dx + dy * dy) <= r2] = 0.0
+    keep[0, 0] = 1.0  # DC stays: the metric divides by mean^2 downstream
+    # Paired with DFT_COMPLEX_OUTPUT, so it has to scale re and im alike.
+    mask = np.repeat(keep[:, :, None], 2, axis=2)
+    _NOTCH_MASKS[shape] = mask
+    return mask
+
+
+def apply_raster_notch(green: np.ndarray) -> np.ndarray:
+    """Remove the calibrated raster spikes from a green-plane image.
+
+    Padded to a DFT-friendly size and run through cv2 rather than numpy: a live
+    crop is 1340 px wide, 1340 factors as 2^2 x 5 x 67, and that prime 67 puts
+    numpy's transform on its slow path -- 124 ms/patch against 13 ms for the
+    whole un-notched metric. The pad is BORDER_REFLECT, not zeros, because a
+    frequency-domain multiply wraps around: a hard edge at the seam smears
+    broadband energy back across the very spectrum being cleaned.
+    """
+    if _NOTCH_SPIKES is None:
+        return green
+    h, w = green.shape
+    ph, pw = cv2.getOptimalDFTSize(h), cv2.getOptimalDFTSize(w)
+    pad = cv2.copyMakeBorder(green, 0, ph - h, 0, pw - w, cv2.BORDER_REFLECT)
+    spec = cv2.dft(pad, flags=cv2.DFT_COMPLEX_OUTPUT)
+    spec *= _notch_mask((ph, pw))
+    out = cv2.idft(spec, flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT)
+    return np.ascontiguousarray(out[:h, :w])
+
+
 def focus_measure_full_res(crop: np.ndarray) -> float:
     """Laplacian-variance focus score for a FULL-RES *raw-Bayer* ROI crop.
 
@@ -702,8 +798,18 @@ def focus_measure_full_res(crop: np.ndarray) -> float:
     """
     if crop is None or crop.ndim < 2 or crop.size == 0:
         return 0.0
-    green = crop[0::2, 1::2]
-    if green.size == 0:
+    return focus_measure_green(crop[0::2, 1::2])
+
+
+def focus_measure_green(green: np.ndarray) -> float:
+    """:func:`focus_measure_full_res` from the green sub-grid onward.
+
+    Split out because the sub-grid is what several things on disk already hold:
+    'Save focus view' writes the green plane, not the Bayer crop, so anything
+    re-scoring those files must enter here or it decimates a second time and
+    measures a different, aliased image than the engine ever saw.
+    """
+    if green is None or green.ndim < 2 or green.size == 0:
         return 0.0
     # One pass, not two. The old form shifted right by 6 into a fresh uint16 array and
     # then converted THAT to float, gathering the strided sub-grid twice. The shift was
@@ -711,6 +817,11 @@ def focus_measure_full_res(crop: np.ndarray) -> float:
     # input cancels exactly -- all >>6 contributed was a truncation that threw away the
     # bottom 6 bits of a 14-bit sample. Measured 11.3 ms -> ~7 ms on a live-sized crop.
     green = green.astype(np.float32)
+    # Bench only, no-op unless calibrated: strip the display's own pixel grid
+    # before it is scored as detail. Ahead of the blur so the notch sees the
+    # spikes at full amplitude, and DC survives it so the mean^2 divide below is
+    # still measuring the same brightness.
+    green = apply_raster_notch(green)
     # Light pre-blur before the Laplacian: sensor read/shot noise is broadband
     # and the Laplacian (a high-pass) amplifies it hard, which is what put a
     # ~10-15% frame-to-frame spread on the score at a *fixed* lens position

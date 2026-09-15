@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json as _json
 import logging
 import os
 import socket
 import sys
 import time
+from pathlib import Path as _Path
 from typing import Optional
 
 import serial_comm
@@ -62,6 +64,7 @@ from PySide6.QtWidgets import (
 
 from .autofocus import AutoFocusController, FineFocusTracker
 from .autofocus import focus_measure_full_res as af_full_res_measure
+from .autofocus import set_raster_notch
 from .dual_tracker import DualObjectTracker
 from .autofocus_v3 import AutoFocusConfigV3
 from .orthosim_decode import ScreenLayout, SpeedDistanceTracker, decode_frame
@@ -383,6 +386,7 @@ class _BringupWorker(QThread):
         get_drive_root,
         gps_provider=None,
         heading_provider=None,
+        focus_provider=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -396,6 +400,7 @@ class _BringupWorker(QThread):
         # at construction. The pipeline forwards it to AcquisitionThread.
         self._gps_provider = gps_provider
         self._heading_provider = heading_provider
+        self._focus_provider = focus_provider
 
     def run(self) -> None:
         try:
@@ -430,6 +435,7 @@ class _BringupWorker(QThread):
                     get_drive_root=self._get_drive_root(cam_no),
                     gps_provider=self._gps_provider,
                     heading_provider=self._heading_provider,
+                    focus_provider=self._focus_provider,
                 )
                 pipeline.start(log_sink=lambda msg: self.log_line.emit(msg))
                 # Move the writer QObject from this worker thread to
@@ -877,6 +883,7 @@ class MainWindow(QMainWindow):
             # frame_in_sweep), so we can pass it straight through.
             gps_provider=self._gps_correlator.pop_fix_for,
             heading_provider=self._gps_correlator.heading_deg,
+            focus_provider=self._focus_metadata,
         )
         worker.log_line.connect(self._log)
         worker.failed.connect(self._on_bringup_failed)
@@ -1409,6 +1416,34 @@ class MainWindow(QMainWindow):
                         f"min={amin:+.0f} ms avg={aavg:+.0f} ms "
                         f"max={amax:+.0f} ms"
                     )
+
+    def _focus_metadata(self) -> Optional[dict]:
+        """The ``focus`` block stamped on every written frame, or None.
+
+        Called from the acquisition thread once per frame, so it only reads the
+        lock-guarded encoder accessors and does no work.
+
+        The point of recording this is that field curvature is a difference in
+        best-focus *position*, so any later attempt to measure it from imagery
+        needs to know where the lens was. Imagery written before this existed
+        cannot answer that question at all -- see the 2026-06-23 flight, whose
+        frames carry GPS and attitude but no lens position, leaving a focus
+        bracket unanalysable after the fact.
+
+        ``encoder_epoch`` is not decoration: counts are only comparable within
+        one epoch, so a consumer must compare epochs before differencing two
+        frames' counts.
+        """
+        try:
+            if not self._serial.connected or not self._serial.encoder_present:
+                return None
+            return {
+                "encoder_count": float(self._serial.encoder_position),
+                "encoder_epoch": self._serial.encoder_epoch,
+            }
+        except Exception:
+            log.debug("focus metadata unavailable", exc_info=True)
+            return None
 
     # Cadence for the periodic GPS position line written to the
     # session-log file. Coarse on purpose: the log is a wall-clock
@@ -2160,6 +2195,7 @@ class MainWindow(QMainWindow):
         self._focus_panel.dual_track_toggled.connect(self._on_dual_track_toggled)
         self._focus_panel.orthosim_toggled.connect(self._on_orthosim_toggled)
         self._focus_panel.lockstep_toggled.connect(self._on_lockstep_toggled)
+        self._focus_panel.deraster_toggled.connect(self._on_deraster_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2298,6 +2334,21 @@ class MainWindow(QMainWindow):
             # rig's own measured gap once AF3 and a field map have run in one session.
             park_bias_counts=0.0,
         )
+        # IRON661_AF_SYNTH=<coarse px/s>: traverse patches off the clock rather than off
+        # the image, for measuring D on a scene with NO content (see synth_travel_px_s).
+        # It sets both knobs because they are not independently useful -- a blank frame
+        # trips both texture gates, which share min_texture_score, so synthetic motion
+        # without that zeroed just fails the run at acquisition. 540 matches the rig.
+        _synth = os.environ.get("IRON661_AF_SYNTH")
+        if _synth:
+            af_cfg.synth_travel_px_s = float(_synth)
+            af_cfg.min_texture_score = 0.0
+            # Module logger, not self._log: this runs from _build_ui, before the log
+            # widget exists. The session log is the destination that matters anyway --
+            # it is what a later reader has to see this warning in.
+            log.warning("SYNTH SCENE: patches traverse at %.0f coarse px/s, texture "
+                        "gates OFF -- measurements are NOT a normal run",
+                        af_cfg.synth_travel_px_s)
         # Keep a handle so the OrthoSim toggle can flip AF interior/edge masking on
         # this shared dataclass (the engine re-reads it every frame). OrthoSim decode
         # state is lazily armed by _on_orthosim_toggled.
@@ -3381,6 +3432,42 @@ class MainWindow(QMainWindow):
         self._dual_tracker.reset()
         if not on:
             self._focus_panel.set_track_rois([])
+
+    RASTER_NOTCH_FILE = "raster_notch.json"
+
+    def _on_deraster_toggled(self, on: bool) -> None:
+        """Arm/disarm the display-raster notch in the focus metric (bench only).
+
+        The calibration is geometry-specific, so it is loaded here rather than at
+        import: the operator can recalibrate and re-tick without restarting, which
+        on this rig matters -- a restart means tearing the grabber down and back up.
+        """
+        if not on:
+            set_raster_notch(None)
+            self._log("De-raster: OFF (focus metric sees the panel's pixel grid).")
+            return
+        path = _Path(__file__).resolve().parent / self.RASTER_NOTCH_FILE
+        try:
+            cfg = _json.loads(path.read_text(encoding="utf-8"))
+            spikes = cfg["spikes"]
+            if not spikes:
+                raise ValueError("calibration lists no spikes")
+            set_raster_notch(spikes, float(cfg.get("radius", 0.012)))
+        except Exception as exc:
+            # Refuse rather than pretend. A checked box over an unfiltered metric
+            # would silently invalidate every run measured under it.
+            set_raster_notch(None)
+            self._focus_panel.set_deraster_active(False)
+            self._log(
+                f"De-raster: NOT armed -- cannot read {path.name} ({exc}). "
+                "Capture blank-grey crops with 'Save focus view', then run "
+                "tools/raster_spectrum.py <folder> --calibrate."
+            )
+            return
+        self._log(
+            f"De-raster: ON ({len(spikes)} spikes notched from the focus metric). "
+            "A blank panel should now score flat and refuse to arm."
+        )
 
     def _on_orthosim_toggled(self, on: bool) -> None:
         """Arm/disarm OrthoSim bench mode: (1) flip AF interior/edge masking on the

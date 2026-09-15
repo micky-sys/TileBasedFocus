@@ -390,7 +390,14 @@ def test_attitude_chunk_roundtrip():
                 payload,
                 sweep=1,
                 frame_in_sweep=i + 1,
-                frame_meta={"acquire_timestamp": "t", "capture_kind": "sweep"},
+                frame_meta={
+                    "acquire_timestamp": "t",
+                    "capture_kind": "sweep",
+                    # The live writer delivers the lens position this way --
+                    # as a frame_meta key, not a dedicated append_chunk
+                    # argument (see writer_proc's io_writer loop).
+                    "focus": {"encoder_count": -1234.0, "encoder_epoch": "20260915T101500"},
+                },
                 attitude=attitude if i == 0 else None,
             )
         w.close_with_index(fsync=False)
@@ -405,7 +412,20 @@ def test_attitude_chunk_roundtrip():
         assert "attitude" in chunk_meta
         assert chunk_meta["attitude"]["yaw_deg"] == attitude["yaw_deg"]
         assert chunk_meta["attitude"]["heading_deg"] == 45.0
-    print("  OK: attitude block round-tripped in chunk JSON")
+        # Lens position, and the epoch without which two counts cannot be
+        # differenced. Both must survive, or a focus bracket flown later is
+        # as unanalysable as the 2026-06-23 imagery was.
+        assert chunk_meta["focus"]["encoder_count"] == -1234.0
+        assert chunk_meta["focus"]["encoder_epoch"] == "20260915T101500"
+    print("  OK: attitude + focus blocks round-tripped in chunk JSON")
+
+    # The hops between the pipeline and that JSON are dataclass fields; a
+    # missing one drops the block silently, with no error anywhere.
+    from capture.frame_buffer_pool import PackedResult, WriteJob  # noqa: E402
+
+    for cls in (WriteJob, PackedResult):
+        assert "focus" in cls.__dataclass_fields__, f"{cls.__name__} drops focus"
+    print("  OK: WriteJob and PackedResult both carry focus")
 
 
 def test_gps_exif_roundtrip():
@@ -461,6 +481,7 @@ def test_gps_exif_roundtrip():
             "camera_serial": "2439008",
             "frame_in_sweep": 7,
         },
+        "focus": {"encoder_count": 2048.0, "encoder_epoch": "20260915T101500"},
     }
     with tempfile.TemporaryDirectory() as tmp:
         bayer_path = os.path.join(tmp, "frame.tif")
@@ -491,6 +512,7 @@ def test_gps_exif_roundtrip():
                 assert desc is not None
                 payload = json.loads(desc.value)
                 assert payload["attitude"]["yaw_deg"] == 88.5
+                assert payload["focus"]["encoder_count"] == 2048.0, label
             et = detect_exiftool()
             if et is not None:
                 import subprocess
