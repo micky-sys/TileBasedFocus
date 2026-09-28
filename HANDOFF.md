@@ -885,6 +885,16 @@ py -3 tools/orthosim_gui.py ortho.png --gsd 5 --windowed     # bring-up
 Controls: Up/Down speed, +/- (or PageUp/Down) zoom, Space pause, H HUD, C
 calibration, R reset distance, S save config, Esc/Q quit.
 
+**`--free-run`** scrolls on the repaint clock instead of waiting for the capture app
+to step the scene, which is what makes `Space` a start/pause again. Without it the
+display is a slave: `_advance_scene` runs only on a step datagram, so nothing moves
+with no capture app on the same PC (`STEP_HOST` is loopback) and `Space` toggles a
+gate with nothing behind it. Free run is for standalone viewing and bring-up only —
+the panel is then moving *during* the exposure, the artefact the stepped rig removed
+(§36) — so it must not be used for a measurement run. The HUD says which mode is
+live, and ground truth stays exact either way (measured 51.421 m/s against 51.44
+commanded). Note `tick` becomes a repaint counter rather than a frame index.
+
 Package (never build onto Google Drive — see §4):
 
 ```
@@ -5230,3 +5240,169 @@ Kept deliberately: `focus_measure_green`, `PatchTracker`, `FineFocusTracker`,
 depends on; and the `tools/field_*.py` offline estimators, which the new plan needs.
 
 After all of it: 191 tests pass across the AF, tracker, field-map, M4 and bay14line suites.
+
+## 49. NMEA wired in, the encoder nomenclature fix, and M4 focus brackets (2026-09-28)
+
+A day of connecting things that had been built but never joined up. Three of the four items
+below are the same shape of bug: code that was written, tested in isolation, and then never
+reached by the live path. None of them failed loudly.
+
+### 49.1 The NMEA parser existed; nothing imported it
+
+`capture/nmea_parser.py` had been complete and self-tested since 17 Sept, `pynmea2` was in
+`requirements.txt` and in the PyInstaller spec -- and `gps_receiver.py` still constructed
+`SbfParser()`. The app was speaking Septentrio binary at an NMEA bridge.
+
+Hardware first, to be sure the fault was ours: firing `$E*` at the ClearCore on COM13 produced
+exactly one sentence per pulse on COM3 at 115200, and the PCB acked each with `$EventFired*`.
+
+```
+$GPGGA,081803.21,3210.21541,N,03449.88043,E,1,17,,57.224,M,17.291,M,,*71
+```
+
+Feeding those four real sentences to both parsers settled it: `SbfParser` decoded **0** events
+and counted all 296 bytes as `skipped_bytes`; `NmeaParser` decoded **4**, with position matching
+the reference site. So the app would have written every image with empty GPS and never said a
+word about it.
+
+The wiring is small because `GpsFix` is the format-agnostic carrier: `gps_receiver` swaps
+`SbfParser`/`SbfExtEvent` for `NmeaParser`/`NmeaEvent`, and `gps_correlator.add_event` accepts an
+`NmeaEvent` (which already carries its own `fix`, where the SBF path computed one). Nothing
+downstream moved -- `tiff_writer`, the EXIF GPS sub-IFD and the whole export studio are
+unchanged. **That containment is the reason to keep `GpsFix` between the parser and everything
+else.**
+
+The diagnostic tap now writes `.nmea` rather than `.sbf`, because the bytes are no longer SBF and
+a stale extension would feed the SBF replay tooling something it cannot read. The `GPS_SBF_TAP_DIR`
+env var name is kept, since it is used in scripts.
+
+Validated on 115 real frames: 100% GPS coverage at every `frame_in_sweep` 1..13, no TOW
+mismatches, no monotonicity violations. The load-bearing result is not coverage but the **gap
+structure** -- intra-sweep deltas median 230 ms against inter-sweep 370 ms, cleanly separated.
+That is what proves the bridge's `hhmmss.ss` field carries enough resolution for the correlator
+to segment sweeps, which is the exact risk `nmea_parser.py`'s own docstring flags. Parsing
+correctly and segmenting correctly are different claims, and only the second one matters here.
+
+Also added a GPS bring-up probe: the app fires `$E*` and waits for a *decoded* event before going
+green, so the status reflects evidence rather than "the port opened".
+
+### 49.2 `$ENC=<cam>` names a PCB slot; the app read it as an app camera
+
+Why every frame in a good recording had `gps` and `attitude` but no `focus` key at all.
+
+The ClearCore's `$ENC=3,...` means **PCB slot 3**, the thing `$C3*` selects. The app's cam1/2/3 is
+grabber discovery order. These are two different numbering schemes and on this rig they are
+close to inverted: app cam1/2/3 map to PCB slots 3/1/2. An encoder reading therefore arrived
+credited to a camera that did not exist, `encoder_present_for()` stayed False for the camera the
+frames actually belonged to, `_focus_metadata` returned None, and the block was silently omitted.
+
+Two hardware facts that came out of this and are worth keeping:
+
+* **The three AMT203S encoders share one SPI bus**, with chip-select routed through the
+  camera-selection relay. Only the *selected* camera's encoder is live; the other two report
+  their last value, which is what `encoder_stale` marks.
+* `$ENC=<cam>,-1` is the error sentinel -- the bus answered, the encoder did not. The app is right
+  to omit the block rather than record a count it does not have.
+
+Fixed by translating at the boundary in `serial_client.py`, so both sides say what the app means.
+Confirmed on real data afterwards: `encoder_camera` reports 1/2/3 with three distinct counts,
+which also proves they really are three separate encoders and not one read three times.
+
+### 49.3 Export studio: encoder into EXIF, and attitude that never once worked
+
+Encoder goes into `EXIF:UserComment` as JSON (operator's choice over a new tag or config file),
+written **without** the `encoder_stale` flag.
+
+While in that code the attitude write turned out to be broken -- and the useful part is that it
+was never *not* broken, so nothing regressed. The evidence, gathered before making the claim: a
+terminal log from 4 June running the unmodified `geotag_attitude_gui.py` shows **247 attitude
+failures and zero successes**; ExifTool refuses the tag from the command line with no Python in
+the picture; and no `.ExifTool_config` exists anywhere in the tree. ExifTool will not *write* an
+unregistered XMP namespace.
+
+Fixed natively, no ExifTool involved:
+
+* **TIFF** -- tag 700 (XMLPacket) is a plain byte array, so `tifffile` will write it through
+  `extratags`. This works precisely where GPS did not: IFD-*pointer* tags (34853 GPSIFD, 34665
+  ExifIFD) are refused by tifffile, which is why `embed_exif_gps_subifd` hand-builds them.
+* **JPEG** -- insert an APP1 segment carrying the `http://ns.adobe.com/xap/1.0/\0` header.
+
+Writing the raw packet declares the `xmlns` inline and so bypasses the registry entirely.
+ExifTool is happy to *read* an unregistered namespace; it just will not write one. Verified
+122/122 files in a real export carry Yaw/Pitch/Roll.
+
+⚠️ **A trap to not walk back into.** Merging the attitude and encoder writes into a single
+ExifTool invocation made the exit code 0, and with `-q -q` that silently swallowed the rejection
+that had at least been getting logged before. The call now uses a single `-q` and
+`_rejected_tag_warnings()` scans stderr -- deliberately ignoring the benign per-frame
+"Duplicate ImageDescription tag in IFD0". The old warning text ended at `(exit 1):` with nothing
+after it for the same reason.
+
+Still broken on purpose: `tools/geotag_attitude_exports.py` patches TIFFs that are already on
+disk, so it cannot use `extratags` and still goes through ExifTool. Fixing it needs IFD surgery
+of the `embed_exif_gps_subifd` kind.
+
+### 49.4 M4 Record now brackets properly, and crops name the frame they came from
+
+Asked for: Record in M4 should put the app in Fine and tick "Save focus view", and there should
+be a way to match the small focus crops to the large frames in the `.bay14line`.
+
+**Recording and the focus tap were mutually exclusive**, which would have made the feature do
+nothing. In the acquisition loop the full-res slot either went to the writer *or* was held for
+the focus tap, never both, so with Record armed `slot_for_fine` stayed `None` and no tile was ever
+cut. The reason was sound: reading a slot view after submit races the writer subprocess -- the
+zoom-preview block immediately above says so, and `slot_view`'s docstring says to drop the
+reference once the slot reaches `work_q`.
+
+Fixed by deferring the **hand-off** rather than the read. The slot is parked in
+`pending_submit_slot`, the focus tap takes its full-res copies while we still own it exclusively,
+and `_submit_slot` runs immediately after. This also deleted the old `defer_release` branch:
+slot ownership is now decided in one place instead of two.
+
+Forcing Fine has a wrinkle worth knowing. `sync_focus_submode_toggle` blocks signals, so setting
+`ModeController` alone leaves `pipeline._fine_focus` False and still yields no tile.
+`_on_m4_record_toggled` therefore syncs the toggle and then calls `_on_focus_submode_changed` by
+hand, which is what actually enables the full-res Fine tap on the pipelines. Arming only --
+disarming leaves the operator's view as they left it.
+
+For correlation, the crop and its frame already shared an identical `acquire_ts_iso`, but a
+timestamp is no help against exported large images, which are named `..._L2_S1_F4.tif` with no
+time in them. So `_submit_slot` now **returns** the `(sweep, frame_in_sweep)` it stamped, the
+deferred emit writes it into the fine-tile meta, and it rides through `FocusJob` into both the
+focus TIFF's `ImageDescription` and the filename as `S{n}_F{m}`. When no full frame was written
+for that trigger -- M4 without Record, autofocus crops -- the segment is **omitted** rather than
+written as a misleading `S0_F0`.
+
+Live result: 148 frames written, 147 crops, all 147 pairing to a real frame with zero timestamp
+disagreements, and the writer reporting `dropped=0 failed=0 packed_drops=0` with
+`packed_wait 0 frames`. The one gap (S2 F11) is the pre-existing `FOCUS_TAP_MIN_INTERVAL_S`
+throttle, not a leak. `tools/test_focus_correlation.py` covers the naming rules and the metadata
+round-trip.
+
+### 49.5 The first bracket was 100% clipped, and "black" meant saturated
+
+Reported as "some pictures are completely black". They were the opposite. At 20000 us with gain
+3.0, **107 of 147 crops were a single constant 16383** -- min equal to max, standard deviation
+exactly 0. A viewer that auto-stretches contrast divides by a zero range and renders the frame
+black, which is where the word came from.
+
+The full frames were *not* uniformly clipped (min 2531, about 50% of pixels at the ceiling); it
+was the pinned focus ROI that happened to sit in a fully blown region. The AF selector had been
+saying so all along in the log, reporting `sat=99%`..`sat=100%` with `eff=0.0` on every candidate
+but one. A flat tile scores zero sharpness by definition, so that entire bracket carries no focus
+information. Re-shot at 8000 us: 32 crops, 0.0% at the ceiling on every one of them.
+
+⚠️ `kyfg_backend` verifies float parameter writes with a 0.1% relative tolerance, which is
+tighter than the camera's own exposure quantization. `ExposureTime=8000` logs **FAIL** with
+readback 7968.38 even though the value applied correctly; `20000` passed only because its
+quantization happened to land inside the 20 us allowance. Left alone for now -- read it as a
+quantization notice, not a failure.
+
+### 49.6 Housekeeping
+
+* Another memory-management BSOD on the bench box, consistent with §22.2 and not caused by the
+  app. The dump needed elevation to copy and was not preserved, so it adds no new evidence.
+  MemTest86 still has not been run.
+* Session logs are buffered and live on the Drive path, so the minutes before a hard crash are
+  lost. Worth moving to local disk if the BSODs continue.
+* Both apps rebuilt to `C:\Parallax Apps` (§4 rules: local NTFS workpath, then mirror).

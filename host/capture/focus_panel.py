@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+from math import ceil
 from typing import Optional
 
 import cv2
@@ -70,6 +71,24 @@ def _crop_pixmap_center(pm: QPixmap, tw: int, th: int) -> QPixmap:
     x = max(0, (sw - tw) // 2)
     y = max(0, (sh - th) // 2)
     return pm.copy(x, y, tw, th)
+
+
+def _fine_view_crop(
+    w: int, h: int, tw: int, th: int, zoom: float
+) -> tuple[int, int, int, int]:
+    """Centre crop ``(x0, y0, cw, ch)`` of a *w*x*h* tile to show in a *tw*x*th*
+    pane at *zoom* screen px per sensor px.
+
+    Rounds up, so the magnified crop covers the pane rather than leaving bars:
+    ``cw * zoom < tw + zoom``. Any overshoot is under one magnified pixel and
+    the label clips it (it never rescales -- ``setScaledContents(False)``). What
+    it never does is return a crop needing a downscale; see
+    :meth:`FocusPanel._paint_fine_tile_to_display` for why that matters.
+    """
+    zoom = max(1.0, float(zoom))
+    cw = min(int(w), max(1, int(ceil(int(tw) / zoom))))  # ceil: fill the pane
+    ch = min(int(h), max(1, int(ceil(int(th) / zoom))))
+    return (int(w) - cw) // 2, (int(h) - ch) // 2, cw, ch
 
 
 def _composite_fine_overview_inset(base: QPixmap, overview_rgb: np.ndarray) -> QPixmap:
@@ -737,6 +756,18 @@ class FocusPanel(QWidget):
         )
         self._clahe_chk.toggled.connect(self._on_clahe_display_toggled)
         top_row.addWidget(self._clahe_chk)
+        top_row.addWidget(QLabel("Zoom:"))
+        self._zoom_box = QComboBox()
+        self._zoom_box.addItems(["1x", "1.5x", "1.8x", "2x", "4x"])
+        self._zoom_box.setToolTip(
+            "Fine view magnification, in SCREEN pixels per SENSOR pixel. Integer "
+            "only, and never below 1x: a view scaled below 1x averages sensor "
+            "pixels together, which blurs away the high spatial frequencies focus "
+            "is judged on and shows a sharp lens as soft. Raising the zoom shows "
+            "less of the tracked tile, never more detail than the sensor captured."
+        )
+        self._zoom_box.currentIndexChanged.connect(self._on_fine_zoom_changed)
+        top_row.addWidget(self._zoom_box)
 
         self._preview_toggle = QPushButton("2-obj preview")
         self._preview_toggle.setCheckable(True)
@@ -834,12 +865,14 @@ class FocusPanel(QWidget):
         self._period_box.hide()
         self._debayer_chk.setEnabled(self._fine_toggle.isChecked())
         self._clahe_chk.setEnabled(self._fine_toggle.isChecked())
+        self._zoom_box.setEnabled(self._fine_toggle.isChecked())
         self._sync_fine_toggle_caption()
 
     def _on_debayer_toggled(self, checked: bool) -> None:
         self.fine_demosaic_changed.emit(bool(checked))
 
-    def _on_clahe_display_toggled(self, _checked: bool) -> None:
+    def _repaint_last_fine_tile(self) -> None:
+        """Re-render the tile already in hand, for display-only setting changes."""
         if (
             self._fine_toggle.isChecked()
             and self._last_fine_rgb is not None
@@ -847,9 +880,39 @@ class FocusPanel(QWidget):
         ):
             self._paint_fine_tile_to_display(self._last_fine_rgb, self._last_fine_meta)
 
+    def _on_clahe_display_toggled(self, _checked: bool) -> None:
+        self._repaint_last_fine_tile()
+
+    def _on_fine_zoom_changed(self, _index: int) -> None:
+        self._repaint_last_fine_tile()
+
+    def fine_view_sensor_wh(self) -> tuple[int, int]:
+        """Sensor pixels this pane can display right now, as (width, height).
+
+        The same ``ceil(pane / zoom)`` as :func:`_fine_view_crop`, so a tile cut to
+        this size is displayed WHOLE: nothing scored gets cropped away, and no pane
+        pixel is left grey. It cannot be a constant -- the display label is
+        Expanding/Expanding so it grows with the window, and the zoom is a combo
+        box -- which is why the nominal 1280x720 left most of a maximised pane
+        empty at 1x.
+        """
+        zoom = self._fine_zoom()
+        return (
+            max(2, ceil(self._display.width() / zoom)),
+            max(2, ceil(self._display.height() / zoom)),
+        )
+
+    def _fine_zoom(self) -> float:
+        """Screen pixels per sensor pixel for the Fine view; >= 1 by construction."""
+        try:
+            return max(1.0, float(self._zoom_box.currentText().rstrip("xX")))
+        except ValueError:
+            return 1.0
+
     def _on_fine_toggle_toggled(self, checked: bool) -> None:
         self._debayer_chk.setEnabled(bool(checked))
         self._clahe_chk.setEnabled(bool(checked))
+        self._zoom_box.setEnabled(bool(checked))
         if not checked:
             self._last_fine_rgb = None
             self._last_fine_meta = None
@@ -1478,24 +1541,53 @@ class FocusPanel(QWidget):
         self._active_pipeline = pipeline
 
     def _paint_fine_tile_to_display(self, rgb: np.ndarray, meta: dict) -> None:
-        """Scale tile to fill the label (crop top/bottom if needed) — no side bars."""
+        """Paint the tile at EXACTLY ``_fine_zoom()`` screen px per sensor px.
+
+        This must never scale below 1:1. It used to fill the label with
+        ``KeepAspectRatioByExpanding``, which was an exact 1.5x upscale back when
+        the tile was sized from the display constants (853x480 into a 1280x720
+        pane). Once the leading-edge tracker began pinning the ROI, the tile
+        arrived at 2680x1904 (a coarse grid tile at ``tiles_per_frame=5``, scaled
+        by ``SUBSAMPLE_FACTOR``) and the same call silently became a ~0.5x
+        DOWNSCALE, averaging sensor pixels together. That destroys precisely the
+        high spatial frequencies focus is judged on, so a well-focused lens
+        looked soft -- the view lied about the thing it exists to show.
+
+        So: crop to the sensor pixels that fit and show those, rather than
+        squeezing the whole tile in. Oversized tiles lose their margins, not
+        their detail.
+        """
         rgb = np.ascontiguousarray(rgb)
         if self._clahe_chk.isChecked():
             rgb = _apply_clahe_display_rgb_u8(rgb)
-        h, w = rgb.shape[:2]
-        qimg = QImage(
-            rgb.data, w, h, w * 3, QImage.Format.Format_RGB888
-        ).copy()
-        pix = QPixmap.fromImage(qimg)
+        zoom = self._fine_zoom()
         tw = max(1, self._display.width())
         th = max(1, self._display.height())
-        scaled = pix.scaled(
-            tw,
-            th,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        scaled = _crop_pixmap_center(scaled, tw, th)
+        h, w = rgb.shape[:2]
+        # Sensor pixels that fit the pane at this zoom, taken about the tile
+        # centre (which is what the tracker is holding on the object).
+        x0, y0, cw, ch = _fine_view_crop(w, h, tw, th, zoom)
+        crop = np.ascontiguousarray(rgb[y0 : y0 + ch, x0 : x0 + cw])
+        qimg = QImage(
+            crop.data, cw, ch, cw * 3, QImage.Format.Format_RGB888
+        ).copy()
+        scaled = QPixmap.fromImage(qimg)
+        if zoom > 1.0:
+            # An integer zoom replicates whole pixels, so nearest neighbour is
+            # exact and invents nothing -- smooth would soften the very pixel
+            # edges being judged and hand back a blur that reads as defocus.
+            # A fractional zoom cannot replicate evenly (1.5x would double every
+            # other pixel and leave visible beat patterns), so it interpolates;
+            # that is still an upscale, so no captured detail is lost.
+            exact = float(zoom).is_integer()
+            scaled = scaled.scaled(
+                round(cw * zoom),
+                round(ch * zoom),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation
+                if exact
+                else Qt.TransformationMode.SmoothTransformation,
+            )
         ov = meta.get("overview_rgb")
         if (
             ov is not None
@@ -1693,7 +1785,12 @@ class FocusPanel(QWidget):
         if self._save_toggle.isChecked() and self._active_pipeline is not None:
             crop = meta.get("uint16_crop")
             if crop is not None and isinstance(crop, np.ndarray):
-                ok = self._active_pipeline.submit_focus_capture(crop, when=when)
+                ok = self._active_pipeline.submit_focus_capture(
+                    crop,
+                    when=when,
+                    sweep=meta.get("sweep"),
+                    frame_in_sweep=meta.get("frame_in_sweep"),
+                )
                 if not ok:
                     log.debug("fine save: submit_focus_capture rejected")
         self._receive_count += 1
@@ -1715,6 +1812,16 @@ class FocusPanel(QWidget):
         """Whether the 'Save focus view' toggle is checked (used to also dump every
         autofocus winning-tile crop while an AF run is in progress)."""
         return self._save_toggle.isChecked()
+
+    def set_save_focus_enabled(self, on: bool) -> None:
+        """Tick/untick 'Save focus view' as if the operator had clicked it.
+
+        Signals are NOT blocked: arming M4 Record flips this on, and any
+        listener on ``save_toggled`` should see that exactly as it would a
+        manual click.
+        """
+        if self._save_toggle.isChecked() != bool(on):
+            self._save_toggle.setChecked(bool(on))
 
     # ── geometry ────────────────────────────────────────────────────────
 

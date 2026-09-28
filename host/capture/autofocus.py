@@ -349,6 +349,11 @@ class PatchTracker:
         self._win: Optional[np.ndarray] = None
         self._sx = 1.0
         self._sy = 1.0
+        # Granularity worth knowing before trusting a small reading: the frame is
+        # squashed to work_size^2, so on a 3350x2382 coarse frame one working-space
+        # pixel is 13.1 frame px across and 9.3 down. Correlation is also
+        # unambiguous only to +-work_size/2; the flown 59% overlap already puts
+        # ~105 of those 128 px to work, so there is little headroom in flight.
 
     def reset(self) -> None:
         self._prev = None
@@ -466,19 +471,55 @@ def select_leading_edge_roi(
     frame: np.ndarray,
     lead_edge: Optional[str],
     cfg: AutoFocusConfig,
+    *,
+    lane_frac: Optional[float] = None,
+    tile_wh: Optional[tuple[int, int]] = None,
+    edge_band: Optional[float] = None,
 ) -> tuple[Roi, float]:
     """Pick a high-texture tile on the leading-edge band (or central circle if
-    ``lead_edge`` is None). Returns ``((x0,y0,x1,y1), score)``."""
+    ``lead_edge`` is None). Returns ``((x0,y0,x1,y1), score)``.
+
+    ``lane_frac`` overrides ``cfg.acquire_lane_frac`` for this call only; pass
+    ``0.0`` to search the full width of the leading edge. Callers that share the
+    AF config but do not want its cross-flow lane need this: at the shipped AF3
+    value of 0.34 the lane cuts the five leading-edge candidates down to one, so
+    the winning-tile scoring below has nothing left to choose between.
+
+    ``tile_wh`` sets the candidates to an exact (width, height) in frame px instead
+    of ``cfg.tiles_per_frame`` divisions. A caller that displays a fixed window
+    needs this twice over: one scalar divisor cannot express a 16:9 pane on a 1.41
+    frame, and a tile larger than the view lets detail the operator never sees pick
+    their object. Smaller tiles also mean more of them, which is the granularity --
+    5 candidates across the flow became 13 at the Fine pane's size.
+
+    ``edge_band`` overrides ``cfg.edge_band``. Pass ``0.0`` for a band exactly one
+    tile deep, which is both the longest dwell and the only depth that starts at the
+    leading edge: :meth:`TileGrid._build_grid_edge` walks tile origins outward from
+    the band's INNER edge with a full-tile stride, so a deeper band than fits a
+    whole number of tiles leaves the outer remainder unsearched -- 168 px of 3350 at
+    the shipped 0.25, one whole frame of travel, so a patch was picked up a frame
+    after it arrived. Flush only by luck on ``top``/``left``, where that inner edge
+    is the frame origin.
+    """
     fh, fw = frame.shape[:2]
+    if tile_wh is None:
+        tile_dw, tile_dh, tile_zoom = fw, fh, cfg.tiles_per_frame
+    else:
+        # zoom 1.0: TileGrid sizes tiles as display/zoom, so this lands exactly.
+        tile_dw, tile_dh, tile_zoom = int(tile_wh[0]), int(tile_wh[1]), 1.0
+    # Only the LEADING-EDGE meaning of edge_band is overridable. The interior grid
+    # reuses the same field to exclude the optical ground-truth strip, which is a
+    # fixed property of the bench rig and nothing to do with candidate sizing.
+    band = float(cfg.edge_band if edge_band is None else edge_band)
     if cfg.restrict_interior:
         # Bench rig: keep tiles inside the screen interior, off the bezel and
         # off the optical strip band, regardless of motion direction.
         grid = TileGrid(
             frame_width=fw,
             frame_height=fh,
-            display_width=fw,
-            display_height=fh,
-            zoom=cfg.tiles_per_frame,
+            display_width=tile_dw,
+            display_height=tile_dh,
+            zoom=tile_zoom,
             region="interior",
             interior_inset=cfg.interior_inset,
             exclude_edge=cfg.exclude_edge,
@@ -490,7 +531,7 @@ def select_leading_edge_roi(
         # already part-way across -- short dwell, and the two-object relay never got
         # its overlap.
         if lead_edge is not None:
-            banded = _tiles_in_lead_band(grid, lead_edge, cfg.edge_band)
+            banded = _tiles_in_lead_band(grid, lead_edge, band)
             if banded:
                 grid = banded
     elif lead_edge is None:
@@ -502,9 +543,9 @@ def select_leading_edge_roi(
         grid = TileGrid(
             frame_width=fw,
             frame_height=fh,
-            display_width=fw,
-            display_height=fh,
-            zoom=cfg.tiles_per_frame,
+            display_width=tile_dw,
+            display_height=tile_dh,
+            zoom=tile_zoom,
             region="interior",
             interior_inset=cfg.interior_inset,
         )
@@ -512,17 +553,21 @@ def select_leading_edge_roi(
         grid = TileGrid(
             frame_width=fw,
             frame_height=fh,
-            display_width=fw,
-            display_height=fh,
-            zoom=cfg.tiles_per_frame,
+            display_width=tile_dw,
+            display_height=tile_dh,
+            zoom=tile_zoom,
             region="edge",
             lead_edge=lead_edge,
-            edge_band=cfg.edge_band,
+            edge_band=band,
         )
     # Applied AFTER the lead band so the two compose: leading edge picks WHEN a patch
     # is taken, the lane picks WHERE across the flow. Needs a known flow axis, so it
     # is skipped when there is no lead edge (static bench).
-    lane = float(getattr(cfg, "acquire_lane_frac", 0.0) or 0.0)
+    lane = (
+        float(getattr(cfg, "acquire_lane_frac", 0.0) or 0.0)
+        if lane_frac is None
+        else max(0.0, float(lane_frac))
+    )
     if lane > 0.0 and lead_edge is not None:
         grid = _tiles_in_centre_lane(grid, lead_edge, lane)
     if len(grid) == 0:
@@ -791,8 +836,16 @@ class FineFocusTracker:
     Coarse decimated frames in; ROI in the same pixel space as the frame.
     """
 
-    def __init__(self, cfg: Optional[AutoFocusConfig] = None) -> None:
+    def __init__(
+        self,
+        cfg: Optional[AutoFocusConfig] = None,
+        *,
+        tile_wh: Optional[tuple[int, int]] = None,
+    ) -> None:
         self.cfg = cfg or AutoFocusConfig()
+        # Candidate size in COARSE px. The display constants live in pipeline, which
+        # imports this module, so the caller passes it rather than us reaching back.
+        self.tile_wh = tile_wh
         self._tracker = PatchTracker()
         self.roi: Optional[Roi] = None
         self.lead_edge: Optional[str] = None
@@ -804,6 +857,10 @@ class FineFocusTracker:
         self.object_id = 0
         self.frames_on_object = 0
         self._frame_wh: Optional[tuple[int, int]] = None
+        # Texture score of the current pick. No longer gates acquisition (see
+        # update), but a weak target still explains a poor focus judgement, so it
+        # is surfaced to the operator rather than silently swallowed.
+        self.pick_score = 0.0
 
     def reset(self) -> None:
         self._tracker.reset()
@@ -814,8 +871,9 @@ class FineFocusTracker:
         self.object_id = 0
         self.frames_on_object = 0
         self._frame_wh = None
+        self.pick_score = 0.0
 
-    def _take(self, roi: Roi, lead: Optional[str]) -> None:
+    def _take(self, roi: Roi, lead: Optional[str], frame: np.ndarray) -> None:
         """Adopt a freshly picked patch as the current object."""
         self.roi = roi
         self.lead_edge = lead
@@ -831,22 +889,27 @@ class FineFocusTracker:
         dx, dy, response = self._tracker.update(frame)
         self.motion_dx, self.motion_dy = dx, dy
 
+        # NO texture gate on the pick. This is a MANUAL-focus aid, and the gate was
+        # backwards for it: it demanded texture before handing over a tile, but an
+        # out-of-focus lens produces no texture -- so precisely when the operator
+        # needs something to focus on, it refused and reported "too bland" forever.
+        # select_leading_edge_roi already returns the BEST tile by the winning-tile
+        # criteria and never returns empty, so the gate only ever added refusal.
+        # It was also inconsistent: _reacquire has never gated on score, so the
+        # tracker would hold any tile once locked but could never get the first lock.
         if self.roi is None:
             lead = leading_edge_from_motion(dx, dy)
-            roi, score = select_leading_edge_roi(frame, lead, self.cfg)
-            if score < self.cfg.min_texture_score:
-                return None
-            self._take(roi, lead)
+            roi, self.pick_score = self._pick(frame, lead)
+            self._take(roi, lead, frame)
             return roi
 
         # Static start (centre fallback): upgrade to leading edge once motion appears.
         if self.lead_edge is None:
             new_lead = leading_edge_from_motion(dx, dy)
             if new_lead is not None:
-                roi, score = select_leading_edge_roi(frame, new_lead, self.cfg)
-                if score >= self.cfg.min_texture_score:
-                    self._take(roi, new_lead)
-                    return self.roi
+                roi, self.pick_score = self._pick(frame, new_lead)
+                self._take(roi, new_lead, frame)
+                return self.roi
 
         moved = (
             self.roi[0] + dx,
@@ -881,6 +944,13 @@ class FineFocusTracker:
             if clamped is None or _roi_pinned_against_flow(clamped, dx, dy, fw, fh):
                 self._reacquire(frame)
                 return self.roi
+            # Dead reckoning ONLY -- identical to DualObjectTracker._advance, which
+            # is the proven path. An appearance re-match was tried here and had to
+            # go: the sharpest-tile pick favours things that are static in SENSOR
+            # coordinates (fiducials, the screen surround, sensor dust), and for
+            # those the true template match sits at `predicted - (dx,dy)`, well
+            # inside any sane search window. The re-match then cancelled the scroll
+            # every frame and welded the tile to one spot on the sensor.
             self.roi = clamped
         self.frames_on_object += 1
         return self.roi
@@ -907,13 +977,49 @@ class FineFocusTracker:
             return None
         return max(int(min(spans)), 0)
 
+    def _pick(self, frame: np.ndarray, lead: Optional[str]) -> tuple[Roi, float]:
+        """Winning tile on the leading edge, across its FULL width.
+
+        The AF config is shared with us so that OrthoSim interior masking
+        reaches this tracker, but it also carries ``acquire_lane_frac`` = 0.34
+        for AF3's long-traverse patches. That lane cut the five leading-edge
+        candidates down to exactly one, so every pick landed mid-height whatever
+        was sitting there and the winning-tile scoring was decorative. A
+        manual-focus aid wants the most focusable thing on that edge, wherever
+        across the flow it happens to be, so the lane is off here only.
+
+        Candidates are sized to the PANE (``tile_wh``) rather than to
+        ``tiles_per_frame``, and the band is one tile deep. Both exist because this
+        tracker feeds a fixed window the operator stares at: scoring the old coarse
+        grid tile ranked 2680x1904 sensor px to choose what to show in 854x480, so
+        the pick turned on margins that never reached the screen and only ever
+        offered 5 positions across the flow. At pane size there are 13, each one a
+        distinct view, and a one-tile band starts them flush at the leading edge for
+        the full traverse.
+        """
+        return select_leading_edge_roi(
+            frame, lead, self.cfg,
+            lane_frac=0.0, tile_wh=self.tile_wh, edge_band=0.0,
+        )
+
     def _reacquire(self, frame: np.ndarray) -> None:
         lead = self.lead_edge or leading_edge_from_motion(
             self.motion_dx, self.motion_dy
         )
-        roi, _score = select_leading_edge_roi(frame, lead, self.cfg)
-        self._take(roi, lead)
-        self._tracker.reset()
+        roi, self.pick_score = self._pick(frame, lead)
+        self._take(roi, lead, frame)
+        # Deliberately NOT self._tracker.reset(). The frame stream is continuous
+        # across a hand-over and PatchTracker measures the SCENE, not the ROI, so
+        # its previous frame is still the correct reference. Resetting threw it
+        # away, so the next update returned (0, 0) and the freshly picked tile
+        # failed to advance by one frame's worth of motion -- at the measured
+        # -168 px/frame that is 672 sensor px of instant offset, once per object,
+        # which is half the visible window at 1x zoom. Measured as a 15/16 dilution
+        # of the mean motion (0.933 = 15/16) by the fine-flow probe.
+        # DualObjectTracker never reset here, which is exactly why its boxes look
+        # clean where this tracker's tile did not. reset() stays on the public
+        # entry point, where the frame stream really can be discontinuous
+        # (mode/camera change).
 
 
 # ---------------------------------------------------------------------------

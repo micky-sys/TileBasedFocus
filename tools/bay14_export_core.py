@@ -56,7 +56,10 @@ from capture.raw_bay_writer import (  # noqa: E402
 from capture.tiff_writer import (  # noqa: E402
     attitude_from_payload,
     embed_exif_gps_subifd,
-    exiftool_write_camera_attitude,
+    exiftool_write_frame_tags,
+    focus_from_payload,
+    xmp_attitude_packet,
+    xmp_extratag,
 )
 
 log = logging.getLogger(__name__)
@@ -177,10 +180,11 @@ def build_standard_extratags(
     height: int,
     fix: Optional[GpsFix] = None,
     modify_ts: Optional[datetime] = None,
+    attitude: Optional[dict[str, Any]] = None,
 ) -> list[tuple]:
     """Bundle the per-image extratags emitted by both TIFF encoders:
     ``ModifyDate`` (IFD0 306), ``ExifImageWidth`` (40962), ``ExifImageHeight``
-    (40963).
+    (40963), and -- when *attitude* is given -- the XMP packet (700).
 
     GPS is **not** emitted here. tifffile's ``extratags`` cannot create the
     GPS sub-IFD that the EXIF spec requires (and refuses IFD-pointer tags
@@ -188,11 +192,19 @@ def build_standard_extratags(
     :func:`capture.tiff_writer.embed_exif_gps_subifd` right after the write
     to add the canonical GPS sub-IFD in place. *fix* is accepted so callers
     can keep passing it (and so the encoders know whether to embed).
+
+    Attitude *is* emitted here, because tag 700 is a plain byte array rather
+    than an IFD pointer. Writing it inline also avoids ExifTool, which cannot
+    write Pix4D's ``XMP-Camera`` namespace at all.
     """
     del fix  # GPS handled by embed_exif_gps_subifd post-write, not extratags
     tags: list[tuple] = []
     tags.append(_build_modify_date_extratag(modify_ts))
     tags.extend(_build_exif_dim_extratags(width, height))
+    if attitude is not None:
+        packet = xmp_attitude_packet(attitude)
+        if packet is not None:
+            tags.append(xmp_extratag(packet))
     return tags
 
 
@@ -512,6 +524,7 @@ def write_tiff_bayer_u16(
         width=arr_w.shape[1],
         height=arr_w.shape[0],
         fix=fix,
+        attitude=attitude_from_payload(meta_out),
     )
 
     tifffile.imwrite(
@@ -527,9 +540,10 @@ def write_tiff_bayer_u16(
     # small block + patches the reserved 34853 pointer; no strip rewrite).
     if fix is not None and fix.has_position:
         embed_exif_gps_subifd(out_path, fix)
-    attitude = attitude_from_payload(meta_out)
-    if attitude is not None:
-        exiftool_write_camera_attitude(out_path, attitude)
+    # Attitude already went in as XMP via extratags; only the encoder reading
+    # needs ExifTool (UserComment lives in the ExifIFD, which tifffile cannot
+    # create -- same pointer-tag limitation as the GPS sub-IFD).
+    exiftool_write_frame_tags(out_path, focus=focus_from_payload(meta_out))
 
 
 def encode_tiff_rgb16(
@@ -585,6 +599,7 @@ def encode_tiff_rgb16(
         width=rgb.shape[1],
         height=rgb.shape[0],
         fix=fix,
+        attitude=attitude_from_payload(merged_meta),
     )
 
     tifffile.imwrite(
@@ -598,9 +613,8 @@ def encode_tiff_rgb16(
     )
     if fix is not None and fix.has_position:
         embed_exif_gps_subifd(out_path, fix)
-    attitude = attitude_from_payload(merged_meta)
-    if attitude is not None:
-        exiftool_write_camera_attitude(out_path, attitude)
+    # Attitude already went in as XMP via extratags -- see encode_tiff_raw16.
+    exiftool_write_frame_tags(out_path, focus=focus_from_payload(merged_meta))
 
 
 def encode_jpeg(

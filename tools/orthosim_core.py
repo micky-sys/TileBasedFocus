@@ -150,6 +150,24 @@ def step_dt(nudges, paused: bool = False,
     return 0.0 if paused else total
 
 
+def free_run_dt(elapsed_s: float, paused: bool = False,
+                hi: float = MAX_STEP_S) -> float:
+    """Simulated seconds owed to the scene for ``elapsed_s`` of wall clock.
+
+    The standalone counterpart to ``step_dt``, for running the display with no
+    capture app to step it: the repaint clock is then the only motion source.
+    Clamped high for the same reason a nudge is -- a stall should cost ground
+    rather than teleport the scene -- but deliberately NOT low, because the caller
+    repaints every 8 ms and ``MIN_STEP_S`` would round that up to 10, running the
+    scene 25% fast while the ground-truth CSV claimed otherwise.
+
+    ``paused`` forfeits the ground instead of banking it, exactly as ``step_dt``
+    does; the caller must still advance its timestamp so that un-pausing does not
+    replay the whole paused interval in a single repaint.
+    """
+    return 0.0 if paused else min(max(0.0, float(elapsed_s)), hi)
+
+
 def simulated_height_hint_m(
     simulated_gsd_cm_value: float,
     focal_length_mm: Optional[float] = None,

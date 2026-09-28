@@ -1,22 +1,32 @@
-"""Qt-friendly wrapper around a Septentrio SBF serial feed.
+"""Qt-friendly wrapper around the GNSS receiver's NMEA serial feed.
+
+The receiver is no longer read directly over USB: a bridge takes the
+Septentrio's SBF and emits plain NMEA on an RS232 line, so this reads NMEA
+and the rest of the app sees only :class:`NmeaEvent` objects. ``sbf_parser``
+stays for the offline geotag tools, which still read recorded SBF from past
+flights.
 
 Modelled on :mod:`capture.serial_client`: owns a ``pyserial`` handle and a
 background reader thread, exposes signals on the GUI thread, and centralises
-the wire-format details so the rest of the app sees only ``SbfExtEvent``
-objects.
+the wire-format details.
 
 Lifecycle:
 
 * :meth:`list_ports` / :meth:`auto_detect` are class-level helpers used by
   the GUI to fill its COM dropdown and pre-select the most likely port.
 * :meth:`connect_port` opens the port at 115200 8N1, spins up the reader
-  thread, and feeds raw bytes into a :class:`SbfParser`. Each fully
-  decoded ``ExtEventPVTGeodetic`` block triggers ``event_received`` and
-  is forwarded to the optional ``on_event`` callable for callers that
-  prefer a non-Qt hook (the correlator does).
+  thread, and feeds raw bytes into a :class:`NmeaParser`. Each decoded
+  position sentence triggers ``event_received`` and is forwarded to the
+  optional ``on_event`` callable for callers that prefer a non-Qt hook
+  (the correlator does).
 * :meth:`disconnect_port` joins the reader and closes the handle. The
   ``connection_changed`` signal mirrors the port state for the status
   label.
+
+Note that opening the port proves nothing: the bridge only speaks when an
+EXT_EVENT pulse reaches the receiver, so a healthy idle link and a dead one
+look identical. The app verifies the link by firing ``$E*`` at the PCB and
+waiting for a sentence -- see ``MainWindow._start_gps_link_probe``.
 """
 
 from __future__ import annotations
@@ -33,12 +43,19 @@ from PySide6.QtCore import QObject, Signal
 import serial
 import serial.tools.list_ports
 
-from .sbf_parser import SbfExtEvent, SbfParser
+from .nmea_parser import NmeaEvent, NmeaParser
 
 log = logging.getLogger(__name__)
 
 
 BAUD_RATE = 115200
+
+# The SBF-to-NMEA bridge hangs off a physical RS232 port, which Windows
+# describes as a generic "Communications Port" -- nothing in the descriptor
+# identifies it, so auto-detect cannot sniff it out the way it can a USB
+# receiver. On this rig it is COM3, so that is what we try first.
+DEFAULT_NMEA_PORT = "COM3"
+
 # Substrings we look for in ``ListPortInfo.description`` / ``.manufacturer``
 # during auto-detect. Septentrio receivers expose multiple USB CDC ports
 # (one for commands, one for SBF). Either matches.
@@ -50,19 +67,21 @@ SEPTENTRIO_ID_HINTS = ("septentrio", "polarx", "mosaic", "asterx", "altus")
 # generic hint match. Lower-cased substring (see ``auto_detect``).
 SEPTENTRIO_PREFERRED_LABEL = "virtual usb com port 1"
 
-# Diagnostic raw-SBF tap. When this env var points at a directory, every
+# Diagnostic raw-wire tap. When this env var points at a directory, every
 # connected receiver tees the raw wire bytes (+ per-chunk arrival timing)
 # into that directory in the same three-file layout ``tools/sbf_record.py``
-# produces, so a live session can be replayed offline through
-# ``tools/sbf_replay.py`` / ``tools/sbf_correlator_harness.py``. Unset =>
-# zero overhead (no file handles opened).
+# produces. Unset => zero overhead (no file handles opened).
+#
+# The env var keeps its original name so existing launch scripts still work,
+# but the capture is NMEA text now, not SBF -- it is written as ``.nmea`` and
+# the SBF replay tools (``tools/sbf_replay.py``) cannot read it.
 SBF_TAP_DIR_ENV = "GPS_SBF_TAP_DIR"
 
 
-class _SbfTap:
-    """Append-only raw-SBF recorder mirroring ``tools/sbf_record.py``.
+class _RawTap:
+    """Append-only raw-wire recorder mirroring ``tools/sbf_record.py``'s layout.
 
-    Writes ``<basename>.sbf`` (raw bytes) and ``<basename>.timing.jsonl``
+    Writes ``<basename>.nmea`` (raw bytes) and ``<basename>.timing.jsonl``
     (one ``{"t_perf_ns", "offset", "n"}`` line per chunk) live, then
     ``<basename>.meta.json`` on close. All writes happen on the receiver's
     reader thread except :meth:`close`, which the GUI thread calls after
@@ -73,15 +92,15 @@ class _SbfTap:
         os.makedirs(tap_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         safe_port = "".join(c if c.isalnum() else "_" for c in port)
-        self._basename = os.path.join(tap_dir, f"sbftap_{safe_port}_{stamp}")
+        self._basename = os.path.join(tap_dir, f"nmeatap_{safe_port}_{stamp}")
         self._port = port
         self._baud = baud
         self._t0_perf = time.perf_counter_ns()
         self._t0_wall = time.time()
         self._total = 0
-        self._sbf_f = open(self._basename + ".sbf", "wb")
+        self._sbf_f = open(self._basename + ".nmea", "wb")
         self._timing_f = open(self._basename + ".timing.jsonl", "w")
-        log.info("[gps] raw-SBF tap -> %s.sbf", self._basename)
+        log.info("[gps] raw-NMEA tap -> %s.nmea", self._basename)
 
     @property
     def basename(self) -> str:
@@ -96,7 +115,7 @@ class _SbfTap:
                 + "\n"
             )
         except Exception:
-            log.exception("[gps] raw-SBF tap write failed; disabling tap")
+            log.exception("[gps] raw-NMEA tap write failed; disabling tap")
             self._safe_close_streams()
             raise
         self._total += len(chunk)
@@ -123,24 +142,23 @@ class _SbfTap:
             with open(self._basename + ".meta.json", "w") as f:
                 json.dump(meta, f, indent=2)
         except Exception:
-            log.exception("[gps] raw-SBF tap meta write failed")
+            log.exception("[gps] raw-NMEA tap meta write failed")
         log.info(
-            "[gps] raw-SBF tap closed: %d bytes -> %s.sbf",
+            "[gps] raw-NMEA tap closed: %d bytes -> %s.nmea",
             self._total, self._basename,
         )
 
 
 class GpsReceiver(QObject):
-    """QObject facade over a pyserial-based Septentrio SBF feed.
+    """QObject facade over a pyserial-based NMEA feed.
 
-    Emits ``event_received(SbfExtEvent, host_perf_ns)`` for every fully
-    decoded ExtEventPVTGeodetic block. ``host_perf_ns`` is captured the
-    moment the block was finalised by the parser, so the correlator can
-    match it against the camera frame's host arrival time on the same
-    monotonic clock.
+    Emits ``event_received(NmeaEvent, host_perf_ns)`` for every decoded
+    position sentence. ``host_perf_ns`` is captured the moment the sentence
+    was finalised by the parser, so the correlator can match it against the
+    camera frame's host arrival time on the same monotonic clock.
     """
 
-    event_received = Signal(object, "qint64")  # SbfExtEvent, host_perf_ns
+    event_received = Signal(object, "qint64")  # NmeaEvent, host_perf_ns
     connection_changed = Signal(bool)
     parser_stats = Signal(dict)
     error_logged = Signal(str)
@@ -152,7 +170,7 @@ class GpsReceiver(QObject):
     def __init__(
         self,
         *,
-        on_event: Optional[Callable[[SbfExtEvent, int], None]] = None,
+        on_event: Optional[Callable[[NmeaEvent, int], None]] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -160,15 +178,15 @@ class GpsReceiver(QObject):
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._on_event = on_event
-        self._parser = SbfParser()
+        self._parser = NmeaParser()
         self._port_name: Optional[str] = None
         # Stats throttle so the GUI log doesn't get spammed; emit one
         # parser_stats every _STATS_INTERVAL_S.
         self._last_stats_t = 0.0
-        # Optional diagnostic raw-SBF tap (see SBF_TAP_DIR_ENV). Created
+        # Optional diagnostic raw-wire tap (see SBF_TAP_DIR_ENV). Created
         # in connect_port if the env var is set; written on the reader
         # thread; closed on disconnect.
-        self._tap: Optional[_SbfTap] = None
+        self._tap: Optional[_RawTap] = None
 
     # ── port enumeration ────────────────────────────────────────────
 
@@ -178,17 +196,22 @@ class GpsReceiver(QObject):
 
     @staticmethod
     def auto_detect() -> Optional[str]:
-        """Return the COM port of the first Septentrio-looking device, or None.
+        """Return the most likely GNSS COM port, or None.
 
         We match on the ``description`` and ``manufacturer`` strings only;
-        opening every port to probe for the ``$@`` sync would block the GUI
-        thread for several hundred ms per port and conflict with whatever
-        else might be listening (e.g. ClearCore on the same machine).
+        opening every port to probe it would block the GUI thread for several
+        hundred ms per port and conflict with whatever else might be listening
+        (e.g. ClearCore on the same machine).
 
         Selection order:
-          1. The preferred SBF port -- a Septentrio device whose label matches
+          1. ``DEFAULT_NMEA_PORT`` (COM3) when present -- the RS232 bridge,
+             which no descriptor can identify.
+          2. The preferred Septentrio port, whose label matches
              ``SEPTENTRIO_PREFERRED_LABEL`` ("Septentrio Virtual USB COM Port 1").
-          2. Fallback: the first Septentrio-looking port by generic hint.
+          3. Fallback: the first Septentrio-looking port by generic hint.
+
+        Returning a port means only "worth opening" -- the link itself is
+        proven later by the ``$E*`` probe, not here.
         """
         ports = list(serial.tools.list_ports.comports())
 
@@ -197,7 +220,14 @@ class GpsReceiver(QObject):
                 str(x or "") for x in (p.description, p.manufacturer, p.product)
             ).lower()
 
-        # 1. Preferred: the specific Septentrio virtual COM port carrying SBF.
+        # 1. The RS232 NMEA bridge, which advertises nothing useful.
+        for p in ports:
+            if p.device.upper() == DEFAULT_NMEA_PORT.upper():
+                log.info("GPS auto-detect (default NMEA bridge port): %s (%s)",
+                         p.device, p.description)
+                return p.device
+
+        # 2. Preferred: the specific Septentrio virtual COM port.
         for p in ports:
             blob = _blob(p)
             if SEPTENTRIO_PREFERRED_LABEL in blob and any(
@@ -209,7 +239,7 @@ class GpsReceiver(QObject):
                 )
                 return p.device
 
-        # 2. Fallback: any Septentrio-looking device (first match).
+        # 3. Fallback: any Septentrio-looking device (first match).
         for p in ports:
             blob = _blob(p)
             for hint in SEPTENTRIO_ID_HINTS:
@@ -254,7 +284,7 @@ class GpsReceiver(QObject):
         )
         self._port_name = port
         self._running = True
-        self._parser = SbfParser()
+        self._parser = NmeaParser()
         # Open the diagnostic tap BEFORE starting the reader so the very
         # first chunk is captured. A tap-open failure must not stop the
         # receiver from running -- log and continue without a tap.
@@ -262,12 +292,12 @@ class GpsReceiver(QObject):
         self._tap = None
         if tap_dir:
             try:
-                self._tap = _SbfTap(tap_dir, port, BAUD_RATE)
+                self._tap = _RawTap(tap_dir, port, BAUD_RATE)
             except Exception:
-                log.exception("[gps] failed to open raw-SBF tap in %r", tap_dir)
+                log.exception("[gps] failed to open raw-NMEA tap in %r", tap_dir)
                 self._tap = None
         self._thread = threading.Thread(
-            target=self._read_loop, name=f"sbf-reader[{port}]", daemon=True,
+            target=self._read_loop, name=f"nmea-reader[{port}]", daemon=True,
         )
         self._thread.start()
         log.info("GPS connected on %s @ %d baud", port, BAUD_RATE)
@@ -290,7 +320,7 @@ class GpsReceiver(QObject):
             try:
                 self._tap.close(self._parser.stats())
             except Exception:
-                log.exception("[gps] raw-SBF tap close raised")
+                log.exception("[gps] raw-NMEA tap close raised")
             self._tap = None
         prev = self._port_name
         self._port_name = None
@@ -361,7 +391,7 @@ class GpsReceiver(QObject):
     # ── on_event override ───────────────────────────────────────────
 
     def set_event_callback(
-        self, on_event: Optional[Callable[[SbfExtEvent, int], None]]
+        self, on_event: Optional[Callable[[NmeaEvent, int], None]]
     ) -> None:
         """Install/replace the synchronous worker-thread event callback.
 

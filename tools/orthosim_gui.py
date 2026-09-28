@@ -84,6 +84,7 @@ for _p in (str(_TOOLS), str(_ROOT)):
 
 import orthosim_codec as codec  # noqa: E402
 from orthosim_core import (  # noqa: E402
+    free_run_dt,
     GroundTruthLogger,
     OrthoSimConfig,
     scale_ticks,
@@ -342,6 +343,12 @@ class OrthoView(QOpenGLWidget):
         self._ls_answered = 0
         self._settle_s = max(0.0, float(getattr(cfg, "settle_ms", codec.SETTLE_MS_DEFAULT))) / 1000.0
 
+        # Standalone scrolling, for a display with no capture app to step it (the
+        # step channel is loopback-only, so a capture app on another machine cannot
+        # reach it either). Off by default: on the bench the camera owns the motion.
+        self._free_run = bool(getattr(cfg, "free_run", False))
+        self._free_run_t = time.monotonic()
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
         # Still ~120 Hz, but now only to repaint (HUD, key presses, pause state).
@@ -375,6 +382,10 @@ class OrthoView(QOpenGLWidget):
         # the app speaks drives the scene, and there is no flag to fall out of sync.
         self._lockstep_tick()
         dt = step_dt(self._steps.drain(), self._paused)
+        if self._free_run:
+            # The drain above still ran, so a stray nudge is discarded rather than
+            # left to bank a backlog; in free run the wall clock is the motion.
+            dt = self._free_run_tick()
         if dt > 0:
             self._advance_scene(dt)
         if self._logger is not None:
@@ -390,6 +401,17 @@ class OrthoView(QOpenGLWidget):
                 flags=self._current_flags(),
             )
         self.update()
+
+    def _free_run_tick(self) -> float:
+        """Simulated seconds from the repaint clock, for standalone scrolling.
+
+        The timestamp advances even while paused, so that un-pausing resumes rather
+        than replaying the paused interval as one jump.
+        """
+        now = time.monotonic()
+        dt = free_run_dt(now - self._free_run_t, self._paused)
+        self._free_run_t = now
+        return dt
 
     def _advance_scene(self, dt: float) -> None:
         """Move the scene by ``dt`` simulated seconds. The one place motion happens."""
@@ -681,6 +703,9 @@ class OrthoView(QOpenGLWidget):
                 if self._ls_seq is not None
                 else f"stepped by camera (open loop): {self._steps_taken} frames"
                 if self._steps.received
+                else "FREE RUN -- scrolling on the repaint clock, not stepped by "
+                     "the camera. NOT for a measurement run"
+                if self._free_run
                 else "WAITING FOR CAMERA -- scene steps on captured frames, "
                      "not on a timer"
             ),
@@ -999,6 +1024,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                          "covering the PANEL's own transition (the artefact being "
                          "removed). Only used when the capture app drives the closed "
                          "loop; ignored on the open-loop nudge channel")
+    ap.add_argument("--free-run", action="store_true",
+                    help="scroll on the repaint clock instead of waiting for the "
+                         "capture app to step the scene (Space pauses/resumes). For "
+                         "standalone viewing and bring-up -- the panel then moves "
+                         "during the exposure, so do NOT use it for a measurement run")
     ap.add_argument("--config", type=str, default=None, help="config JSON to load")
     ap.add_argument("--log", type=str, default=None,
                     help="ground-truth CSV output path (default: next to ortho)")
@@ -1036,6 +1066,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # launch, and adding it would put it in the saved config JSON as if it were a
     # property of the scene.
     cfg.settle_ms = args.settle_ms
+    cfg.free_run = args.free_run          # same reasoning: a per-launch rig knob
     if args.speed is not None:
         cfg.ground_speed_mps = args.speed
     if args.zoom is not None:
@@ -1065,6 +1096,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger = GroundTruthLogger(log_path, cfg.csv_log_hz)
         logger.open()
         print(f"[OrthoSim] ground-truth CSV -> {log_path}")
+
+    if args.free_run:
+        print("[OrthoSim] free run: scene scrolls on the repaint clock; Space "
+              "pauses. Not stepped by the camera.", flush=True)
 
     win = OrthoSimWindow(ortho, cfg, logger)
     if args.windowed:

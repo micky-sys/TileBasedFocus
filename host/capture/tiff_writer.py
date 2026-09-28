@@ -65,6 +65,10 @@ class FrameMetadata:
     bayer_pattern: str = "RG"
     acquire_timestamp: str = ""  # ISO-8601 with ms; filled in by caller
     capture_kind: str = "sweep"  # "sweep" (M0/M1) or "focus" (M4)
+    # For a "focus" crop this is the sweep of the FULL frame cut from the same
+    # trigger, which is how a crop is matched to its full-res image. 0 when no
+    # full frame was written.
+    sweep: int = 0
 
 
 def write_frame(
@@ -87,6 +91,7 @@ def write_frame(
         "camera_serial": meta.camera_serial,
         "project": meta.project,
         "line": meta.line,
+        "sweep": meta.sweep,
         "frame_in_sweep": meta.frame_in_sweep,
         "bit_depth": meta.bit_depth,
         "bayer_pattern": meta.bayer_pattern,
@@ -584,6 +589,160 @@ def exiftool_geotag(
         )
 
 
+# Pix4D's camera-orientation namespace. ExifTool can READ it but refuses to
+# WRITE it without a ``.ExifTool_config`` defining the namespace, which is why
+# every ``-XMP-Camera:Yaw=`` assignment came back "doesn't exist or isn't
+# writable" and silently wrote nothing. Emitting the packet ourselves declares
+# the xmlns inline, so there is no registry to satisfy -- and it rides along in
+# ``extratags`` instead of forcing ExifTool to rewrite the whole TIFF.
+XMP_CAMERA_NS = "http://pix4d.com/camera/1.0/"
+TIFFTAG_XMP = 700
+
+
+def xmp_attitude_packet(attitude: dict[str, Any]) -> Optional[bytes]:
+    """Return an XMP packet carrying ``Camera:Yaw/Pitch/Roll``, or ``None``.
+
+    ``None`` when the block holds no usable angle, so callers write no tag at
+    all rather than an empty packet.
+    """
+    fields: list[str] = []
+    for key, name in (("yaw_deg", "Yaw"), ("pitch_deg", "Pitch"), ("roll_deg", "Roll")):
+        value = attitude.get(key)
+        if value is None:
+            continue
+        try:
+            fields.append(f'Camera:{name}="{float(value):.6f}"')
+        except (TypeError, ValueError):
+            continue
+    if not fields:
+        return None
+    return (
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" '
+        f'xmlns:Camera="{XMP_CAMERA_NS}" '
+        f'{" ".join(fields)}/>'
+        "</rdf:RDF></x:xmpmeta>"
+        '<?xpacket end="w"?>'
+    ).encode("utf-8")
+
+
+def xmp_extratag(packet: bytes) -> tuple:
+    """tifffile ``extratags`` entry for TIFF tag 700 (XMLPacket).
+
+    Unlike the GPS pointer (34853), 700 is a plain byte array, so tifffile
+    writes it directly -- no post-write IFD surgery needed.
+    """
+    return (TIFFTAG_XMP, 1, len(packet), packet, True)
+
+
+_JPEG_SOI = b"\xff\xd8"
+_JPEG_APP1 = b"\xff\xe1"
+_JPEG_XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+
+
+def insert_jpeg_xmp_packet(path: Path, packet: bytes) -> bool:
+    """Insert *packet* into a JPEG as an APP1 XMP segment, in place.
+
+    JPEG has no tag 700; XMP rides in its own APP1 segment. Returns ``False``
+    if the file is not a JPEG.
+    """
+    data = path.read_bytes()
+    if not data.startswith(_JPEG_SOI):
+        log.warning("not a JPEG, skipping XMP insert: %s", path)
+        return False
+    body = _JPEG_XMP_HEADER + packet
+    seg_len = len(body) + 2  # the length field counts itself
+    if seg_len > 0xFFFF:
+        raise ValueError(f"XMP packet too large for one APP1 segment: {seg_len}")
+    segment = _JPEG_APP1 + struct.pack(">H", seg_len) + body
+    path.write_bytes(data[:2] + segment + data[2:])
+    return True
+
+
+FOCUS_EXIF_KEYS: tuple[str, ...] = (
+    "encoder_count",
+    "encoder_epoch",
+    "encoder_camera",
+)
+"""``focus`` keys copied into ``EXIF:UserComment``.
+
+``encoder_epoch`` rides along with the count because counts are only
+comparable within one epoch -- differencing two frames from different
+epochs is meaningless, and the consumer cannot tell without it.
+"""
+
+
+def _exiftool_frame_tags_argv(
+    path: Path,
+    *,
+    attitude: Optional[dict[str, Any]] = None,
+    focus: Optional[dict[str, Any]] = None,
+    exiftool_exe: Path,
+    overwrite_original: bool = True,
+) -> list[str]:
+    """Build one argv for the Pix4D attitude XMP tags and/or the lens encoder.
+
+    Both groups go in a *single* invocation on purpose: ExifTool rewrites a
+    TIFF wholesale, and these frames run to hundreds of MB, so a second pass
+    would double the export cost to write a handful of bytes.
+
+    Only ONE ``-q`` (not the usual double-quiet): ExifTool exits 0 when some
+    assignments succeed and others are rejected, so double-quiet would drop a
+    silently-unwritten tag on the floor. :func:`_rejected_tag_warnings` reads
+    the surviving warnings back out.
+    """
+    args: list[str] = [
+        str(exiftool_exe),
+        "-charset", "filename=UTF8",
+        "-q",
+    ]
+    if overwrite_original:
+        args.append("-overwrite_original")
+
+    def _f(block: dict[str, Any], key: str) -> Optional[float]:
+        v = block.get(key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    wrote_any = False
+
+    if attitude is not None:
+        yaw = _f(attitude, "yaw_deg")
+        pitch = _f(attitude, "pitch_deg")
+        roll = _f(attitude, "roll_deg")
+        if yaw is not None:
+            args.append(f"-XMP-Camera:Yaw={yaw:.6f}")
+        if pitch is not None:
+            args.append(f"-XMP-Camera:Pitch={pitch:.6f}")
+        if roll is not None:
+            args.append(f"-XMP-Camera:Roll={roll:.6f}")
+        if yaw is None and pitch is None and roll is None:
+            raise ValueError(f"attitude block has no Yaw/Pitch/Roll for {path}")
+        wrote_any = True
+
+    if focus is not None:
+        # No standard EXIF tag carries an absolute lens-encoder count, so the
+        # reading goes into UserComment as compact JSON.
+        payload = {k: focus[k] for k in FOCUS_EXIF_KEYS if focus.get(k) is not None}
+        if "encoder_count" not in payload:
+            raise ValueError(f"focus block has no encoder_count for {path}")
+        args.append(
+            "-EXIF:UserComment=" + json.dumps(payload, separators=(",", ":"))
+        )
+        wrote_any = True
+
+    if not wrote_any:
+        raise ValueError(f"no attitude or focus block to write for {path}")
+    args.append(str(path))
+    return args
+
+
 def _exiftool_camera_attitude_argv(
     path: Path,
     attitude: dict[str, Any],
@@ -592,36 +751,81 @@ def _exiftool_camera_attitude_argv(
     overwrite_original: bool = True,
 ) -> list[str]:
     """Build argv for Pix4D ``Camera:Yaw/Pitch/Roll`` XMP tags."""
-    args: list[str] = [
-        str(exiftool_exe),
-        "-charset", "filename=UTF8",
-        "-q", "-q",
+    return _exiftool_frame_tags_argv(
+        path,
+        attitude=attitude,
+        exiftool_exe=exiftool_exe,
+        overwrite_original=overwrite_original,
+    )
+
+
+def _rejected_tag_warnings(stderr: str) -> list[str]:
+    """Return ExifTool warnings that mean a tag was silently NOT written.
+
+    ExifTool still exits 0 when one assignment lands and another is refused,
+    so the exit code alone cannot tell us the metadata went missing. The
+    benign "Duplicate ImageDescription tag in IFD0" warning (we write that
+    tag via tifffile, then ExifTool sees it again) is deliberately excluded --
+    it fires on every frame and would drown the real signal.
+    """
+    return [
+        line.strip()
+        for line in (stderr or "").splitlines()
+        if "isn't writable" in line or "doesn't exist" in line
     ]
-    if overwrite_original:
-        args.append("-overwrite_original")
 
-    def _f(key: str) -> Optional[float]:
-        v = attitude.get(key)
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
 
-    yaw = _f("yaw_deg")
-    pitch = _f("pitch_deg")
-    roll = _f("roll_deg")
-    if yaw is not None:
-        args.append(f"-XMP-Camera:Yaw={yaw:.6f}")
-    if pitch is not None:
-        args.append(f"-XMP-Camera:Pitch={pitch:.6f}")
-    if roll is not None:
-        args.append(f"-XMP-Camera:Roll={roll:.6f}")
-    if yaw is None and pitch is None and roll is None:
-        raise ValueError(f"attitude block has no Yaw/Pitch/Roll for {path}")
-    args.append(str(path))
-    return args
+def exiftool_write_frame_tags(
+    path: Path,
+    *,
+    attitude: Optional[dict[str, Any]] = None,
+    focus: Optional[dict[str, Any]] = None,
+    exiftool_exe: Optional[Path] = None,
+    overwrite_original: bool = True,
+    timeout_s: float = 60.0,
+) -> bool:
+    """Write XMP attitude and/or the lens encoder reading in ONE ExifTool pass.
+
+    Returns False if ExifTool is unavailable, there was nothing to write, or
+    the write failed.
+    """
+    if attitude is None and focus is None:
+        return False
+    exe = exiftool_exe or detect_exiftool()
+    if exe is None:
+        log.debug("exiftool not found; skipping frame tags for %s", path)
+        return False
+    args = _exiftool_frame_tags_argv(
+        path,
+        attitude=attitude,
+        focus=focus,
+        exiftool_exe=exe,
+        overwrite_original=overwrite_original,
+    )
+    completed = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    rejected = _rejected_tag_warnings(completed.stderr)
+    if rejected:
+        log.warning(
+            "ExifTool refused %d tag(s) for %s: %s",
+            len(rejected),
+            path,
+            "; ".join(rejected),
+        )
+    if completed.returncode != 0:
+        log.warning(
+            "ExifTool frame tags failed for %s (exit %s): %s",
+            path,
+            completed.returncode,
+            (completed.stderr or "").strip(),
+        )
+        return False
+    return not rejected
 
 
 def exiftool_write_camera_attitude(
@@ -633,37 +837,24 @@ def exiftool_write_camera_attitude(
     timeout_s: float = 60.0,
 ) -> bool:
     """Write XMP ``Camera:Yaw/Pitch/Roll`` via ExifTool. Returns False if unavailable."""
-    exe = exiftool_exe or detect_exiftool()
-    if exe is None:
-        log.debug("exiftool not found; skipping Camera:Yaw/Pitch/Roll for %s", path)
-        return False
-    args = _exiftool_camera_attitude_argv(
+    return exiftool_write_frame_tags(
         path,
-        attitude,
-        exiftool_exe=exe,
+        attitude=attitude,
+        exiftool_exe=exiftool_exe,
         overwrite_original=overwrite_original,
+        timeout_s=timeout_s,
     )
-    completed = subprocess.run(
-        args,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
-    if completed.returncode != 0:
-        log.warning(
-            "ExifTool Camera attitude failed for %s (exit %s): %s",
-            path,
-            completed.returncode,
-            (completed.stderr or "").strip(),
-        )
-        return False
-    return True
 
 
 def attitude_from_payload(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Return the ``attitude`` block from ImageDescription / chunk JSON."""
     blob = payload.get("attitude")
+    return blob if isinstance(blob, dict) else None
+
+
+def focus_from_payload(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Return the ``focus`` block from ImageDescription / chunk JSON."""
+    blob = payload.get("focus")
     return blob if isinstance(blob, dict) else None
 
 

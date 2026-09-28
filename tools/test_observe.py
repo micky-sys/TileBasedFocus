@@ -863,10 +863,13 @@ def test_the_crop_window_is_shifted_by_the_travel_measured_before_cropping() -> 
         _roi_pin: tuple = ([(0, 0, 8, 8)], True, None)
         _roi_travel_x = _roi_travel_y = 0.0
         _preview_rois = [(0, 0, 8, 8)]
+        _focus_pin: tuple = (None, False, None)
         def __init__(self):
             self._roi_travel_at = {}      # per instance, or a, b and c share an odometer
         set_preview_rois = AcquisitionThread.set_preview_rois
+        set_focus_roi = AcquisitionThread.set_focus_roi
         _accrue_roi_travel = AcquisitionThread._accrue_roi_travel
+        _debt_since = AcquisitionThread._debt_since
 
     # A scene panning a known amount per frame. Structured, because phase correlation on
     # white noise has nothing to lock onto.
@@ -921,6 +924,121 @@ def test_the_crop_window_is_shifted_by_the_travel_measured_before_cropping() -> 
     nxt, _pin, _dx, _dy = c._accrue_roi_travel(frames[2], "g2")
     assert nxt == [(0, 500, 8, 508)], f"the new pin never took effect: {nxt}"
     assert abs(abs(c._roi_debt_y) - STEP) < 6, c._roi_debt_y
+
+
+def test_the_fine_tile_pin_is_charged_the_same_travel_as_the_preview_panes() -> None:
+    """The single-ROI Fine pin needs the odometer too, not just the two-object panes.
+
+    It is the same staleness: the Fine tracker runs on the GUI thread off a coarse
+    frame the acq thread has already passed, so cropping the pin verbatim shows the
+    object where it was when the GUI answered. Because the delay VARIES (Qt queues
+    the hop, and conflated frames never reach the GUI at all) the error is not a
+    constant lag that the eye ignores -- it is white, non-accumulating jitter, which
+    is what the operator saw as "the image still looks jittery". Measured on the
+    13:58 save: 42 sensor px of position error, lag-1 autocorrelation -0.63 on the
+    frame-to-frame residual, mean +4.7 px against 648 px of per-frame travel -- pure
+    delay with no bias, exactly what an odometer removes.
+
+    Asserts on the debt the crop is shifted by, and on the two cases that must NOT
+    move: a pin with follow off (Lock tile holds a fixed SENSOR patch) and a pin
+    whose source frame has aged out of the stamp window.
+    """
+    sys.path.insert(0, str(REPO / "host"))
+    from capture.pipeline import AcquisitionThread          # noqa: E402
+
+    class _Acq:
+        label = "test"
+        _roi_follow = False
+        _roi_tracker = None
+        _roi_debt_x = _roi_debt_y = 0.0
+        _roi_shift_max = 0.0
+        _roi_pin: tuple = ([], False, None)      # no two-object pin at all
+        _roi_travel_x = _roi_travel_y = 0.0
+        _preview_rois: list = []
+        _focus_pin: tuple = (None, False, None)
+        _focus_roi = None
+        def __init__(self):
+            self._roi_travel_at = {}
+        set_focus_roi = AcquisitionThread.set_focus_roi
+        _accrue_roi_travel = AcquisitionThread._accrue_roi_travel
+        _debt_since = AcquisitionThread._debt_since
+        _shifted_focus_roi = AcquisitionThread._shifted_focus_roi
+
+    rng = np.random.default_rng(3)
+    tall = cv2.GaussianBlur(
+        rng.integers(0, 16383, (900, 600), dtype=np.uint16).astype(np.float32), (0, 0), 2)
+    STEP = 40
+    frames = [tall[i * STEP:i * STEP + 400].astype(np.uint16) for i in range(6)]
+
+    # A tracked Fine pin, with NO preview pin. The odometer used to gate on the
+    # preview pin alone, so in Fine mode it never ran and the debt was always zero.
+    a = _Acq()
+    a.set_focus_roi((0, 0, 64, 64), follow=True, src_ts="f0")
+    a._accrue_roi_travel(frames[0], "f0")        # first frame only primes the tracker
+    assert a._debt_since("f0") == (0.0, 0.0)
+
+    for i, f in enumerate(frames[1:4], 1):
+        a._accrue_roi_travel(f, f"f{i}")
+    dbx, dby = a._debt_since("f0")
+    assert abs(abs(dby) - 3 * STEP) < 6, (
+        f"the Fine pin was not charged the travel since its own frame: {dby}")
+
+    # A pin one frame old is charged for exactly one -- the normal case, and the one
+    # that has to be right or every frame carries a frame of lag.
+    a._accrue_roi_travel(frames[4], "f4")
+    _dbx, dby = a._debt_since("f3")
+    assert abs(abs(dby) - STEP) < 6, dby
+
+    # Lock tile: a pin that must stay put in SENSOR coordinates. follow=False has to
+    # leave the odometer alone entirely, or the locked patch would crawl.
+    b = _Acq()
+    b.set_focus_roi((0, 0, 64, 64), follow=False, src_ts="f0")
+    for i, f in enumerate(frames):
+        b._accrue_roi_travel(f, f"f{i}")
+    assert b._debt_since("f0") == (0.0, 0.0), "a fixed sensor pin accrued travel"
+    assert b._roi_travel_y == 0.0, "the odometer ran for a pin that never moves"
+
+    # An unknown source frame means no correction. The stamps are bounded, so a pin
+    # older than the window has lost its reference; shifting it by the whole odometer
+    # would fling the crop clean off the frame.
+    assert a._debt_since("never-seen") == (0.0, 0.0)
+    assert a._debt_since(None) == (0.0, 0.0)
+
+    # --- and the crop that debt produces has to keep its SIZE -------------------
+    # Cropping clamps its edges independently, so a pin shifted past the frame edge
+    # gives up width rather than position. The view shows the tile CENTRE, so a tile
+    # narrowed by 218 px carries the object 109 px across the screen -- a one-frame
+    # jump on the last frame of every object, where the ROI is already pinned against
+    # the outflow edge and the debt pushes it past. Seen as 5 narrowed tiles in 75,
+    # on exactly the 16-frame hand-over cadence.
+    SUB, FW, FH, TW, TH = 4, 13400, 9528, 2680, 1904
+    d = _Acq()
+    d.set_focus_roi((0, 0, TW, TH), follow=True, src_ts="f0")
+    d._accrue_roi_travel(frames[0], "f0")
+    d._accrue_roi_travel(frames[1], "f1")
+    _dbx, dby = d._debt_since("f0")
+    assert abs(abs(dby) - STEP) < 6, dby          # one frame of travel, coarse px
+
+    # Interior: the pin moves by the travel MEASURED, converted to sensor px.
+    pin = (5000, 4000, 5000 + TW, 4000 + TH)
+    got = d._shifted_focus_roi(pin, "f0", FW, FH)
+    assert (got[2] - got[0], got[3] - got[1]) == (TW, TH), got
+    assert abs((got[1] - pin[1]) - round(dby * SUB)) <= 2, (got, dby * SUB)
+
+    # Against the outflow edge, which is the case that was losing width.
+    shy = got[1] - pin[1]
+    edge = (0, 0, TW, TH) if shy < 0 else (FW - TW, FH - TH, FW, FH)
+    got = d._shifted_focus_roi(edge, "f0", FW, FH)
+    assert got[2] - got[0] == TW, f"lost width at the edge: {got}"
+    assert got[3] - got[1] == TH, f"lost height at the edge: {got}"
+    assert 0 <= got[0] and got[2] <= FW, got
+    assert 0 <= got[1] and got[3] <= FH, got
+    assert got[0] % 2 == 0 and got[1] % 2 == 0, f"odd origin flips Bayer phase: {got}"
+
+    # A pin bigger than the frame has no valid slide, and an unshifted crop beats no
+    # crop at all -- the Fine view is the operator's only feedback while focusing.
+    huge = (0, 0, FW + 4, FH + 4)
+    assert d._shifted_focus_roi(huge, "f0", FW, FH) == huge
 
 
 def _lockstep_owner(clock):

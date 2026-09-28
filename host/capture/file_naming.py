@@ -235,10 +235,28 @@ class LineName:
 
         Cam{SN}_{YYYYMMDD}_{project}_L{line}_{HHMMSS}.bay14line
 
+    and, for an M4 focus bracket::
+
+        Cam{SN}_{YYYYMMDD}_{project}_FOCUS_C{n}_L{line}_{HHMMSS}.bay14line
+
     The ``HHMMSS`` suffix is the wall-clock time the line was opened.
     Including it means the operator can re-select a previously used
     line number (Line down then Line up) and still get a fresh,
     non-overwritten file -- the new container coexists with the old.
+
+    ``FOCUS`` marks a container as a lens bracket rather than a mapping
+    line: the two are shot in the same project, onto the same drive, and
+    are indistinguishable by size or timestamp, but only one of them is
+    training data. ``C{n}`` is the friendly camera number -- ``Cam{SN}``
+    already identifies the camera, but mapping a serial to the camera the
+    GUI and ``$Cn*`` call "1" needs a lookup table, and a bracket is
+    always about one specific lens.
+
+    The marker sits before ``_L`` on purpose. ``sbf_geotag_exports``
+    matches these names with ``project`` as a free field, so anything
+    inserted there is absorbed into that group and the container is still
+    discovered and grouped correctly; a marker leading the name, or placed
+    where the date is expected, would make the file invisible to it.
 
     See :mod:`raw_bay_writer` for the on-disk container layout
     (file header + chunks + index).
@@ -249,6 +267,8 @@ class LineName:
     camera_serial: str
     line: int
     when: _dt.datetime
+    focus: bool = False  # True => M4 focus bracket, not a mapping line
+    camera_number: Optional[int] = None  # friendly 1..3; only used when focus
 
     def directory(self) -> str:
         return os.path.join(self.drive_root, self.project)
@@ -265,10 +285,16 @@ class LineName:
         Reader tools can rejoin parts by sorting on the suffix.
         """
         suffix = "" if part_idx is None else f"_p{int(part_idx)}"
+        mark = ""
+        if self.focus:
+            mark = "_FOCUS"
+            if self.camera_number is not None:
+                mark += f"_C{int(self.camera_number)}"
         return (
             f"Cam{self.camera_serial}_"
             f"{self.when.strftime('%Y%m%d')}_"
-            f"{self.project}_"
+            f"{self.project}"
+            f"{mark}_"
             f"L{self.line}_"
             f"{self.when.strftime('%H%M%S')}{suffix}.bay14line"
         )
@@ -284,8 +310,14 @@ def build_line_name(
     camera_serial: str,
     line: int,
     when: _dt.datetime | None = None,
+    focus: bool = False,
+    camera_number: int | None = None,
 ) -> LineName:
-    """Build a :class:`LineName` for a freshly-opened line container."""
+    """Build a :class:`LineName` for a freshly-opened line container.
+
+    Pass ``focus=True`` (with *camera_number*) for an M4 bracket so the
+    container is identifiable as training data on the ground.
+    """
     project = sanitize_project_name(project_raw)
     serial = sanitize_serial(camera_serial)
     if when is None:
@@ -294,6 +326,8 @@ def build_line_name(
         drive_root=drive_root,
         project=project,
         camera_serial=serial,
+        focus=bool(focus),
+        camera_number=None if camera_number is None else int(camera_number),
         line=int(line),
         when=when,
     )
@@ -319,6 +353,15 @@ class FocusFrameName:
     the same object, and is a 43000-scoring patch actually sharp?" into sorting a
     directory by filename."""
 
+    sweep: Optional[int] = None
+    frame_in_sweep: Optional[int] = None
+    """Coordinates of the FULL frame cut from the same trigger, when one was
+    written (M4 with Record armed). They go in the filename as ``S<n>_F<m>`` so
+    a crop pairs with its full-res export -- which the studio names
+    ``..._L2_S1_F4.tif`` -- by reading the two listings side by side. ``None``
+    when no full frame exists to point at, and then the segment is omitted
+    rather than written as a misleading S0_F0."""
+
     def directory(self) -> str:
         return os.path.join(self.drive_root, self.project, FOCUS_SUBDIR)
 
@@ -329,12 +372,15 @@ class FocusFrameName:
         # its files out of the listing. Leading with it groups each object's whole life
         # together, which is what the folder is opened to check.
         tag = f"{sanitize_tag(self.tag)}_" if self.tag else ""
+        pos = ""
+        if self.sweep is not None and self.frame_in_sweep is not None:
+            pos = f"_S{int(self.sweep)}_F{int(self.frame_in_sweep)}"
         return (
             f"{tag}"
             f"Cam{self.camera_serial}_"
             f"{self.when.strftime('%Y%m%d')}_"
             f"{self.project}_focus_"
-            f"{self.when.strftime('%H%M%S')}_{ms}.tif"
+            f"{self.when.strftime('%H%M%S')}_{ms}{pos}.tif"
         )
 
     def full_path(self) -> str:
@@ -354,6 +400,8 @@ def build_focus_frame_name(
     camera_serial: str,
     when: _dt.datetime | None = None,
     tag: str = "",
+    sweep: Optional[int] = None,
+    frame_in_sweep: Optional[int] = None,
 ) -> FocusFrameName:
     project = sanitize_project_name(project_raw)
     serial = sanitize_serial(camera_serial)
@@ -365,6 +413,8 @@ def build_focus_frame_name(
         camera_serial=serial,
         when=when,
         tag=tag,
+        sweep=sweep,
+        frame_in_sweep=frame_in_sweep,
     )
 
 

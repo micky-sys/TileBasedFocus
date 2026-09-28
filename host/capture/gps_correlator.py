@@ -1,4 +1,4 @@
-"""Match SBF ExtEvent blocks to the camera frames they triggered.
+"""Match GNSS events to the camera frames they triggered.
 
 Architecture
 ============
@@ -7,8 +7,14 @@ The ClearCore PCB fires every trigger pulse to all three cameras AND
 to the Septentrio receiver's EXT_EVENT input simultaneously, so each
 trigger produces:
 
-* 1 ``ExtEventPVTGeodetic`` block on the GPS COM port, and
+* 1 event on the GPS COM port -- live, an NMEA sentence from the RS232
+  bridge; offline, an ``ExtEventPVTGeodetic`` block replayed from a
+  recorded SBF flight -- and
 * 1 raw frame from each of the 3 cameras (300-400 ms later).
+
+Both carry a receiver-clock millisecond stamp of the trigger pulse in
+``tow_ms``, which is all the segmentation below needs; see
+:mod:`capture.nmea_parser` for why the NMEA one counts ms of UTC day.
 
 The correlator runs as a single shared object that:
 
@@ -103,6 +109,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .gps_fix import GpsFix
+from .nmea_parser import NmeaEvent
 from .sbf_parser import DEFAULT_LEAP_SECONDS, DNU_U4, SbfExtEvent
 
 log = logging.getLogger(__name__)
@@ -169,7 +176,7 @@ HEADING_BEARING_WINDOW = 8
 class _SlotEntry:
     seq: int                 # monotonic per-receiver event sequence number
     host_perf_ns: int        # time.perf_counter_ns() at parser completion
-    event: SbfExtEvent       # decoded SBF block
+    event: NmeaEvent | SbfExtEvent  # live NMEA sentence, or recorded SBF block
     fix: GpsFix              # converted to GpsFix once at add_event
     gps_sweep_gen: int       # 1-based; bumped each time a SWEEP_GAP_MS gap is seen
     gps_event_in_sweep: int  # 1..sweep_size
@@ -265,13 +272,20 @@ class GpsCorrelator:
 
     # ── ingest ──────────────────────────────────────────────────────
 
-    def add_event(self, event: SbfExtEvent, host_perf_ns: int) -> None:
-        """Append a freshly decoded SBF event to the slot table.
+    def add_event(
+        self, event: NmeaEvent | SbfExtEvent, host_perf_ns: int
+    ) -> None:
+        """Append a freshly decoded event to the slot table.
 
         Called from the :class:`GpsReceiver` reader thread (see
         :meth:`GpsReceiver.set_event_callback`). Constant-time.
+
+        Takes both wire formats: the live path feeds :class:`NmeaEvent`, which
+        already carries its :class:`GpsFix`, while the offline harnesses
+        (``tools/sbf_correlator_harness.py``) replay recorded SBF, which has to
+        be converted here. Everything downstream sees only the fix.
         """
-        fix = self._event_to_fix(event)
+        fix = event.fix if isinstance(event, NmeaEvent) else self._event_to_fix(event)
         with self._lock:
             host_perf_ns = int(host_perf_ns)
             seq = self._next_seq
@@ -281,11 +295,13 @@ class GpsCorrelator:
             # USB read batching); fall back to the host-arrival gap only
             # when a TOW is Do-Not-Use. ``tow_valid`` guards both the
             # current and previous event having a usable TOW.
+            # Two sentinels mean "no usable time": SBF's Do-Not-Use and NMEA's
+            # negative ``NO_TIME_MS`` (a sentence with no time field). Without
+            # the ``>= 0`` guard the latter reads as a huge backwards step and
+            # would open a new sweep generation on every timeless sentence.
             tow_ms = int(event.tow_ms)
-            tow_valid = (
-                tow_ms != DNU_U4
-                and self._last_event_tow_ms >= 0
-            )
+            tow_usable = tow_ms >= 0 and tow_ms != DNU_U4
+            tow_valid = tow_usable and self._last_event_tow_ms >= 0
 
             if self._last_event_host_ns < 0:
                 # First event ever
@@ -333,9 +349,9 @@ class GpsCorrelator:
             self._by_slot[(self._gps_sweep_gen, self._gps_event_in_sweep)] = entry
             self._latest = entry
             self._last_event_host_ns = host_perf_ns
-            # Remember the last *valid* TOW so a single DNU event doesn't
+            # Remember the last *valid* TOW so a single sentinel event doesn't
             # poison the next event's gap computation.
-            if tow_ms != DNU_U4:
+            if tow_usable:
                 self._last_event_tow_ms = tow_ms
             self._update_heading_locked(fix)
             self._trim_locked()

@@ -73,7 +73,7 @@ from .frame_buffer_pool import (
     WriteJob,
 )
 from .attitude import compute_attitude_dict
-from .autofocus import PatchTracker
+from .autofocus import PatchTracker, _clamp_roi
 from .gps_fix import GpsFix
 from .kyfg_backend import KyfgCamera
 from .mode_controller import ModeController
@@ -96,6 +96,17 @@ FOCUS_TAP_MIN_INTERVAL_S = 0.18  # cap focus tap to ~5.5 Hz. MUST stay BELOW the
 M4_FINE_DISPLAY_W = 1280
 M4_FINE_DISPLAY_H = 720
 M4_FINE_ZOOM = 1.5
+
+# STARTING candidate tile for the Fine tracker's pick, in COARSE px: one nominal
+# pane at 1:1. Only used until the first coarse frame, after which app.py resizes
+# it per frame from the pane's real extent (FocusPanel.fine_view_sensor_wh) -- the
+# label expands with the window and the zoom is operator-selectable, so no constant
+# fits. The pick used to score whole coarse grid tiles instead: 670x476 coarse =
+# 2680x1904 sensor px against the 854x480 the pane shows at 1.5x, so 12x more area
+# than is visible chose which object the operator got, and the winner was routinely
+# sharpest in a margin that never reached the screen.
+M4_FINE_PICK_TILE_W = math.ceil(M4_FINE_DISPLAY_W / KyfgCamera.SUBSAMPLE_FACTOR)
+M4_FINE_PICK_TILE_H = math.ceil(M4_FINE_DISPLAY_H / KyfgCamera.SUBSAMPLE_FACTOR)
 
 # Spatial decimation for the M4 Fine focus-panel overview inset (Bayer-aligned).
 M4_FOCUS_OVERVIEW_DECIM = 8
@@ -242,7 +253,9 @@ HeadingProvider = Callable[[], Optional[float]]
 # Returns the ``focus`` block to stamp on this frame, or None when the lens
 # position is unknown. Assembled by the caller (app.py) rather than here,
 # because the encoder and its epoch live on the serial client, which the
-# per-camera pipeline has no business knowing about.
+# per-camera pipeline has no business knowing about. Takes no arguments: the
+# caller has already bound WHICH camera this pipeline is, so each camera gets
+# its own encoder rather than the currently selected one.
 FocusProvider = Callable[[], Optional[dict]]
 
 
@@ -292,6 +305,11 @@ class FocusJob:
     when: _dt.datetime
     gps: Optional[GpsFix] = None
     tag: str = ""  # filename suffix; several patches can share one timestamp
+    # Coordinates of the FULL frame this crop was cut from, when one was
+    # written for the same trigger. None in M4 without Record armed, where
+    # there is no full frame to point at.
+    sweep: Optional[int] = None
+    frame_in_sweep: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +402,48 @@ def _m4_focus_overview_rgb(
         cv2.rectangle(ov_bgr, (x0, y0), (x1, y1), winner_bgr, 2, cv2.LINE_AA)
 
     return cv2.cvtColor(ov_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _m4_roi_overview_rgb(
+    frame_u16: np.ndarray,
+    roi: tuple[int, int, int, int],
+    *,
+    decim: int = M4_FOCUS_OVERVIEW_DECIM,
+) -> Optional[np.ndarray]:
+    """Whole frame with the TRACKED ROI boxed, for the Fine inset (RGB uint8).
+
+    Sibling of :func:`_m4_focus_overview_rgb` minus the tile grid and centre circle:
+    a tracked patch has no rival candidates to show, only where its object has got
+    to. That is the one thing the magnified tile cannot show -- at 1x it is a 1280 px
+    window onto a 13400 px frame -- so without it the operator cannot see an object
+    approaching the outflow edge and has no warning that the tile is about to hand
+    over mid-adjustment.
+
+    ``roi`` is in ``frame_u16``'s own pixels. Pass the COARSE frame and a coarse ROI:
+    striding the full-res frame moves ~16x the memory on the thread that delivers
+    frames, and the inset renders ~128 px wide either way.
+
+    Returns ``None`` on an unusable frame rather than raising -- this is decoration
+    on the operator's only focus feedback, and it must not be able to take the tap
+    down with it.
+    """
+    if frame_u16 is None or getattr(frame_u16, "ndim", 0) < 2:
+        return None
+    step = max(2, int(decim)) & ~1          # even: keeps the decimation Bayer-aligned
+    ov = cv2.cvtColor(
+        np.clip(frame_u16[::step, ::step] >> 6, 0, 255).astype(np.uint8),
+        cv2.COLOR_GRAY2BGR,
+    )
+    oh, ow = ov.shape[:2]
+    s = 1.0 / float(step)
+    x0 = max(0, min(ow - 1, int(roi[0] * s)))
+    y0 = max(0, min(oh - 1, int(roi[1] * s)))
+    x1 = max(x0, min(ow - 1, int(math.ceil(roi[2] * s)) - 1))
+    y1 = max(y0, min(oh - 1, int(math.ceil(roi[3] * s)) - 1))
+    # The same cyan-green the auto-pick path draws its winner in, so a box means the
+    # same thing whichever path produced the tile.
+    cv2.rectangle(ov, (x0, y0), (x1, y1), (220, 255, 0), 2, cv2.LINE_AA)
+    return cv2.cvtColor(ov, cv2.COLOR_BGR2RGB)
 
 
 def m4_fine_tile_rgb_from_frame(
@@ -587,6 +647,8 @@ class AcquisitionThread(QThread):
         # tracked patch) instead of the auto-picked winning tile. None = the
         # default auto-pick behaviour.
         self._focus_roi: Optional[tuple[int, int, int, int]] = None
+        # (roi, follow, src_ts) published in ONE write -- see set_focus_roi.
+        self._focus_pin: tuple = (None, False, None)
         self._dropped_due_to_queue_full = 0
         self._dropped_writer_not_ready = 0
         # Diagnostic counter for the M4 focus-tap path. Bumped each
@@ -767,7 +829,7 @@ class AcquisitionThread(QThread):
         the previous frame's crops kept alive to correlate against.
         """
         rois, follow, src_ts = self._roi_pin        # ONE read: pin and travel must pair
-        if not follow or not rois:
+        if not (follow and rois) and not self._focus_pin[1]:
             return rois, src_ts, 0.0, 0.0
         if small_u16 is not None and getattr(small_u16, "ndim", 0) >= 2:
             if self._roi_tracker is None:
@@ -785,13 +847,51 @@ class AcquisitionThread(QThread):
         if len(self._roi_travel_at) > 64:           # dict keeps insertion order
             for k in list(self._roi_travel_at)[:-32]:
                 del self._roi_travel_at[k]
-        base = self._roi_travel_at.get(src_ts)      # unknown pin => no correction
-        bx, by = base if base is not None else (self._roi_travel_x, self._roi_travel_y)
-        self._roi_debt_x = self._roi_travel_x - bx
-        self._roi_debt_y = self._roi_travel_y - by
+        self._roi_debt_x, self._roi_debt_y = self._debt_since(src_ts)
         self._roi_shift_max = max(
             self._roi_shift_max, abs(self._roi_debt_x), abs(self._roi_debt_y))
         return rois, src_ts, self._roi_debt_x, self._roi_debt_y
+
+    def _shifted_focus_roi(
+        self, pin: tuple, src_ts: Optional[str], fw: int, fh: int
+    ) -> tuple:
+        """The Fine pin, moved to where its object sits on the frame being cropped.
+
+        Shifts by the travel measured since ``src_ts``, then slides the result back
+        inside the frame RIGIDLY. Cropping clamps its edges independently, which
+        gives up width rather than position -- and because the view shows the tile
+        CENTRE, a tile narrowed by 218 px carries the object 109 px across the
+        screen. That surfaced as a one-frame jump on the last frame of every object,
+        where the ROI is already pinned against the outflow edge and the debt pushes
+        it past: 5 narrowed tiles in 75, on exactly the 16-frame hand-over cadence.
+
+        The origin stays even, so the crop keeps landing on the same Bayer quad (an
+        odd origin samples a different colour plane and shifts the score): the shift
+        is snapped even, and ``_clamp_roi`` only ever subtracts an even size from an
+        even frame dimension here.
+        """
+        sub = KyfgCamera.SUBSAMPLE_FACTOR
+        dbx, dby = self._debt_since(src_ts)
+        shx = int(round(dbx * sub)) & ~1
+        shy = int(round(dby * sub)) & ~1
+        moved = (pin[0] + shx, pin[1] + shy, pin[2] + shx, pin[3] + shy)
+        # `or pin`: _clamp_roi rejects a ROI bigger than the frame, and an unshifted
+        # crop beats no crop -- the Fine view is the operator's only feedback.
+        return _clamp_roi(moved, fw, fh) or pin
+
+    def _debt_since(self, src_ts: Optional[str]) -> tuple[float, float]:
+        """Coarse-frame travel accrued since the frame named ``src_ts``.
+
+        Only meaningful right after ``_accrue_roi_travel`` has stamped the current
+        frame. An unknown ``src_ts`` means no correction rather than a guess: the
+        stamps are bounded to the last 64 frames, so a pin older than that has
+        lost its reference and shifting it by the whole odometer would fling the
+        crop off the frame.
+        """
+        base = self._roi_travel_at.get(src_ts)
+        if base is None:
+            return 0.0, 0.0
+        return self._roi_travel_x - base[0], self._roi_travel_y - base[1]
 
     def set_fine_focus_enabled(self, enabled: bool) -> None:
         """M4 only: when True, focus tap reads full-res from pool and emits RGB."""
@@ -802,7 +902,11 @@ class AcquisitionThread(QThread):
         self._fine_demosaic = bool(enabled)
 
     def set_focus_roi(
-        self, roi: Optional[tuple[int, int, int, int]]
+        self,
+        roi: Optional[tuple[int, int, int, int]],
+        *,
+        follow: bool = False,
+        src_ts: Optional[str] = None,
     ) -> None:
         """M4 Fine only: pin the focus tap to a FIXED full-res ROI (autofocus).
 
@@ -810,15 +914,28 @@ class AcquisitionThread(QThread):
         Fine tap emit that exact crop every frame (so autofocus measures a
         stable patch and the operator sees the tracked target), or ``None`` to
         restore the default per-frame winning-tile auto-pick.
+
+        ``follow`` compensates the pinning lag exactly as in ``set_preview_rois``:
+        a MOVING pin cannot be applied to the frame it was derived from, because
+        the GUI only sees that frame after the acq thread has passed it, so the
+        crop is shifted by the travel measured since ``src_ts``. Leave it False
+        for a pin that is meant to stay put in SENSOR coordinates (Lock tile, the
+        field map) -- those must never be shifted, whatever the scene does.
+
+        Published as ONE tuple so the acq thread reads the ROI, the flag and the
+        source frame together; see ``set_preview_rois`` for why that matters.
         """
         if roi is None:
+            self._focus_pin = (None, False, None)
             self._focus_roi = None
             return
         x0, y0, x1, y1 = (int(v) for v in roi)
         if x1 - x0 < 2 or y1 - y0 < 2:
+            self._focus_pin = (None, False, None)
             self._focus_roi = None
             return
-        self._focus_roi = (x0, y0, x1, y1)
+        self._focus_pin = ((x0, y0, x1, y1), bool(follow), src_ts)
+        self._focus_roi = self._focus_pin[0]
 
     def set_armed(self, armed: bool) -> None:
         """Tell the run loop whether the IA is currently started/streaming.
@@ -1092,46 +1209,44 @@ class AcquisitionThread(QThread):
                             "%s zoom preview build failed: %s", self.label, exc
                         )
 
+                # Does the focus tap below need to read the full-res slot?
+                # Either Fine preview is on, or (coarse) autofocus has pinned
+                # an ROI it wants scored at full resolution.
                 slot_for_fine: Optional[int] = None
+                if (
+                    is_valid_slot
+                    and in_focus_mode
+                    and self._focus_tap_enabled
+                    and want_focus_tap
+                    and (
+                        self._fine_focus
+                        or self._focus_roi is not None
+                        or bool(self._preview_rois)
+                    )
+                ):
+                    slot_for_fine = int(full_u16)
+
+                # Slot waiting to be handed to the writer, and the
+                # (sweep, frame_in_sweep) it ends up stamped with. Both are
+                # resolved AFTER the focus tap; see the deferred submit below.
+                pending_submit_slot: Optional[int] = None
+                sweep_pos: Optional[tuple[int, int]] = None
+                # (rgb, meta) of the Fine tile, held back until the sweep
+                # position is known so the crop can be stamped to match the
+                # full frame it was cut from.
+                pending_fine_emit: Optional[tuple[np.ndarray, dict]] = None
+
                 if is_valid_slot:
                     if will_write:
-                        # Submit the slot to the writer subprocess via
-                        # the shared-memory pool; the writer reads the
-                        # bytes directly out of the slot via its
-                        # SharedMemory mapping.
-                        slot_idx = int(full_u16)
-                        try:
-                            self._submit_slot(slot_idx, acquire_ts_iso, frame_perf_ns)
-                        except Exception as exc:
-                            # Final safety net -- _submit_slot is
-                            # supposed to handle its own slot release
-                            # on every error path. If it raises, count
-                            # the drop and release the slot here so it
-                            # doesn't leak.
-                            self._dropped_writer_not_ready += 1
-                            assert self._pool is not None
-                            self._pool.release_slot(slot_idx)
-                            log.exception(
-                                "%s submit slot %d failed: %s",
-                                self.label, slot_idx, exc,
-                            )
+                        # Deferred, NOT submitted here: reading a slot view
+                        # after submit races the writer subprocess, and in M4
+                        # with Record armed the focus tap still has to cut its
+                        # crop out of this same frame. Recording and focusing
+                        # used to be mutually exclusive, which is why this was
+                        # a plain submit.
+                        pending_submit_slot = int(full_u16)
                     else:
-                        # Hold the full-res slot for a focus-tap read when
-                        # either Fine preview is on OR (coarse) autofocus has
-                        # pinned an ROI it wants scored at full resolution.
-                        defer_release = (
-                            in_focus_mode
-                            and self._focus_tap_enabled
-                            and want_focus_tap
-                            and (
-                                self._fine_focus
-                                or self._focus_roi is not None
-                                or bool(self._preview_rois)
-                            )
-                        )
-                        if defer_release:
-                            slot_for_fine = int(full_u16)
-                        elif self._pool is not None:
+                        if slot_for_fine is None and self._pool is not None:
                             self._pool.release_slot(int(full_u16))
                         if in_recording_mode and block_reason is not None:
                             self._dropped_writer_not_ready += 1
@@ -1182,7 +1297,24 @@ class AcquisitionThread(QThread):
                             and self._pool is not None
                         ):
                             full_view = self._pool.slot_view(slot_for_fine)
-                            roi = self._focus_roi
+                            # ONE read, and the shift applied here rather than at the
+                            # attribute: a tracked Fine pin is derived from a coarse
+                            # frame the GUI only sees after this thread has passed it,
+                            # so cropping it verbatim shows the object wherever it was
+                            # when the GUI answered. The delay varies (Qt queues the
+                            # hop, and ~28% of focus frames get conflated), so the tile
+                            # lagged and then over-shot catching up -- measured on the
+                            # 13:58 save as 42 sensor px of white, non-accumulating
+                            # position error (lag-1 autocorrelation -0.63 on the
+                            # frame-to-frame residual, mean +4.7 px in 648 px of travel,
+                            # so pure delay, no bias). The two-object path has charged
+                            # this debt since the AF work and is exactly why its panes
+                            # look steady where this tile did not.
+                            roi, roi_follow, roi_src_ts = self._focus_pin
+                            if roi is not None and roi_follow:
+                                fh_f, fw_f = full_view.shape[:2]
+                                roi = self._shifted_focus_roi(
+                                    roi, roi_src_ts, fw_f, fh_f)
                             if roi is not None:
                                 rgb, score, crop_u16 = m4_roi_tile_rgb_from_frame(
                                     full_view,
@@ -1194,7 +1326,21 @@ class AcquisitionThread(QThread):
                                     "best_score": score,
                                     "uint16_crop": crop_u16,
                                     "ts_iso": acquire_ts_iso,
-                                    "overview_rgb": None,
+                                    # Filled in by the deferred emit below,
+                                    # once the writer has stamped the position.
+                                    "sweep": None,
+                                    "frame_in_sweep": None,
+                                    # Where the tracked patch has got to, boxed on the
+                                    # whole frame. Built from the SHIFTED roi, so the
+                                    # box marks where the pixels above were actually
+                                    # cut from rather than where the pin was posted.
+                                    "overview_rgb": _m4_roi_overview_rgb(
+                                        small_u16,
+                                        tuple(
+                                            int(v) // KyfgCamera.SUBSAMPLE_FACTOR
+                                            for v in roi
+                                        ),
+                                    ),
                                     "fine_demosaic": self._fine_demosaic,
                                     "roi": roi,
                                     "tile_roi": roi,
@@ -1211,11 +1357,14 @@ class AcquisitionThread(QThread):
                                     "best_score": sharp_res.best_score,
                                     "uint16_crop": crop_u16,
                                     "ts_iso": acquire_ts_iso,
+                                    # See above: stamped by the deferred emit.
+                                    "sweep": None,
+                                    "frame_in_sweep": None,
                                     "overview_rgb": overview_rgb,
                                     "fine_demosaic": self._fine_demosaic,
                                     "tile_roi": tile_bbox,
                                 }
-                            self.raw_focus_tile_rgb.emit(rgb, meta)
+                            pending_fine_emit = (rgb, meta)
                         elif not self._fine_focus:
                             # Coarse autofocus: if a winning-tile ROI is pinned
                             # and we held the full-res slot, ship a full-res crop
@@ -1288,14 +1437,25 @@ class AcquisitionThread(QThread):
                                 self._preview_crops_inflight = True
                                 self.raw_focus_preview_crops.emit(
                                     crops, acquire_ts_iso, pin_src_ts)
-                            # Conflate: only emit if the GUI has consumed the
-                            # previous 8 MB frame. Otherwise drop this one so the
-                            # queued-event backlog can't grow unbounded (the crash).
-                            if self._focus_frame_inflight:
-                                self._focus_frames_conflated += 1
-                            else:
-                                self._focus_frame_inflight = True
-                                self.raw_focus_frame.emit(small_u16, acquire_ts_iso)
+                        # Conflate: only emit if the GUI has consumed the
+                        # previous 8 MB frame. Otherwise drop this one so the
+                        # queued-event backlog can't grow unbounded (the crash).
+                        #
+                        # Emitted in BOTH submodes. Fine NEEDS this coarse frame: the
+                        # leading-edge tracker runs on the GUI thread off it. While
+                        # this sat inside the `not _fine_focus` branch above, Fine
+                        # mode never received a frame, so FineFocusTracker never
+                        # advanced, set_focus_roi was never called, and the tile fell
+                        # back to m4_fine_tile_rgb_from_frame's CENTRE CIRCLE -- the
+                        # tracker was unreachable in the one mode built for it.
+                        # Safe against the latch: the GUI clears it at the TOP of its
+                        # handler (note_focus_frame_consumed), before the submode
+                        # branch, so Fine releases it just as Coarse does.
+                        if self._focus_frame_inflight:
+                            self._focus_frames_conflated += 1
+                        else:
+                            self._focus_frame_inflight = True
+                            self.raw_focus_frame.emit(small_u16, acquire_ts_iso)
                         self._focus_tap_emit_count += 1
                         if self._focus_tap_emit_count == 1 or (
                             self._focus_tap_emit_count % 16 == 0
@@ -1316,8 +1476,40 @@ class AcquisitionThread(QThread):
                             "%s focus-tap emit failed: %s", self.label, exc
                         )
                     finally:
-                        if slot_for_fine is not None and self._pool is not None:
+                        # Not ours to release when the writer is about to take
+                        # it; the writer subprocess returns it to free_q.
+                        if (
+                            slot_for_fine is not None
+                            and pending_submit_slot is None
+                            and self._pool is not None
+                        ):
                             self._pool.release_slot(slot_for_fine)
+
+                # Every full-res read of the slot is done by here, so the
+                # writer can have it.
+                if pending_submit_slot is not None:
+                    try:
+                        sweep_pos = self._submit_slot(
+                            pending_submit_slot, acquire_ts_iso, frame_perf_ns)
+                    except Exception as exc:
+                        # Final safety net -- _submit_slot is supposed to
+                        # handle its own slot release on every error path. If
+                        # it raises, count the drop and release the slot here
+                        # so it doesn't leak.
+                        self._dropped_writer_not_ready += 1
+                        assert self._pool is not None
+                        self._pool.release_slot(pending_submit_slot)
+                        log.exception(
+                            "%s submit slot %d failed: %s",
+                            self.label, pending_submit_slot, exc,
+                        )
+
+                if pending_fine_emit is not None:
+                    fine_rgb, fine_meta = pending_fine_emit
+                    if sweep_pos is not None:
+                        fine_meta["sweep"] = sweep_pos[0]
+                        fine_meta["frame_in_sweep"] = sweep_pos[1]
+                    self.raw_focus_tile_rgb.emit(fine_rgb, fine_meta)
 
                 if want_preview:
                     self._last_preview_t = now_t
@@ -1389,9 +1581,15 @@ class AcquisitionThread(QThread):
 
     def _submit_slot(
         self, slot_idx: int, acquire_ts_iso: str, frame_perf_ns: int,
-    ) -> None:
+    ) -> Optional[tuple[int, int]]:
         """Build a WriteJob for ``slot_idx`` and hand it to the writer
         subprocess via the pool's work_q.
+
+        Returns the ``(sweep, frame_in_sweep)`` the job was stamped with, or
+        ``None`` if the frame was dropped. The M4 focus tap reuses it so the
+        small crop and the full frame from the SAME trigger carry the same
+        coordinates -- that pairing is the only way to line a focus crop up
+        against the full-res image it was cut from.
 
         On any failure (bad path, work_q full, GPS provider raised) the
         slot is returned to free_q before this method returns. Counters
@@ -1414,7 +1612,7 @@ class AcquisitionThread(QThread):
         if not drive_root or not (project_raw or "").strip():
             pool.release_slot(slot_idx)
             self._dropped_writer_not_ready += 1
-            return
+            return None
 
         # Gate on "is a line currently open on the io_writer side?"
         # If not, drop the frame here rather than burn pack CPU
@@ -1427,7 +1625,7 @@ class AcquisitionThread(QThread):
                 "no .bay14line container is open; frames being dropped. "
                 "Did the line spinbox get bumped without re-entering M0/M1?",
             )
-            return
+            return None
 
         try:
             sweep_num, frame_index = self._sweep.next_position()
@@ -1435,7 +1633,7 @@ class AcquisitionThread(QThread):
             self._dropped_writer_not_ready += 1
             log.exception("%s sweep counter failed: %s", self.label, exc)
             pool.release_slot(slot_idx)
-            return
+            return None
 
         gps_dict: Optional[dict] = None
         if self._gps_provider is not None:
@@ -1511,9 +1709,10 @@ class AcquisitionThread(QThread):
                 "writer subprocess is behind (work queue full); "
                 "frames being dropped.",
             )
-            return
+            return None
 
         self._note_unblocked()
+        return int(sweep_num), int(frame_index)
 
     def _drain_queue(self) -> None:
         """Drop any frames currently sitting in the input queue.
@@ -2229,6 +2428,8 @@ class FocusWriterThread(QThread):
                     camera_serial=self._camera_serial,
                     when=job.when,
                     tag=job.tag,
+                    sweep=job.sweep,
+                    frame_in_sweep=job.frame_in_sweep,
                 )
                 ensure_directory(fname)
                 path = fname.full_path()
@@ -2236,7 +2437,10 @@ class FocusWriterThread(QThread):
                     camera_serial=self._camera_serial,
                     project=fname.project,
                     line=self._context.line,
-                    frame_in_sweep=0,  # not part of a sweep
+                    # 0 when no full frame was written for this trigger, which
+                    # is what M4 without Record looks like.
+                    frame_in_sweep=int(job.frame_in_sweep or 0),
+                    sweep=int(job.sweep or 0),
                     capture_kind="focus",
                     acquire_timestamp=job.when.astimezone().isoformat(timespec="milliseconds"),
                 )
@@ -2727,6 +2931,11 @@ class CameraPipeline:
         if not drive_root or not (project_raw or "").strip():
             return False
         when = _dt.datetime.now()
+        # An M4 bracket and a mapping line are the same container format on the
+        # same drive; only the intent differs, and only one of them is training
+        # data. Mark it in BOTH the name and the header -- the name is what the
+        # operator sorts by, the header is what survives a rename.
+        is_focus = self._modes.m4_recording()
         try:
             lname = build_line_name(
                 drive_root=drive_root,
@@ -2734,6 +2943,8 @@ class CameraPipeline:
                 camera_serial=self.camera_serial,
                 line=int(self._context.line),
                 when=when,
+                focus=is_focus,
+                camera_number=self.camera_number,
             )
             ensure_directory(lname)
             target_path = lname.full_path()
@@ -2743,9 +2954,10 @@ class CameraPipeline:
             return False
         line_meta = {
             "camera_serial": self.camera_serial,
+            "camera_number": self.camera_number,
             "project": lname.project,
             "line": lname.line,
-            "capture_kind": "sweep",
+            "capture_kind": "focus" if is_focus else "sweep",
             "line_started_at": when.isoformat(timespec="milliseconds"),
             "genicam_pixel_format": self._backend.pixel_format or "",
         }
@@ -2813,11 +3025,20 @@ class CameraPipeline:
         self.acq.set_fine_demosaic_enabled(bool(enabled))
 
     def set_focus_roi(
-        self, roi: Optional[tuple[int, int, int, int]]
+        self,
+        roi: Optional[tuple[int, int, int, int]],
+        *,
+        follow: bool = False,
+        src_ts: Optional[str] = None,
     ) -> None:
         """M4 autofocus: pin the Fine focus tap to a fixed full-res ROI, or
-        ``None`` to restore the default winning-tile auto-pick."""
-        self.acq.set_focus_roi(roi)
+        ``None`` to restore the default winning-tile auto-pick.
+
+        ``follow=True`` corrects the pinning lag by shifting the crop by the scene
+        travel measured since ``src_ts`` -- the frame the ROI was derived from --
+        so a MOVING pin lands on the object rather than behind it. Leave it off
+        for a pin that must hold a fixed sensor patch."""
+        self.acq.set_focus_roi(roi, follow=follow, src_ts=src_ts)
 
     def set_preview_rois(self, rois: list, follow: bool = False,
                          src_ts: Optional[str] = None) -> None:
@@ -2848,6 +3069,8 @@ class CameraPipeline:
         when: Optional[_dt.datetime] = None,
         gps: Optional[GpsFix] = None,
         tag: str = "",
+        sweep: Optional[int] = None,
+        frame_in_sweep: Optional[int] = None,
     ) -> bool:
         """Queue a focus-view crop for writing.
 
@@ -2865,7 +3088,10 @@ class CameraPipeline:
         if not self._modes.is_focus_mode():
             return False
         when = when or _dt.datetime.now()
-        job = FocusJob(crop_u16=crop_u16.copy(), when=when, gps=gps, tag=tag)
+        job = FocusJob(
+            crop_u16=crop_u16.copy(), when=when, gps=gps, tag=tag,
+            sweep=sweep, frame_in_sweep=frame_in_sweep,
+        )
         try:
             self.focus_queue.put_nowait(job)
         except queue.Full:

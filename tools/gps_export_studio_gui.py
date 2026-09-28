@@ -109,7 +109,10 @@ from capture.gps_fix import GpsFix  # noqa: E402
 from capture.tiff_writer import (  # noqa: E402
     detect_exiftool,
     exiftool_geotag,
-    exiftool_write_camera_attitude,
+    exiftool_write_frame_tags,
+    focus_from_payload,
+    insert_jpeg_xmp_packet,
+    xmp_attitude_packet,
 )
 
 log = logging.getLogger("gps_export_studio")
@@ -282,7 +285,9 @@ class ExportWorker(QThread):
                 quality=self._jpeg_quality, flip_lr=cam.flip_lr,
                 resize_width=resize_width,
             )
-            self._write_jpeg_exif(out_path, fix, attitude)
+            self._write_jpeg_exif(
+                out_path, fix, attitude, focus_from_payload(merged_meta),
+            )
         elif self._export_kind == "tiff_rgb":
             encode_tiff_rgb16(
                 out_path, arr, merged_meta, flip_lr=cam.flip_lr,
@@ -295,16 +300,27 @@ class ExportWorker(QThread):
                 resize_width=resize_width,
             )
 
-    def _write_jpeg_exif(self, out_path: Path, fix: Optional[GpsFix], attitude: Optional[dict]) -> None:
+    def _write_jpeg_exif(
+        self,
+        out_path: Path,
+        fix: Optional[GpsFix],
+        attitude: Optional[dict],
+        focus: Optional[dict] = None,
+    ) -> None:
         if self._exiftool is None:
             return
         try:
             if fix is not None and fix.has_position:
                 exiftool_geotag(out_path, fix, exiftool_exe=self._exiftool)
+            exiftool_write_frame_tags(
+                out_path, focus=focus, exiftool_exe=self._exiftool,
+            )
+            # Attitude last: ExifTool cannot write the Camera namespace, so we
+            # append the XMP segment ourselves once ExifTool is done rewriting.
             if attitude is not None:
-                exiftool_write_camera_attitude(
-                    out_path, attitude, exiftool_exe=self._exiftool,
-                )
+                packet = xmp_attitude_packet(attitude)
+                if packet is not None:
+                    insert_jpeg_xmp_packet(out_path, packet)
         except Exception as exc:
             self.log_line.emit(f"  JPEG EXIF failed for {out_path.name}: {exc}")
 
@@ -315,8 +331,8 @@ class ExportWorker(QThread):
         if self._export_kind == "jpeg" and self._exiftool is None:
             self.log_line.emit(
                 "WARNING: ExifTool not found -- JPEG exports will have NO "
-                "GPS/attitude EXIF. (TIFF GPS still works; TIFF attitude needs "
-                "ExifTool too.)"
+                "GPS/attitude/encoder EXIF. (TIFF GPS still works; TIFF "
+                "attitude + encoder need ExifTool too.)"
             )
         try:
             from bay14_export_core import discover_lines

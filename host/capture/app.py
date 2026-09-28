@@ -32,8 +32,6 @@ import sys
 import time
 from typing import Optional
 
-import serial_comm
-
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -60,7 +58,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .autofocus import AutoFocusController, FineFocusTracker
+from .autofocus import AutoFocusController, FineFocusTracker, PatchTracker
 from .autofocus import focus_measure_full_res as af_full_res_measure
 from .dual_tracker import DualObjectTracker
 from .autofocus_v3 import AutoFocusConfigV3
@@ -88,7 +86,14 @@ from .mode_controller import (
     MODE_BUTTON_WIDTH_FULL,
     mode_display_label,
 )
-from .pipeline import AcquisitionThread, CameraPipeline, CaptureContext, PREVIEW_MAX_EDGE
+from .pipeline import (
+    AcquisitionThread,
+    CameraPipeline,
+    CaptureContext,
+    M4_FINE_PICK_TILE_H,
+    M4_FINE_PICK_TILE_W,
+    PREVIEW_MAX_EDGE,
+)
 from .serial_client import SerialClient
 from .session_log import SessionLogger, build_date, default_log_dir
 
@@ -118,6 +123,14 @@ _COM_PANEL_STYLE_DISCONNECTED = (
 
 def _com_panel_style(connected: bool) -> str:
     return _COM_PANEL_STYLE_CONNECTED if connected else _COM_PANEL_STYLE_DISCONNECTED
+
+
+# GPS link probe: how many ``$E*`` pulses to fire before declaring the bridge
+# dead, and how long to wait for each one's sentence. Measured round-trip on
+# the bench is ~40 ms (pulse out, GGA back), so 800 ms is generous; the retries
+# cover a receiver that is still acquiring when the app starts.
+_GPS_PROBE_ATTEMPTS = 3
+_GPS_PROBE_INTERVAL_MS = 800
 
 
 class _PreviewDisplayLabel(QLabel):
@@ -432,7 +445,14 @@ class _BringupWorker(QThread):
                     get_drive_root=self._get_drive_root(cam_no),
                     gps_provider=self._gps_provider,
                     heading_provider=self._heading_provider,
-                    focus_provider=self._focus_provider,
+                    # Bind THIS row's camera so the focus block carries its own
+                    # encoder rather than the selected camera's -- only one of
+                    # the three encoders is live at a time (shared SPI bus,
+                    # relay-selected), so they genuinely differ.
+                    focus_provider=(
+                        None if self._focus_provider is None
+                        else (lambda c=cam_no: self._focus_provider(c))
+                    ),
                 )
                 pipeline.start(log_sink=lambda msg: self.log_line.emit(msg))
                 # Move the writer QObject from this worker thread to
@@ -694,7 +714,11 @@ class MainWindow(QMainWindow):
         )
         self._gps_receiver.error_logged.connect(self._log)
         self._gps_receiver.parser_stats.connect(self._on_gps_parser_stats)
+        self._gps_receiver.event_received.connect(self._on_gps_event_received)
         self._gps_port_arg = gps_port
+        # An open port is not a proven link -- see :meth:`_refresh_gps_panel`.
+        self._gps_link_verified = False
+        self._gps_probe_attempts = 0
 
         self._manager = CameraManager(cti_path)
         self._pipelines: list[CameraPipeline] = []
@@ -709,7 +733,18 @@ class MainWindow(QMainWindow):
         self._raw_focus_drops_not_in_m4 = 0
         self._raw_focus_drops_wrong_cam = 0
         self._raw_focus_forwarded = 0
-        self._fine_tracker = FineFocusTracker()
+        # Candidates sized to the Fine pane, so the pick is decided by the pixels
+        # the operator is actually looking at (see M4_FINE_PICK_TILE_W).
+        self._fine_tracker = FineFocusTracker(
+            tile_wh=(M4_FINE_PICK_TILE_W, M4_FINE_PICK_TILE_H))
+        # Diagnostic, off unless IRON661_FINE_FLOW=1. Measures whether static
+        # content in the FOV is biasing the Fine tracker's motion estimate; see
+        # _probe_fine_flow. Costs a second phase correlation per coarse frame,
+        # so it stays opt-in rather than always-on.
+        self._fine_flow_probe = (
+            PatchTracker() if os.environ.get("IRON661_FINE_FLOW") == "1" else None
+        )
+        self._fine_flow_samples: list[tuple[float, float, float, float]] = []
         # Independent two-object tracker for the optional split-screen preview
         # (relays a leading-edge patch onto each pane; runs with or without AF).
         self._dual_tracker = DualObjectTracker()
@@ -918,6 +953,10 @@ class MainWindow(QMainWindow):
 
     @Slot(int, str, list)
     def _on_camera_opened(self, cam_no: int, serial: str, align_log: list) -> None:
+        # Tell the serial client which PCB slot this camera is wired to, so
+        # ``$ENC`` tags land on the app camera number the rest of the app uses.
+        # Earliest point where both numbers are known.
+        self._serial.set_camera_serial(cam_no, serial)
         if 1 <= cam_no <= len(self._rows):
             self._rows[cam_no - 1].set_serial(serial)
         try:
@@ -1235,10 +1274,11 @@ class MainWindow(QMainWindow):
     def _auto_connect_gps(self) -> None:
         """Connect the GPS receiver at startup if a port is known.
 
-        Order of preference: CLI ``--gps-port`` arg, then any port
-        whose Windows driver description matches a Septentrio device.
-        Silently no-ops when nothing's found so a rig running without
-        GPS attached still boots cleanly.
+        Order of preference: CLI ``--gps-port`` arg, then
+        :meth:`GpsReceiver.auto_detect` -- which tries COM3 (the RS232 NMEA
+        bridge) before any Septentrio USB descriptor. Silently no-ops when
+        nothing's found so a rig running without GPS attached still boots
+        cleanly. Connecting only opens the port; ``$E*`` proves the link.
         """
         port = self._gps_port_arg or GpsReceiver.auto_detect()
         if not port:
@@ -1258,7 +1298,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._gps_receiver.connect_port(port)
-            self._log(f"GPS connected on {port}")
+            self._log(f"GPS port {port} open")
         except Exception as exc:
             self._log(f"GPS connect failed: {exc}")
 
@@ -1283,20 +1323,111 @@ class MainWindow(QMainWindow):
         # error counters and re-emits a single "receiving events" line.
         self._gps_parser_alive_logged = False
         self._gps_parser_err_prev = None
+        self._gps_link_verified = False
         if not connected:
             # Final diagnostic dump on disconnect (covers shutdown after the
             # common M1 -> M0 -> quit flow, which never re-enters a
             # non-recording mode and so misses the leave-recording dump).
             self._log_gps_correlator_stats()
+        self._refresh_gps_panel()
+        if connected:
+            self._start_gps_link_probe()
+
+    def _refresh_gps_panel(self) -> None:
+        """Paint the GPS bar from (port open, link proven) -- in that order.
+
+        An open port is NOT a working link here: the bridge is silent until an
+        EXT_EVENT pulse reaches the receiver, so a disconnected antenna, a dead
+        bridge and a healthy idle rig all look identical on the wire. Only a
+        decoded sentence turns the panel green; until one arrives the bar stays
+        red and says so, rather than claiming a link nobody has tested.
+        """
+        open_ = self._gps_receiver.connected
+        live = open_ and self._gps_link_verified
         if hasattr(self, "_gps_status_label"):
-            self._gps_status_label.setText("connected" if connected else "disconnected")
+            if live:
+                text = "connected"
+            elif open_:
+                text = "port open, no data"
+            else:
+                text = "disconnected"
+            self._gps_status_label.setText(text)
             self._gps_status_label.setStyleSheet(
-                "color:#3a7;" if connected else "color:#888;"
+                "color:#3a7;" if live else "color:#888;"
             )
         if hasattr(self, "_gps_connect_btn"):
-            self._gps_connect_btn.setText("Disconnect" if connected else "Connect")
+            self._gps_connect_btn.setText("Disconnect" if open_ else "Connect")
         if hasattr(self, "_gps_bar_box"):
-            self._gps_bar_box.setStyleSheet(_com_panel_style(connected))
+            self._gps_bar_box.setStyleSheet(_com_panel_style(live))
+
+    def _start_gps_link_probe(self) -> None:
+        """Fire ``$E*`` at the PCB and wait for the bridge to answer.
+
+        ``$E*`` pulses the receiver's EXT_EVENT input without moving a motor or
+        exposing a frame, so this is safe to run on every connect. A sentence
+        coming back proves the whole chain at once -- PCB output, EXT_EVENT
+        input, the bridge's SBF-to-NMEA translation, the RS232 wiring and this
+        port -- which is the only honest test available for a port whose
+        Windows descriptor says nothing.
+
+        Retries because one pulse can be lost to a receiver still warming up.
+        On timeout the port is closed so the operator sees a red bar and a
+        reason, not a green one hiding a dead link.
+
+        Verification itself is driven by ``_on_gps_event_received``, not by
+        this timer: any sentence at all flips the bar green, so a rig whose
+        ClearCore connects late still goes green on its first real trigger.
+        """
+        if not self._serial.connected:
+            # No PCB, so no way to provoke a sentence. Leave the port open and
+            # the bar red; the first real trigger will verify it.
+            self._log(
+                "GPS: link unverified -- ClearCore not connected, cannot fire "
+                "$E*. Will verify on the first sentence received."
+            )
+            return
+
+        self._gps_probe_attempts = 0
+
+        def _attempt() -> None:
+            if self._gps_link_verified or not self._gps_receiver.connected:
+                return
+            self._gps_probe_attempts += 1
+            if self._gps_probe_attempts > _GPS_PROBE_ATTEMPTS:
+                self._log(
+                    f"GPS: no sentence after {_GPS_PROBE_ATTEMPTS} $E* probes "
+                    f"on {self._gps_receiver.port} -- closing the port. Check "
+                    f"the bridge, the RS232 lead, and the receiver's EXT_EVENT "
+                    f"input."
+                )
+                self._gps_receiver.disconnect_port()
+                return
+            try:
+                self._serial.fire_event()
+            except Exception as exc:
+                self._log(f"GPS: $E* probe failed to send: {exc}")
+                return
+            QTimer.singleShot(_GPS_PROBE_INTERVAL_MS, _attempt)
+
+        self._log(f"GPS: probing {self._gps_receiver.port} with $E* ...")
+        _attempt()
+
+    @Slot(object, "qint64")
+    def _on_gps_event_received(self, event: object, host_perf_ns: int) -> None:
+        """First sentence of a session proves the link; later ones are free.
+
+        Wired to every decoded sentence (~5 Hz while flying), so this stays a
+        bool check after the first one.
+        """
+        if self._gps_link_verified:
+            return
+        self._gps_link_verified = True
+        fix = getattr(event, "fix", None)
+        where = ""
+        if fix is not None and fix.has_position:
+            where = f" at {fix.latitude_deg:+.6f}, {fix.longitude_deg:+.6f}"
+        self._log(f"GPS: link verified on {self._gps_receiver.port}{where}")
+        self._refresh_gps_panel()
 
     @Slot(dict)
     def _on_gps_parser_stats(self, stats: dict) -> None:
@@ -1414,8 +1545,12 @@ class MainWindow(QMainWindow):
                         f"max={amax:+.0f} ms"
                     )
 
-    def _focus_metadata(self) -> Optional[dict]:
+    def _focus_metadata(self, camera_number: int) -> Optional[dict]:
         """The ``focus`` block stamped on every written frame, or None.
+
+        *camera_number* is the camera whose frame this is, bound per pipeline at
+        construction, so each camera's imagery carries ITS OWN lens position
+        rather than whichever one happened to be selected.
 
         Called from the acquisition thread once per frame, so it only reads the
         lock-guarded encoder accessors and does no work.
@@ -1430,14 +1565,33 @@ class MainWindow(QMainWindow):
         ``encoder_epoch`` is not decoration: counts are only comparable within
         one epoch, so a consumer must compare epochs before differencing two
         frames' counts.
+
+        ``encoder_stale`` is the same kind of warning for the multi-camera rig.
+        The three encoders share one SPI bus and the motor-selection relays pick
+        which one answers, so only the SELECTED camera has a live count; the
+        other two carry their last known value. Stepping camera 1 through focus
+        leaves camera 2 and 3 reporting a fixed count that is real but no longer
+        current, and a consumer that cannot tell the difference would read a
+        through-focus series where none was flown.
         """
         try:
-            if not self._serial.connected or not self._serial.encoder_present:
+            if not self._serial.connected:
                 return None
-            return {
-                "encoder_count": float(self._serial.encoder_position),
+            cam = int(camera_number)
+            if not self._serial.encoder_present_for(cam):
+                return None
+            selected = self._serial.selected_camera
+            age = self._serial.encoder_age_for(cam)
+            meta = {
+                "encoder_count": float(self._serial.encoder_position_for(cam)),
                 "encoder_epoch": self._serial.encoder_epoch,
+                "encoder_camera": cam,
+                "selected_camera": int(selected),
+                "encoder_stale": cam != int(selected),
             }
+            if age is not None:
+                meta["encoder_age_s"] = round(float(age), 3)
+            return meta
         except Exception:
             log.debug("focus metadata unavailable", exc_info=True)
             return None
@@ -2350,10 +2504,14 @@ class MainWindow(QMainWindow):
         # this shared dataclass (the engine re-reads it every frame). OrthoSim decode
         # state is lazily armed by _on_orthosim_toggled.
         self._af_cfg = af_cfg
-        # Share that same dataclass with the two-object tracker (built earlier in
-        # __init__, before af_cfg exists), so its boxes honour the OrthoSim interior
-        # masking too -- otherwise it tracks the bezel/office while AF ignores it.
+        # Share that same dataclass with BOTH scene trackers (built earlier in
+        # __init__, before af_cfg exists), so their boxes honour the OrthoSim interior
+        # masking too -- otherwise they track the bezel/office while AF ignores it.
+        # The Fine tracker needs it just as much as the dual one: it is what picks the
+        # tile the operator hand-focuses on, and on its own default AutoFocusConfig it
+        # also missed any tuned min_texture_score / ROI size.
         self._dual_tracker.cfg = af_cfg
+        self._fine_tracker.cfg = af_cfg
         self._ortho_layout: Optional[ScreenLayout] = None
         self._ortho_tracker: Optional[SpeedDistanceTracker] = None
         self._ortho_last_t = 0.0
@@ -2472,13 +2630,14 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_gps_bar(self) -> QWidget:
-        """COM bar for the Septentrio receiver's SBF feed.
+        """COM bar for the GNSS receiver's NMEA feed.
 
         Same shape as :meth:`_build_serial_bar`: port combo + refresh,
         Connect/Disconnect button, status label. The receiver thread
         and parser live in :class:`GpsReceiver` (constructed in
         :meth:`__init__`); we only build the UI here. Auto-detect
-        favours device descriptions containing "Septentrio".
+        favours COM3, the RS232 bridge. The bar only turns green once a
+        sentence has actually arrived -- see :meth:`_refresh_gps_panel`.
         """
         box = QGroupBox("GPS receiver")
         box.setStyleSheet(_com_panel_style(False))
@@ -2832,13 +2991,19 @@ class MainWindow(QMainWindow):
             ok and collecting and not self._pending_end_line
         )
 
-    def _recording_prerequisites_missing(self) -> list[str]:
+    def _recording_prerequisites_missing(
+        self, only: Optional[int] = None
+    ) -> list[str]:
         """What is still unset that would make an armed line write nothing.
 
         ``_open_lines_for_active_pipelines`` skips pipelines without a drive or
         project silently by design, so every manual arm (M3 Start line, M4
         Record) warns up front instead of letting the operator discover it from
         an empty drive afterwards.
+
+        *only* restricts the drive check to one camera. M4 Record writes the
+        selected camera alone, so without this it would nag about drives for two
+        cameras it is never going to write to.
         """
         missing: list[str] = []
         if not (self._context.project or "").strip():
@@ -2846,7 +3011,8 @@ class MainWindow(QMainWindow):
         cams_without_drive = [
             p.camera_number
             for p in self._pipelines
-            if self._drive_roots.get(p.camera_number) is None
+            if (only is None or p.camera_number == only)
+            and self._drive_roots.get(p.camera_number) is None
         ]
         if cams_without_drive:
             cams_str = ", ".join(f"cam{c}" for c in cams_without_drive)
@@ -2971,32 +3137,68 @@ class MainWindow(QMainWindow):
         Every frame written here carries the lens encoder count in its chunk
         JSON, which is the point: a focus bracket flown through focus and out
         the other side can be sorted by lens position on the ground.
+
+        Writes the SELECTED camera only. A bracket steps one lens, and only the
+        selected camera's focus motor is on the relay, so the other two would
+        contribute frames at a fixed (and separately drifting) lens position --
+        three times the disk for data that can't be sorted by the thing the
+        bracket varies. Switching preview while armed disarms; see
+        :meth:`_on_preview_selected`.
         """
         if self._modes.mode != Mode.M4:
             self._log("Record: ignored (only valid in M4).")
             self._focus_panel.sync_m4_record_toggle(False)
             return
 
+        active = self._active_pipeline()
+        if on and active is None:
+            self._log("Record: no camera selected for preview -- ignored.")
+            self._focus_panel.sync_m4_record_toggle(False)
+            return
+
+        cam = active.camera_number if active is not None else None
         if on:
-            missing = self._recording_prerequisites_missing()
+            missing = self._recording_prerequisites_missing(only=cam)
             if missing:
                 self._log(
                     "WARN Record: nothing will be saved until you set: "
                     + "; ".join(missing) + "."
                 )
         for p in self._pipelines:
+            # Only the selected camera emits full-res while bracketing. In M4
+            # the focus tap is already gated on the selected camera, so the
+            # other two have no use for full-res frames.
+            want = bool(on) and p.camera_number == cam
             try:
-                p.set_full_res_emission(bool(on))
+                p.set_full_res_emission(want)
             except Exception as exc:
                 self._log(
-                    f"cam{p.camera_number}: set_full_res_emission({on}) "
+                    f"cam{p.camera_number}: set_full_res_emission({want}) "
                     f"failed: {exc}"
                 )
         self._modes.set_m4_recording(on)
         if on:
+            # A bracket is only worth recording if the small focus crops land
+            # next to the full frames: Coarse never emits a tile, and with
+            # "Save focus view" off the crops are computed and thrown away.
+            # Force both rather than let the operator discover it afterwards.
+            if self._modes.focus_submode() != FocusSubMode.FINE:
+                # Silent toggle sync first, then the handler by hand -- it is
+                # what turns the full-res Fine tap on in the pipelines, and
+                # sync_focus_submode_toggle blocks the signal that would
+                # normally call it.
+                self._focus_panel.sync_focus_submode_toggle(FocusSubMode.FINE)
+                self._on_focus_submode_changed(FocusSubMode.FINE)
+                self._log("Record: switched to Fine view (needed for focus crops).")
+            if not self._focus_panel.is_save_focus_enabled():
+                self._focus_panel.set_save_focus_enabled(True)
+                self._log("Record: ticked 'Save focus view'.")
             self._gps_correlator.reset_stats()
-            self._open_lines_for_active_pipelines()
-            self._log("Record ARMED in M4: writing .bay14line with encoder stamps.")
+            self._open_lines_for_active_pipelines(only=cam)
+            self._log(
+                f"Record ARMED in M4 on cam{cam} only: writing .bay14line "
+                "with encoder stamps."
+            )
         else:
             self._close_all_lines()
             self._log("Record disarmed in M4: lines closed.")
@@ -3123,7 +3325,9 @@ class MainWindow(QMainWindow):
 
     # ── Line-container lifecycle ───────────────────────────────────────
 
-    def _open_lines_for_active_pipelines(self) -> None:
+    def _open_lines_for_active_pipelines(
+        self, only: Optional[int] = None
+    ) -> None:
         """Open a fresh ``.bay14line`` for every pipeline that has the
         prerequisites (drive set, project name set).
 
@@ -3131,8 +3335,14 @@ class MainWindow(QMainWindow):
         AcquisitionThread will drop frames at submit time and emit
         the standard ``no_line_open`` block message via its log_line
         signal, which is already wired into the GUI log.
+
+        *only* opens a line for that one camera. M0/M1/M3 record all three
+        cameras (they are mapping the ground and want every look angle), but an
+        M4 focus bracket is about ONE lens, so it writes one camera.
         """
         for p in self._pipelines:
+            if only is not None and p.camera_number != only:
+                continue
             if p.line_open:
                 # Defensive: if a stray open snuck through (e.g. a
                 # mid-bring-up race), close it first so we always end
@@ -3226,19 +3436,6 @@ class MainWindow(QMainWindow):
 
     # ── Preview routing ─────────────────────────────────────────────────
 
-    def _pcb_focus_slot_for_pipeline(self, p: CameraPipeline) -> int:
-        """Map pipeline Iron661 serial → PCB ``$Cn*`` slot (fixed rig wiring)."""
-        serial = str(p.camera_serial).strip()
-        slot = serial_comm.PCB_FOCUS_CAMERA_SLOT_BY_SERIAL.get(serial)
-        if slot is not None:
-            return slot
-        exp = sorted(serial_comm.PCB_FOCUS_CAMERA_SLOT_BY_SERIAL)
-        self._log(
-            f"WARN: cam{p.camera_number} serial {serial!r} has no fixed PCB "
-            f"$C mapping (expected serials {exp}); sending $C{p.camera_number}*"
-        )
-        return p.camera_number
-
     def _on_preview_selected(self, camera_number: int) -> None:
         """User clicked the preview radio for one camera.
 
@@ -3284,6 +3481,22 @@ class MainWindow(QMainWindow):
             self._sync_preview_sensor_fields()
             return
 
+        # A focus-bracket container belongs to ONE camera. If Record is armed
+        # and the operator promotes a different camera, the old camera's line
+        # would stay open and keep writing while they focus another lens, which
+        # silently mixes two lenses into one file. Disarm instead and make them
+        # re-arm -- the same rule that makes any mode change disarm Record.
+        if self._modes.m4_recording() and not any(
+            p.line_open and p.camera_number == camera_number
+            for p in self._pipelines
+        ):
+            self._log(
+                f"Record disarmed: preview moved to cam{camera_number}; "
+                "re-arm to bracket this camera."
+            )
+            self._on_m4_record_toggled(False)
+            self._focus_panel.sync_m4_record_toggle(False)
+
         # Flip the preview flag exclusively to the chosen camera. The
         # focus tap follows the preview and is additionally gated on
         # M4. AcquisitionThreads for the non-selected cameras keep
@@ -3315,10 +3528,9 @@ class MainWindow(QMainWindow):
         # the user just promoted to active preview.
         if in_focus and self._serial.connected:
             try:
-                pcb_slot = self._pcb_focus_slot_for_pipeline(target_pipeline)
-                self._serial.select_camera(pcb_slot)
+                self._serial.select_camera(camera_number)
                 self._log(
-                    f"sent $C{pcb_slot}* "
+                    f"sent $C{self._serial.pcb_slot_for(camera_number)}* "
                     f"(UI cam{camera_number}, serial {target_pipeline.camera_serial})"
                 )
             except Exception as exc:
@@ -3429,9 +3641,88 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self._log(f"set_focus_roi(clear) failed: {exc}")
 
+    def _probe_fine_flow(self, coarse_raw) -> None:
+        """Report how much a whole-frame motion estimate under-reads the scroll.
+
+        The Fine tracker dead-reckons on a ``PatchTracker`` restricted to the
+        centre of the frame, because the whole-frame estimate is biased on the
+        bench: a slice of the FOV never moves (screen bezel, fiducials, the room
+        around the screen), and static content drags a global translation
+        estimate toward zero. A tile under-shifted every frame slides backwards
+        against the flow at a steady rate, which is what constant drift looks
+        like. Measured here at ~6%, stable across 11 batches.
+
+        So this keeps the whole frame as the *reference* and compares the
+        tracker's centre estimate against it: ``tracker/whole`` above 1.00 means
+        static content is still biasing a whole-frame estimate, and by how much.
+        It stays a differential measurement rather than a comparison against
+        OrthoSim's commanded scroll, which would need screen geometry, GSD and a
+        unit conversion chain, any link of which could explain a discrepancy on
+        its own.
+        """
+        probe = self._fine_flow_probe
+        if probe is None or coarse_raw is None or coarse_raw.ndim < 2:
+            return
+        wdx, wdy, _wresp = probe.update(coarse_raw)
+        self._fine_flow_samples.append(
+            (self._fine_tracker.motion_dx, self._fine_tracker.motion_dy, wdx, wdy)
+        )
+        if len(self._fine_flow_samples) < 16:
+            return
+        # Drop a sample if EITHER estimate is zero, not just if both are. A
+        # one-sided zero is a frame where one estimator had no predecessor, and
+        # averaging it in dilutes that estimator's mean while leaving the other
+        # intact -- which reads as a clean, stable bias. That is precisely how
+        # the reset in _reacquire disguised itself as a 6% static-content bias
+        # (one zero per 16-sample batch, 15/16 = 0.9375).
+        rows = [
+            s
+            for s in self._fine_flow_samples
+            if abs(s[0]) + abs(s[1]) > 1e-6 and abs(s[2]) + abs(s[3]) > 1e-6
+        ]
+        self._fine_flow_samples = []
+        if not rows:
+            return
+        n = float(len(rows))
+        tdx, tdy, wdx, wdy = (sum(r[i] for r in rows) / n for i in range(4))
+        # Ratio of travelled distance, which is what accumulates as drift.
+        tracked = (tdx * tdx + tdy * tdy) ** 0.5
+        whole = (wdx * wdx + wdy * wdy) ** 0.5
+        ratio = (tracked / whole) if whole > 1e-6 else float("nan")
+        self._log(
+            f"fine-flow n={len(rows)}: tracker dx{tdx:+.2f} dy{tdy:+.2f} "
+            f"(|{tracked:.2f}|)  whole-frame dx{wdx:+.2f} dy{wdy:+.2f} "
+            f"(|{whole:.2f}|)  tracker/whole={ratio:.3f}"
+        )
+
     def _update_fine_leading_edge(self, pipeline: CameraPipeline, coarse_raw) -> None:
         """Track a leading-edge tile on coarse frames; pin Fine tap to full-res ROI."""
+        # Size the candidates to what the pane can show AT THIS ZOOM, before update()
+        # can re-pick. Set every frame because both inputs are the operator's: the
+        # pane expands with the window and the zoom is a combo box, so any constant
+        # fits one layout and letterboxes the rest. It takes effect at the next
+        # hand-over rather than mid-object -- _pick only runs from _reacquire, and a
+        # live resize of the current tile would look like the focus jumped.
+        vw, vh = self._focus_panel.fine_view_sensor_wh()
+        sub = KyfgCamera.SUBSAMPLE_FACTOR
+        fh_c, fw_c = coarse_raw.shape[:2]
+        # Even (Bayer), and never larger than the frame: an oversized tile yields an
+        # EMPTY grid, and select_leading_edge_roi then falls back to a centred ROI,
+        # silently dropping the leading-edge behaviour this whole path exists for.
+        self._fine_tracker.tile_wh = (
+            min(fw_c, max(2, -(-vw // sub))) & ~1,
+            min(fh_c, max(2, -(-vh // sub))) & ~1,
+        )
         roi_coarse = self._fine_tracker.update(coarse_raw)
+        # A diagnostic must never break the thing it observes. This one threw a
+        # NameError and took the whole method down with it, so set_focus_roi was
+        # never reached -- Fine mode silently fell back to the centre-circle
+        # auto-pick and looked exactly like "tracking is broken again".
+        try:
+            self._probe_fine_flow(coarse_raw)
+        except Exception as exc:
+            self._fine_flow_probe = None
+            self._log(f"fine-flow probe disabled after error: {exc}")
         held = self._fine_tracker.frames_on_object
         left = self._fine_tracker.frames_left()
         if self._locked_fine_roi is not None:
@@ -3448,14 +3739,31 @@ class MainWindow(QMainWindow):
                 pipeline.set_focus_roi(None)
                 self._focus_panel.set_dwell_info("no object yet (too bland)")
             else:
+                # follow=True: this pin is TRACKED, and it can only ever reach a
+                # later frame than the coarse one it was derived from, so the acq
+                # thread shifts it by the travel it measures on the frame it
+                # actually crops. Without it the tile lagged the object by a
+                # varying sub-frame delay -- 42 sensor px of jitter at the flown
+                # 648 px/frame -- which is what "the image looks jittery" was.
+                # src_ts names that coarse frame, so the shift covers however many
+                # frames we took to answer (the GUI conflates under load).
                 pipeline.set_focus_roi(
-                    tuple(int(v * scale) for v in roi_coarse)
+                    tuple(int(v * scale) for v in roi_coarse),
+                    follow=True,
+                    src_ts=getattr(self, "_focus_frame_ts", None),
                 )
-                edge = self._fine_tracker.lead_edge or "static"
+                tr = self._fine_tracker
+                edge = tr.lead_edge or "static"
+                # Texture no longer blocks the pick, so show how strong the target
+                # actually is -- a bland tile is a legitimate thing to hand-focus on,
+                # but the operator should know the judgement will be harder.
+                weak = "  WEAK" if tr.pick_score < tr.cfg.min_texture_score else ""
                 self._focus_panel.set_dwell_info(
-                    f"obj #{self._fine_tracker.object_id} from {edge}  "
+                    f"obj #{tr.object_id} from {edge}  "
                     f"held {held}f  "
                     + (f"~{left}f left" if left is not None else "no flow")
+                    + f"  dx{tr.motion_dx:+.1f} dy{tr.motion_dy:+.1f}"
+                    + f"  tex {tr.pick_score:.1f}{weak}"
                 )
         except Exception as exc:
             self._log(f"set_focus_roi failed: {exc}")
@@ -5446,9 +5754,14 @@ class MainWindow(QMainWindow):
         if self._serial is None or not getattr(self._serial, "connected", False):
             text = "enc: --"
         elif not self._serial.encoder_present:
-            text = "enc: absent"
+            text = f"enc: absent (cam{self._serial.selected_camera})"
         else:
-            text = f"enc: {int(self._serial.encoder_position)}"
+            # Name the camera: three encoders share the bus and only the selected
+            # one is live, so an unlabelled count is ambiguous on this rig.
+            text = (
+                f"enc: {int(self._serial.encoder_position)} "
+                f"(cam{self._serial.selected_camera})"
+            )
         self._focus_panel.set_encoder_text(text)
 
     # ── Log + close ─────────────────────────────────────────────────────
@@ -5661,10 +5974,9 @@ class MainWindow(QMainWindow):
         if in_focus and self._serial.connected:
             if active is not None:
                 try:
-                    pcb_slot = self._pcb_focus_slot_for_pipeline(active)
-                    self._serial.select_camera(pcb_slot)
+                    self._serial.select_camera(active.camera_number)
                     self._log(
-                        f"sent $C{pcb_slot}* "
+                        f"sent $C{self._serial.pcb_slot_for(active.camera_number)}* "
                         f"(focus UI cam{active.camera_number}, serial {active.camera_serial})"
                     )
                 except Exception as exc:
@@ -5818,8 +6130,8 @@ def main() -> int:
         "--gps-port",
         default=None,
         help=(
-            "Septentrio SBF COM port (115200 8N1). Auto-detected by "
-            "device description if omitted."
+            "GNSS NMEA COM port (115200 8N1). Defaults to COM3, the RS232 "
+            "SBF-to-NMEA bridge, falling back to a Septentrio USB port."
         ),
     )
     parser.add_argument(

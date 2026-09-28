@@ -6,6 +6,9 @@ one, plus their end-to-end use in the sweep-and-hold engine:
 * :class:`capture.focus_axis.EncoderTracker` -- parses/unwraps the ``$ENC=n*``
   stream (a 12-bit angle that rolls over every motor revolution) into a monotonic
   count, and reports absence on the firmware ``-1`` sentinel.
+* :class:`capture.focus_axis.MultiEncoderTracker` -- routes the shared stream by
+  its ``$ENC=<cam>,<pos>*`` camera tag, so the three encoders on one SPI bus each
+  get their own accumulator and a camera switch cannot leak counts between them.
 * :class:`capture.focus_axis.EncoderAxis` -- reads that count back as the axis
   position (so a move that stalls simply doesn't advance), scales counts->pulses,
   and still seats gear lash upward via ``park_upward``.
@@ -27,7 +30,11 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(HOST))
 
 from capture.autofocus_v2 import AFStateV2, AutoFocusConfigV2, AutoFocusEngineV2  # noqa: E402
-from capture.focus_axis import EncoderAxis, EncoderTracker  # noqa: E402
+from capture.focus_axis import (  # noqa: E402
+    EncoderAxis,
+    EncoderTracker,
+    MultiEncoderTracker,
+)
 from frame_grabber_sim import FocusSceneSimulator  # noqa: E402
 
 
@@ -79,6 +86,92 @@ def test_tracker_parses_line_and_handles_sentinel() -> None:
     # firmware sentinel: encoder stopped responding
     assert t.update_line("$ENC=-1*") is True
     assert t.present is False
+
+
+# ── MultiEncoderTracker ──────────────────────────────────────────────────────
+
+
+def test_multi_routes_by_camera_tag() -> None:
+    t = MultiEncoderTracker()
+    assert t.reported_camera is None
+    assert t.update_line("$ENC=1,1000*") == 1
+    assert t.update_line("$ENC=1,1010*") == 1
+    assert t.position(1) == 10, t.position(1)
+    assert t.reported_camera == 1
+    # A different camera starts from its own zero and leaves camera 1 alone.
+    assert t.update_line("$ENC=2,3000*") == 2
+    assert t.update_line("$ENC=2,2990*") == 2
+    assert t.position(2) == -10, t.position(2)
+    assert t.position(1) == 10, "camera 1 moved when camera 2 reported"
+    assert t.reported_camera == 2
+    assert t.present(1) and t.present(2)
+    assert not t.present(3), "camera 3 never reported yet claims a reading"
+    assert t.position(3) == 0
+
+
+def test_multi_switch_cannot_leak_counts() -> None:
+    """The bug this class exists to prevent.
+
+    One accumulator would fold camera 2's absolute angle in by shortest path from
+    camera 1's last reading and invent up to half a revolution of travel. Here the
+    two shafts sit at opposite ends of the range, which is the worst case."""
+    t = MultiEncoderTracker()
+    for _ in range(3):  # bounce between cameras at maximum angular distance
+        t.update_line("$ENC=1,10*")
+        t.update_line("$ENC=2,2058*")
+    assert t.position(1) == 0, t.position(1)
+    assert t.position(2) == 0, t.position(2)
+
+    # Same stream through a single tracker: ~2048 counts of pure fiction.
+    single = EncoderTracker()
+    for _ in range(3):
+        single.update_line("$ENC=1,10*")
+        single.update_line("$ENC=2,2058*")
+    assert abs(single.position) > 1000, (
+        "single tracker no longer conflates shafts -- is this test still needed?"
+    )
+
+
+def test_multi_untagged_line_credited_to_default_camera() -> None:
+    """Old single-encoder firmware emits ``$ENC=<pos>*`` with no camera."""
+    t = MultiEncoderTracker()
+    assert t.update_line("$ENC=500*", default_cam=2) == 2
+    assert t.update_line("$ENC=520*", default_cam=2) == 2
+    assert t.position(2) == 20, t.position(2)
+    assert t.position(1) == 0
+    # No camera at all, tagged or defaulted: nothing to credit it to.
+    assert t.update_line("$ENC=520*") is None
+    # A camera we do not track is ignored rather than crashing.
+    assert t.update_line("$ENC=7,100*") is None
+    assert t.update_line("not an encoder line") is None
+
+
+def test_multi_sentinel_does_not_refresh_age() -> None:
+    """A ``-1`` proves the bus answered but the encoder did not, so the count is
+    no fresher than before -- otherwise a dead encoder would look live forever."""
+    t = MultiEncoderTracker()
+    t.update_line("$ENC=1,1000*")
+    assert t.present(1)
+    age_before = t.age_s(1)
+    assert age_before is not None
+    t.update_line("$ENC=1,-1*")
+    assert not t.present(1), "sentinel left the camera marked present"
+    assert (t.age_s(1) or 0.0) >= age_before, "failed read counted as fresh"
+    assert t.age_s(3) is None, "camera that never reported has an age"
+
+
+def test_multi_reset_drops_counts_and_freshness() -> None:
+    t = MultiEncoderTracker()
+    t.update_line("$ENC=1,1000*")
+    t.update_line("$ENC=1,1010*")
+    assert t.position(1) == 10
+    t.reset()
+    assert t.position(1) == 0 and not t.present(1)
+    assert t.age_s(1) is None and t.reported_camera is None
+    # And it still tracks afterwards.
+    t.update_line("$ENC=1,2000*")
+    t.update_line("$ENC=1,2005*")
+    assert t.position(1) == 5, t.position(1)
 
 
 # ── EncoderAxis ──────────────────────────────────────────────────────────────
@@ -258,6 +351,11 @@ def main() -> int:
     for t in (
         test_tracker_unwraps_both_directions,
         test_tracker_parses_line_and_handles_sentinel,
+        test_multi_routes_by_camera_tag,
+        test_multi_switch_cannot_leak_counts,
+        test_multi_untagged_line_credited_to_default_camera,
+        test_multi_sentinel_does_not_refresh_age,
+        test_multi_reset_drops_counts_and_freshness,
         test_encoder_axis_tracks_true_position_across_wrap,
         test_encoder_axis_counts_per_pulse_scaling,
         test_encoder_axis_inverted_polarity_tracks_and_reports,

@@ -27,6 +27,11 @@
 #define focusMotorPin ConnectorIO5  //H-bridge output for focus motor
 #define encoderPort ConnectorCOM1  //AMT203S absolute encoder (SPI master) on the focus-motor shaft. COM-0 is the RS232 collection link; COM-1 was free.
 
+// Encoder chip-select: COM-1's own SS pin, routed THROUGH the camera-selection
+// relay on the PCB so the relay picks which encoder receives a CS that the
+// ClearCore still toggles per byte (see encoderTransfer). Nothing to configure
+// here -- SS is part of encoderPort, at the same logic level as MISO/MOSI/SCK.
+
 // AMT20-series (AMT203S) SPI protocol -- see the Same Sky AMT20 datasheet. 12-bit
 // absolute (0..4095), SPI mode 0, data rate <= 1 MHz, and the CS line MUST be
 // released after EVERY byte. Command: send rd_pos, clock nop bytes while the
@@ -36,6 +41,24 @@ const uint8_t ENC_NOP = 0x00;      // no-op / wait byte
 const uint8_t ENC_RD_POS = 0x10;   // read-position command (also its echo)
 const int ENC_SPI_HZ = 500000;     // 500 kHz -- comfortably under the 1 MHz max
 const int ENC_ECHO_TRIES = 20;     // max nop reads waiting for the rd_pos echo
+const int ENC_READ_FAILED = -1;    // sentinel the host treats as "encoder absent"
+// Raw reads allowed while looking for two that agree; see readEncoderPosition.
+// 4 gives three chances to find a matching pair, which covers the observed
+// worst case of two consecutive corrupted samples after a switch.
+const int ENC_AGREE_TRIES = 4;
+
+// THREE ENCODERS, ONE BUS. MISO/MOSI/CLK stay on COM-1; COM-1's SS is fanned out
+// by that camera's own motor-selection relay, so "which encoder is on the bus" is
+// NOT separately controllable -- it IS the motor selection (HB1Select/HB2Select).
+// Consequence: only the SELECTED camera's encoder can be read. Reading another
+// one means throwing the H-bridge onto a different motor, so we never switch just
+// to poll outside the inter-sweep pause (see pollAllEncoders). $ENC is tagged
+// with the camera it came from, and the host keeps one unwrap accumulator each.
+const uint32_t relaySettleMs = 20;   // relay contact bounce before SPI is trustworthy
+int selectedCamera = 1;              // 1..3, mirrors HB1Select/HB2Select
+uint32_t lastCameraSelectMs = 0;     // when the relays last moved
+bool encoderDiscardNextRead = true;  // first read after a switch is thrown away
+
 // Encoder USB report cadence, gated by mode: the closed-loop AF (M4/M5) needs a
 // fresh shaft position every ~100 ms, but streaming that fast in the operational
 // modes (M0/M1/...) just floods the host log and USB link for no benefit. So poll
@@ -103,6 +126,13 @@ int sweepEndDelay = 500;
 int commandDelay = 10;
 int minTimeBetweenFrames = 209; //The maximum FPS of the Kaya camera system is 4.8
 int picsInPlaceDelay = 250;
+bool triggerExternal = false;  //M4 lockstep: when true the mode stops self-triggering and
+                               //the host fires every frame with "$T*". Set by $X1*/$X0*.
+                               //Why: the bench display and the camera are two independent
+                               //clocks. With M4 timing its own triggers the host cannot say
+                               //WHEN a frame is taken, so the panel's redraw landed at an
+                               //uncontrolled phase relative to the shutter and some frames
+                               //recorded the LCD partway between two scene positions.
 int i = 0;
 
 int focusTimeIncrement = 10;
@@ -173,6 +203,25 @@ const int MAX_ITER = 100;
 
 bool Command = false;
 
+// Point the H-bridge -- and therefore the SPI bus, since the same relays ground
+// the encoders' SS lines -- at camera 1..3. Single place that touches
+// HB1Select/HB2Select, so the selected camera, the settle deadline and the
+// discard flag can never disagree with the relay state.
+void selectCamera(int cam) {
+  if (cam < 1 || cam > 3) {
+    return;
+  }
+  // 0 at HB1Select selects camera 1 whatever HB2Select does; 1/0 selects
+  // camera 2 and 1/1 selects camera 3.
+  digitalWrite(HB1Select, cam != 1);
+  digitalWrite(HB2Select, cam == 3);
+  selectedCamera = cam;
+  lastCameraSelectMs = millis();
+  // The relays have just moved, so the next SPI read may catch contact bounce
+  // AND it would be the first sample of a different shaft -- throw it away.
+  encoderDiscardNextRead = true;
+}
+
 void setup() {
     M0Exists = false;
     M1Exists = false;
@@ -188,8 +237,7 @@ void setup() {
     focusMotorPin.Mode(Connector::OUTPUT_H_BRIDGE);  //H-bridge for focus motor
     digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
     digitalWrite(eventPin, true);  //same for Gamad events
-    digitalWrite(HB1Select, false); // 0 at HB1Select sets the focus mechanism selection to camera 1, no matter what happens on HB2Select
-    digitalWrite(HB2Select, false);  //  1 at HB1Select and 0 at HB2 select sets the focus mechanism to cam 2, while 1 and 1 sets to cam 3
+    selectCamera(1);
     
     focusMotorPin.State(0);
     attachInterrupt(digitalPinToInterrupt(TrigInterrupt), SweepOnTrig, FALLING);
@@ -314,7 +362,7 @@ void loop() {
       }
       break;
     case 4:
-      TakePicsInPlace();
+      if (!triggerExternal) { TakePicsInPlace(); }  //external: the host triggers via $T*
       break;
     case 5:
       SweepStepM5();
@@ -451,8 +499,24 @@ void CheckMessages() {
           m5Index = 0;
         }
       }
-      if (incomingSerialMessage.equals("$T*")){  //Mode 4, which is a focus adjustmet mode, allowing control of H-bridge driven focus motors. Locks servos in mid position and fires
+      if (incomingSerialMessage.equals("$T*")){  //Fires ONE camera trigger without disturbing the motors. Manual one-shot, and the host's per-frame trigger in M4 lockstep ($X1*).
         testClick();
+      }
+      if (incomingSerialMessage.equals("$E*")){  //Fires ONE GNSS event pulse, no camera, no motors.
+        eventClick();
+        Serial.println("$EventFired*");
+      }
+      if (incomingSerialMessage.equals("$X1*")){  //M4 lockstep ON: stop self-triggering, wait for $T* per frame
+        triggerExternal = true;
+        MoveAbsolutePosition(0, 0);  //TakePicsInPlace re-centred the servos every frame; with it
+                                     //suppressed, centre once here. Servos hold a commanded
+                                     //position, so per-trigger re-centring would only add jitter
+                                     //to the one thing that now has to be tightly timed.
+        Serial.println("Trigger: external, $T* per frame");
+      }
+      if (incomingSerialMessage.equals("$X0*")){  //M4 lockstep OFF: back to internally timed triggers
+        triggerExternal = false;
+        Serial.println("Trigger: internal, timed");
       }
       if (incomingSerialMessage.startsWith("$FT")){  //Focus pulse time-increment in ms per '+'/'-' char, e.g. "$FT1*". Default 10 (normal AF). The backlash test drops it to 1 so it can scan sub-10ms open times to find the minimum move; it restores 10 afterwards. Clamped [1,100].
         int reqInc = incomingSerialMessage.substring(3).toInt();  //toInt stops at the trailing '*'
@@ -490,20 +554,19 @@ void CheckMessages() {
         focusStrength = str3;
         focusTimeIncrement = 10;
       }
-      if (incomingSerialMessage.equals("$C1*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
+      // Selecting a camera moves BOTH the H-bridge and the encoder SPI bus --
+      // the same relays do both. See selectCamera().
+      if (incomingSerialMessage.equals("$C1*")){
         Serial.println("Camera 1 set");
-        digitalWrite(HB1Select, false); // 0 at HB1Select sets the focus mechanism selection to camera 1, no matter what happens on HB2Select
-        digitalWrite(HB2Select, false);       
+        selectCamera(1);
       } 
-      if (incomingSerialMessage.equals("$C2*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
+      if (incomingSerialMessage.equals("$C2*")){
         Serial.println("Camera 2 set");
-        digitalWrite(HB1Select, true); // 0 at HB1Select sets the focus mechanism selection to camera 1, no matter what happens on HB2Select
-        digitalWrite(HB2Select, false);       
+        selectCamera(2);
       } 
-      if (incomingSerialMessage.equals("$C3*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
+      if (incomingSerialMessage.equals("$C3*")){
         Serial.println("Camera 3 set");
-        digitalWrite(HB1Select, true); // 0 at HB1Select sets the focus mechanism selection to camera 1, no matter what happens on HB2Select
-        digitalWrite(HB2Select, true);       
+        selectCamera(3);
       }  
 
       if (incomingSerialMessage.equals("$reset*")){  //Resets. This includes cycling enable and rehoming. If motors had issues on startup this may solve it
@@ -639,36 +702,91 @@ void checkSerial0Message () {
 
 // One SPI byte to the AMT203S, releasing CS afterwards -- the AMT20 datasheet
 // requires the CS line be released after EVERY byte, not just per transaction.
+//
+// WARNING (multi-encoder PCB): this only works because COM-1's SS line runs
+// THROUGH the camera-selection relay contact. If SS is instead grounded straight
+// from the relay, these SpiSsMode calls toggle a ClearCore pin connected to no
+// encoder: the selected encoder sees CS held low for as long as its camera is
+// selected, never gets the inter-byte release, and every read comes back -1.
+//
+// LINE_ON drives the line LOW (SerialBase::RtsSsPinState writes `mode ==
+// LINE_OFF` to the pad, "ON is low voltage due to inversions"), which is the
+// assert the active-low CSB wants. Do not "fix" the apparent polarity.
+//
+// Verified against the AMT20 series datasheet (CUI / Same Sky, "Serial Peripheral
+// Interface Bus (SPI) on AMT203"), which states it twice over:
+//   "Each byte transmitted must be followed by a release of the Chip Select
+//    line (CSB)."
+//   "CSB high resets the clock counter, and terminates any command sequence."
+// So this is not a guard against a timing quirk -- CSB going high is the very
+// thing that ENDS a command. Held low, the encoder never finishes interpreting
+// rd_pos, so the echo the read loop waits for can never arrive. CUI's own sample
+// sketch is byte-for-byte this function, 10 us delay included.
 uint8_t encoderTransfer(uint8_t sendByte) {
-  encoderPort.SpiSsMode(SerialDriver::LINE_ON);   // assert CS (active low)
+  encoderPort.SpiSsMode(SerialDriver::LINE_ON);   // assert CS (CSB low)
   uint8_t data = encoderPort.SpiTransferData(sendByte);
-  encoderPort.SpiSsMode(SerialDriver::LINE_OFF);  // release CS
+  encoderPort.SpiSsMode(SerialDriver::LINE_OFF);  // release CS (CSB high)
   delayMicroseconds(10);                          // datasheet inter-byte guard
   return data;
 }
 
-// Read the 12-bit absolute position (0..4095) from the AMT203S focus-shaft
-// encoder. Returns -1 if the encoder never echoes rd_pos within the retry budget
-// (e.g. not connected, wiring/level-shift fault) so a bad read is distinguishable
-// from a real 0 position.
-int readEncoderPosition() {
+// ONE read of the 12-bit absolute position (0..4095) from the AMT203S focus-shaft
+// encoder. Returns ENC_READ_FAILED if the encoder never echoes rd_pos within the
+// retry budget (e.g. not connected, wiring/level-shift fault) so a bad read is
+// distinguishable from a real 0 position.
+//
+// Call readEncoderPosition() instead unless you specifically want an unverified
+// single sample -- a lone read is not trustworthy right after a relay switch.
+int readEncoderRaw() {
   uint8_t data = encoderTransfer(ENC_RD_POS);
   int tries = 0;
   while (data != ENC_RD_POS && tries++ < ENC_ECHO_TRIES) {
     data = encoderTransfer(ENC_NOP);  // encoder returns 0xA5 while it is busy
   }
   if (data != ENC_RD_POS) {
-    return -1;  // no acknowledgement -> read failed
+    return ENC_READ_FAILED;  // no acknowledgement -> read failed
   }
   int pos = (encoderTransfer(ENC_NOP) & 0x0F) << 8;  // MSB: only low 4 bits valid
   pos |= encoderTransfer(ENC_NOP);                    // LSB
   return pos;
 }
 
+// Position confirmed by two consecutive identical raw reads, or ENC_READ_FAILED.
+//
+// Changing the chip-select over leaves the newly selected encoder's command
+// state machine mid-sequence, and its first sample or two come back corrupted:
+// either ENC_READ_FAILED, or -- worse -- a plausible count with the MSB byte
+// dropped to 0x00 while the LSB is correct (3447 read as 119, 519 read as 7).
+// The second kind is silently wrong, so the host would stamp it into frame
+// metadata as a real lens position.
+//
+// Measured on the bench with all three encoders wired: ~0.1 bad samples per
+// $Cn*, ALWAYS within 500 ms of the switch, and 0 errors in 576 reads while the
+// selection was left static. So this is a per-switch hazard, not ambient noise.
+// A fixed settle delay long enough to cover it (~500 ms) would add 1.5 s to
+// pollAllEncoders' three-camera sweep, against an inter-sweep pause of ~300 ms;
+// requiring agreement costs one extra read (~0.3 ms) when the bus is healthy.
+//
+// Safe during a focus move: the two samples are a fraction of a millisecond
+// apart, far too close for real shaft motion to separate them.
+int readEncoderPosition() {
+  int prev = readEncoderRaw();
+  for (int i = 1; i < ENC_AGREE_TRIES; i++) {
+    int cur = readEncoderRaw();
+    // ENC_READ_FAILED twice is agreement on "no encoder", not on a position --
+    // keep trying, and fall through to the failure return if it never settles.
+    if (cur == prev && cur != ENC_READ_FAILED) {
+      return cur;
+    }
+    prev = cur;
+  }
+  return ENC_READ_FAILED;
+}
+
 // Poll the focus-shaft encoder and stream its absolute position to the host over
-// USB at a fixed cadence. Tagged "$ENC=<pos>*" so the capture app can parse it
-// without confusing it with the human-readable ack/debug lines; pos = -1 on a
-// failed read. Cadence is mode-gated (see encoderReportFast/SlowMs): fast in the
+// USB at a fixed cadence. Tagged "$ENC=<cam>,<pos>*" so the capture app can parse
+// it without confusing it with the human-readable ack/debug lines, and so it knows
+// WHICH camera's shaft the count belongs to; pos = -1 on a failed read. Cadence is mode-gated (see encoderReportFast/SlowMs): fast in the
 // focus modes M4/M5 where AF consumes it, slow elsewhere so it doesn't spam the
 // log. (The blocking sweep modes also only run loop() between sweeps.)
 void reportEncoder() {
@@ -676,11 +794,68 @@ void reportEncoder() {
   if (millis() - lastEncoderReport < interval) {
     return;
   }
+  // Relays that have only just moved are still bouncing, and the bus is shared,
+  // so a read now can come from neither shaft cleanly. Wait it out rather than
+  // publish a reading we would have to retract.
+  if (millis() - lastCameraSelectMs < relaySettleMs) {
+    return;
+  }
   lastEncoderReport = millis();
+  if (encoderDiscardNextRead) {
+    readEncoderRaw();  // throwaway: flush the state machine the switch interrupted
+    encoderDiscardNextRead = false;
+  }
   int pos = readEncoderPosition();
+  // Tagged with the camera because the host keeps one unwrap accumulator per
+  // encoder. An untagged count folded into the wrong accumulator would invent
+  // up to half a revolution of travel that never happened.
   Serial.print("$ENC=");
+  Serial.print(selectedCamera);
+  Serial.print(",");
   Serial.print(pos);
   Serial.println("*");
+}
+
+// Read ALL THREE encoders back to back and report each. Called between sweeps.
+//
+// Why: only the selected camera's encoder is on the bus, so during a line the
+// other two lenses are unobserved. A lens knocked off its parked count by
+// vibration would not surface until that camera was next selected, which could
+// be a whole flight later -- and by then there is no way to tell which frames
+// were shot before the drift and which after. Between sweeps nothing is being
+// triggered, so this is the one window where the bus can be borrowed.
+//
+// INTERLOCK: HB1Select/HB2Select choose which focus MOTOR the H-bridge drives,
+// not merely which encoder is on the bus. Switching them mid-burst would
+// energise a different lens's motor than the pulse was computed for, driving
+// the wrong lens by an amount nothing would record. So a running or queued
+// focus burst skips the poll outright rather than waiting for it -- the next
+// sweep boundary is a few seconds away and drift is not a per-sweep event.
+//
+// Cost is ~3*(relaySettleMs + up to 5 raw reads) plus the restore, i.e. roughly 70-80 ms
+// -- relaySettleMs dominates; a raw read is ~0.3 ms.
+// added to the inter-sweep pause. That lengthens the GPS inter-sweep gap the
+// correlator segments on, which is safe because segmentation triggers on gap >
+// SWEEP_TOW_GAP_MS: a LONGER pause is still unambiguously a sweep boundary.
+void pollAllEncoders() {
+  if (focusPhase != FP_IDLE || focusQHead != focusQTail) { return; }
+  int restore = selectedCamera;
+  for (int cam = 1; cam <= 3; cam++) {
+    selectCamera(cam);
+    delay(relaySettleMs);   // contacts still bouncing; a read now is meaningless
+    readEncoderRaw();       // throwaway: flush the state machine the switch interrupted
+    int pos = readEncoderPosition();
+    Serial.print("$ENC=");
+    Serial.print(cam);
+    Serial.print(",");
+    Serial.print(pos);
+    Serial.println("*");
+  }
+  // Restore before anything else can act on the selection: the focus +/-
+  // buttons drive whatever is selected, so leaving it moved would silently
+  // point the operator's next focus command at the wrong lens.
+  selectCamera(restore);
+  lastEncoderReport = millis();  // don't re-report what we just read
 }
 
 void EnableAndHome () { 
@@ -789,6 +964,7 @@ void Sweep(){
     }
   calculateSweepTime();
   Serial0.println("$Done*");  
+  pollAllEncoders();  //all three lenses, while nothing is being triggered
   MoveAbsolutePosition(verticalAngles[0]*6400/360,startAngle1);
   Serial0.println("$Ready*");
 }
@@ -824,6 +1000,7 @@ void SweepStepM5(){
   if (m5Index >= Positions) {
     m5Index = 0;  //continuous sweep
     calculateSweepTime();
+    pollAllEncoders();  //sweep boundary: same window as the blocking Sweep()
   }
 }
 
@@ -843,12 +1020,51 @@ void TakePicsInPlace(){
     MoveAbsolutePosition(0, 0);
 }
 
+void eventClick(){
+    //Fires ONE pulse on eventPin only -- the GNSS EXT_EVENT input. No camera
+    //trigger, no motor motion.
+    //
+    //Exists so the host can PROBE the GNSS link. The NMEA bridge sits on a
+    //physical RS232 port (COM3), whose Windows description says nothing about
+    //what is plugged into it, so "is the receiver there?" cannot be answered by
+    //enumerating ports the way the USB Septentrio was. The host instead fires
+    //this and waits for the bridge to emit the corresponding sentence: a reply
+    //proves the whole chain (PCB output -> receiver EXT_EVENT -> bridge -> RS232
+    //-> host), which is the only thing actually worth knowing.
+    //
+    //Deliberately NOT folded into $T*: in M4 lockstep the host fires $T* on every
+    //frame, and pulsing EXT_EVENT there would inject an event per frame into the
+    //receiver's log, which is exactly the stream the geotagging depends on being
+    //one-event-per-trigger.
+    digitalWrite(eventPin, false);  //optocoupler outputs are reversed: this asserts the event
+    delay(picDelayCurr);            //same width as the per-frame event pulse in Sweep()
+    digitalWrite(eventPin, true);
+}
+
 void testClick(){
-    //Takes a single picture, without disturbing the motors
+    //Takes a single picture, without disturbing the motors.
+    //
+    //Busy-waits calling serviceFocusPulse() instead of delay()-ing, for the same reason
+    //TakePicsInPlace does. A focus move is a TRAIN of short pulses (~focusTimeIncrement ms
+    //on, focusPulseGapMs off) sequenced from loop(), and delay() does not service it: the
+    //old delay(picsInPlaceDelay) here held the motor energised for up to 209 ms instead of
+    //~10 ms, roughly a 20x overshoot. That never bit while $T* was a manual one-shot with
+    //the lens parked, but in M4 lockstep the host fires $T* on every frame WHILE the
+    //autofocus is driving the lens, which puts it straight on the hot path.
+    //
+    //The camera's max FPS is enforced BEFORE the pulse rather than as a trailing delay, so
+    //a host whose cycle is already slower than minTimeBetweenFrames pays nothing for it,
+    //and the host is never left waiting on the MCU after the frame it asked for.
+    while ((millis()-lastFrameTime) < (uint32_t)minTimeBetweenFrames){
+      serviceFocusPulse();
+    }
     digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
-    delay (picDelayCurr);
+    lastFrameTime = millis();
+    //Subtraction, not (millis() < end): that form breaks on the ~49-day millis() rollover.
+    while ((millis()-lastFrameTime) < (uint32_t)picDelayCurr){
+      serviceFocusPulse();
+    }
     digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
-    delay(picsInPlaceDelay);
 }
 
 void stop() {

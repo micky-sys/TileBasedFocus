@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -24,7 +26,16 @@ from capture.attitude import (  # noqa: E402
     mirror_angle_for_frame,
     yaw_pitch_roll,
 )
-from capture.tiff_writer import _exiftool_camera_attitude_argv  # noqa: E402
+from capture.tiff_writer import (  # noqa: E402
+    _exiftool_camera_attitude_argv,
+    _exiftool_frame_tags_argv,
+    _rejected_tag_warnings,
+    XMP_CAMERA_NS,
+    focus_from_payload,
+    insert_jpeg_xmp_packet,
+    xmp_attitude_packet,
+    xmp_extratag,
+)
 
 
 class MirrorScheduleTests(unittest.TestCase):
@@ -122,6 +133,151 @@ class ExiftoolArgvTests(unittest.TestCase):
         self.assertIn("-XMP-Camera:Yaw=10.000000", argv)
         self.assertIn("-XMP-Camera:Pitch=-45.000000", argv)
         self.assertIn("-XMP-Camera:Roll=2.500000", argv)
+
+
+class FocusEncoderArgvTests(unittest.TestCase):
+    """The lens encoder reading -> EXIF:UserComment."""
+
+    FOCUS = {
+        "encoder_count": 930.0,
+        "encoder_epoch": "20260928T122656",
+        "encoder_camera": 1,
+        "selected_camera": 1,
+        "encoder_stale": False,
+        "encoder_age_s": 0.151,
+    }
+
+    def _user_comment(self, argv: list[str]) -> dict:
+        prefix = "-EXIF:UserComment="
+        hits = [a[len(prefix):] for a in argv if a.startswith(prefix)]
+        self.assertEqual(len(hits), 1, f"expected one UserComment arg, got {hits}")
+        return json.loads(hits[0])
+
+    def test_encoder_written_as_json(self) -> None:
+        argv = _exiftool_frame_tags_argv(
+            Path("x.tif"), focus=self.FOCUS, exiftool_exe=Path("exiftool.exe"),
+        )
+        self.assertEqual(
+            self._user_comment(argv),
+            {
+                "encoder_count": 930.0,
+                "encoder_epoch": "20260928T122656",
+                "encoder_camera": 1,
+            },
+        )
+
+    def test_zero_count_is_written(self) -> None:
+        """0.0 is a real encoder position, not a missing value."""
+        argv = _exiftool_frame_tags_argv(
+            Path("x.tif"),
+            focus={"encoder_count": 0.0, "encoder_epoch": "e"},
+            exiftool_exe=Path("exiftool.exe"),
+        )
+        self.assertEqual(self._user_comment(argv)["encoder_count"], 0.0)
+
+    def test_attitude_and_focus_share_one_invocation(self) -> None:
+        """ExifTool rewrites the whole TIFF; two passes would double export cost."""
+        argv = _exiftool_frame_tags_argv(
+            Path("x.tif"),
+            attitude={"yaw_deg": 10.0, "pitch_deg": None, "roll_deg": None},
+            focus=self.FOCUS,
+            exiftool_exe=Path("exiftool.exe"),
+        )
+        self.assertIn("-XMP-Camera:Yaw=10.000000", argv)
+        self.assertIn("encoder_count", "".join(argv))
+        self.assertEqual(argv[0], "exiftool.exe")
+        self.assertEqual(argv[-1], "x.tif")
+
+    def test_focus_without_count_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _exiftool_frame_tags_argv(
+                Path("x.tif"),
+                focus={"encoder_epoch": "20260928T122656"},
+                exiftool_exe=Path("exiftool.exe"),
+            )
+
+    def test_nothing_to_write_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            _exiftool_frame_tags_argv(
+                Path("x.tif"), exiftool_exe=Path("exiftool.exe"),
+            )
+
+    def test_focus_from_payload_ignores_non_dict(self) -> None:
+        self.assertIsNone(focus_from_payload({}))
+        self.assertIsNone(focus_from_payload({"focus": "nope"}))
+        self.assertEqual(focus_from_payload({"focus": self.FOCUS}), self.FOCUS)
+
+
+class NativeXmpTests(unittest.TestCase):
+    """We emit the XMP packet ourselves; ExifTool cannot write XMP-Camera."""
+
+    ATT = {"yaw_deg": 123.456, "pitch_deg": -45.0, "roll_deg": 1.5}
+
+    def test_packet_declares_namespace_and_values(self) -> None:
+        pkt = xmp_attitude_packet(self.ATT).decode("utf-8")
+        self.assertIn(XMP_CAMERA_NS, pkt)
+        self.assertIn('Camera:Yaw="123.456000"', pkt)
+        self.assertIn('Camera:Pitch="-45.000000"', pkt)
+        self.assertIn('Camera:Roll="1.500000"', pkt)
+
+    def test_partial_attitude_writes_only_known_angles(self) -> None:
+        pkt = xmp_attitude_packet({"yaw_deg": 1.0}).decode("utf-8")
+        self.assertIn("Camera:Yaw=", pkt)
+        self.assertNotIn("Camera:Pitch=", pkt)
+
+    def test_no_angles_yields_no_packet(self) -> None:
+        """Better no tag than an empty one."""
+        self.assertIsNone(xmp_attitude_packet({}))
+        self.assertIsNone(xmp_attitude_packet({"yaw_deg": None, "attitude_status": "x"}))
+
+    def test_extratag_is_tag_700_bytes(self) -> None:
+        pkt = xmp_attitude_packet(self.ATT)
+        code, dtype, count, value, writeonce = xmp_extratag(pkt)
+        self.assertEqual(code, 700)
+        self.assertEqual(dtype, 1)  # BYTE
+        self.assertEqual(count, len(pkt))
+        self.assertIs(value, pkt)
+        self.assertTrue(writeonce)
+
+    def test_jpeg_insert_adds_app1_after_soi(self) -> None:
+        import tempfile
+
+        pkt = xmp_attitude_packet(self.ATT)
+        p = Path(tempfile.mkdtemp()) / "t.jpg"
+        p.write_bytes(b"\xff\xd8" + b"\xff\xdb" + b"payload")
+        self.assertTrue(insert_jpeg_xmp_packet(p, pkt))
+        out = p.read_bytes()
+        self.assertTrue(out.startswith(b"\xff\xd8\xff\xe1"))
+        self.assertIn(b"http://ns.adobe.com/xap/1.0/\x00", out)
+        self.assertTrue(out.endswith(b"\xff\xdb" + b"payload"))
+        # Segment length field counts itself but not the 0xFFE1 marker.
+        declared = int.from_bytes(out[4:6], "big")
+        self.assertEqual(declared, len(b"http://ns.adobe.com/xap/1.0/\x00") + len(pkt) + 2)
+
+    def test_jpeg_insert_rejects_non_jpeg(self) -> None:
+        import tempfile
+
+        p = Path(tempfile.mkdtemp()) / "t.tif"
+        p.write_bytes(b"II*\x00rest")
+        self.assertFalse(insert_jpeg_xmp_packet(p, xmp_attitude_packet(self.ATT)))
+        self.assertEqual(p.read_bytes(), b"II*\x00rest")
+
+
+class RejectedTagWarningTests(unittest.TestCase):
+    """ExifTool exits 0 when one tag lands and another is refused."""
+
+    def test_unwritable_tag_is_surfaced(self) -> None:
+        stderr = "Warning: Sorry, XMP-Camera:Yaw doesn't exist or isn't writable\n"
+        self.assertEqual(len(_rejected_tag_warnings(stderr)), 1)
+
+    def test_duplicate_imagedescription_is_ignored(self) -> None:
+        """Fires on every frame we write; would drown the real signal."""
+        stderr = "Warning: Duplicate ImageDescription tag in IFD0 - x.tif\n"
+        self.assertEqual(_rejected_tag_warnings(stderr), [])
+
+    def test_empty_stderr(self) -> None:
+        self.assertEqual(_rejected_tag_warnings(""), [])
+        self.assertEqual(_rejected_tag_warnings(None), [])  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

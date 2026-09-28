@@ -20,6 +20,7 @@ from orthosim_core import (  # noqa: E402
     MAX_STEP_S,
     MIN_STEP_S,
     OrthoSimConfig,
+    free_run_dt,
     screen_gsd_cm,
     scroll_speed_screen_px_s,
     simulated_gsd_cm,
@@ -125,6 +126,43 @@ def test_pausing_discards_pending_steps_rather_than_banking_them() -> None:
     an exposure. Banking nudges while paused would replay the backlog as one
     enormous jump on un-pause -- a worse smear than the one we are removing."""
     assert step_dt([0.24, 0.24, 0.24], paused=True) == 0.0
+
+
+def test_free_run_dt_clamps_a_stall_but_passes_a_fast_repaint_through() -> None:
+    """The low clamp that ``step_dt`` needs would be a bug here: the repaint timer
+    runs at 8 ms and MIN_STEP_S would round every one of those up to 10, scrolling
+    the scene 25% fast while the ground-truth CSV recorded the honest speed."""
+    assert abs(free_run_dt(0.008) - 0.008) < 1e-9
+    assert MIN_STEP_S > 0.008, "this test is only meaningful while 8 ms < MIN_STEP_S"
+    # A stall (window drag, debugger) costs ground rather than teleporting the scene.
+    assert abs(free_run_dt(30.0) - MAX_STEP_S) < 1e-9
+    assert free_run_dt(-1.0) == 0.0
+    assert free_run_dt(0.5, paused=True) == 0.0
+
+
+def test_free_run_pause_forfeits_the_ground_instead_of_banking_it(monkeypatch) -> None:
+    """Un-pausing must resume, not replay. Holding the paused interval would jump the
+    scene by the whole pause in one repaint -- the smear the stepped rig removed."""
+    import orthosim_gui
+    from orthosim_gui import OrthoView
+
+    clock = [1000.0]
+    monkeypatch.setattr(orthosim_gui.time, "monotonic", lambda: clock[0])
+    s = type("S", (), {})()
+    s._paused = False
+    s._free_run_t = clock[0]
+
+    clock[0] += 0.008
+    assert abs(OrthoView._free_run_tick(s) - 0.008) < 1e-9
+
+    s._paused = True
+    clock[0] += 5.0
+    assert OrthoView._free_run_tick(s) == 0.0, "paused display moved the scene"
+
+    s._paused = False
+    clock[0] += 0.008
+    dt = OrthoView._free_run_tick(s)
+    assert abs(dt - 0.008) < 1e-9, f"un-pausing replayed the paused interval: {dt}"
 
 
 def test_the_lockstep_handshake_round_trips() -> None:

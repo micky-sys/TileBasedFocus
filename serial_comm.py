@@ -245,6 +245,23 @@ class FocusController:
         """
         self._send("$T*\n")
 
+    def fire_event(self) -> None:
+        """Fire one ``$E*``: a single GNSS EXT_EVENT pulse, no camera, no motors.
+
+        Implemented on the PCB as ``eventClick()``. This is the GNSS link probe:
+        the NMEA bridge hangs off a physical RS232 port whose Windows description
+        reveals nothing about what is attached, so the only honest test is to make
+        an event happen and see whether a sentence comes back. A reply proves the
+        entire chain end to end -- PCB output, receiver EXT_EVENT input, the
+        bridge's SBF-to-NMEA translation, the RS232 wiring, and the host's port.
+
+        Fire-and-forget: ``_send`` queues onto the TX thread, so the caller must
+        wait for the *GPS* side to show a sentence rather than expect a return
+        value here. The PCB also acknowledges with ``$EventFired*``, which only
+        proves the PCB got the command, not that the receiver saw the pulse.
+        """
+        self._send("$E*\n")
+
     def set_external_trigger(self, on: bool) -> None:
         """``$X1*`` / ``$X0*``: hand the M4 trigger timing to the host, or give it back.
 

@@ -12,6 +12,13 @@ Usage (from repo root)::
     py tools/gps_com_smoke.py --port COM3 --seconds 30
     py tools/gps_com_smoke.py --port COM16 --target-lat 32.17025 --target-lon 34.83136
 
+For the RS232 NMEA bridge (no SBF on the wire), ``--raw`` dumps the sentences
+themselves plus the gap between them, which is what tells you whether events
+arrive one-per-trigger or on a fixed schedule::
+
+    py tools/gps_com_smoke.py --port COM3 --raw --seconds 20
+    py tools/gps_com_smoke.py --port COM3 --raw --baud 38400 --seconds 20
+
 Pure side-thread is unused on purpose -- we just block-read in the main
 thread so Ctrl-C works cleanly without a Qt loop. Standalone of the
 GUI; only depends on ``pyserial`` and ``host/capture/sbf_parser.py``.
@@ -84,9 +91,63 @@ def _list_septentrio_ports() -> list[str]:
     return out
 
 
+def _raw_dump(ser, seconds: float) -> int:
+    """Print every line arriving on the port, with arrival time and inter-line gap.
+
+    For the NMEA bridge: we need to know WHICH sentences it emits and whether they
+    arrive one-per-trigger or on a fixed schedule. The gap column answers the
+    second question -- a PCB sweep gives ~200 ms between triggers and ~300 ms
+    across the inter-sweep pause, whereas a periodic talker gives a flat rate no
+    matter what the ClearCore does.
+
+    Uses ``readline`` so each line is timestamped when ITS newline arrives rather
+    than when a 4 KB chunk does; gaps are good to a few ms, which is plenty to
+    tell 200 ms from 300 ms.
+    """
+    t0 = time.monotonic()
+    deadline = t0 + seconds
+    last: float | None = None
+    counts: dict[str, int] = {}
+    n_lines = 0
+    n_binary = 0
+    while time.monotonic() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        now = time.monotonic()
+        line = raw.rstrip(b"\r\n")
+        if not line:
+            continue
+        n_lines += 1
+        gap = "         " if last is None else f"+{(now - last) * 1000:7.1f}ms"
+        last = now
+        try:
+            text = line.decode("ascii")
+        except UnicodeDecodeError:
+            n_binary += 1
+            text = f"<non-ASCII, {len(line)} bytes> {bytes(line[:24])!r}"
+        key = text.split(",", 1)[0] if text.startswith("$") else "<other>"
+        counts[key] = counts.get(key, 0) + 1
+        print(f"  t+{now - t0:7.3f}s {gap}  {text}")
+
+    print()
+    print(f"[raw] {n_lines} line(s) in {seconds:.1f}s"
+          + (f", {n_binary} non-ASCII (binary, not NMEA)" if n_binary else ""))
+    for key, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"[raw]   {key:<12} x{n}  ({n / seconds:.2f}/s)")
+    if not n_lines:
+        print("[raw] RESULT: nothing arrived -- wrong port, wrong baud, "
+              "or the bridge is not transmitting.")
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", required=True, help="COM port (e.g. COM3, COM16).")
+    ap.add_argument("--raw", action="store_true",
+                    help="Dump raw lines + arrival gaps instead of SBF-decoding. "
+                         "Use this on the NMEA bridge.")
     ap.add_argument("--seconds", type=float, default=20.0,
                     help="How long to listen before exiting (default 20).")
     ap.add_argument("--target-lat", type=float, default=32.170250,
@@ -109,6 +170,12 @@ def main() -> int:
     except serial.SerialException as exc:
         print(f"[smoke] open failed: {exc}", file=sys.stderr)
         return 2
+
+    if args.raw:
+        try:
+            return _raw_dump(ser, args.seconds)
+        finally:
+            ser.close()
 
     parser = SbfParser()
     total_bytes = 0
