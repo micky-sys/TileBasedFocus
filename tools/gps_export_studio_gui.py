@@ -105,16 +105,6 @@ from gps_export_studio_core import (  # noqa: E402
     load_embedded_camera,
     load_external_camera,
 )
-from capture.gps_fix import GpsFix  # noqa: E402
-from capture.tiff_writer import (  # noqa: E402
-    detect_exiftool,
-    exiftool_geotag,
-    exiftool_write_frame_tags,
-    focus_from_payload,
-    insert_jpeg_xmp_packet,
-    xmp_attitude_packet,
-)
-
 log = logging.getLogger("gps_export_studio")
 
 # Low-res ("_S") export width, in pixels. The full frame is ~13400 px wide;
@@ -202,9 +192,9 @@ class ExportWorker(QThread):
     """Encode every frame, injecting each record's GPS + attitude into EXIF.
 
     Mirrors Bay14Reader's exporter but stamps the studio's per-frame GPS
-    (embedded or correlated) and Yaw/Pitch/Roll into the output. TIFF GPS
-    + attitude flow through the existing encoders via the injected
-    metadata; JPEG GPS + attitude are written with ExifTool post-encode.
+    (embedded or correlated) and Yaw/Pitch/Roll into the output. All three
+    formats pick the metadata up from the injected ``merged_meta`` inside
+    the encoders, so there is no post-encode pass here.
     """
 
     progress = Signal(int, int, str)  # done, total, message
@@ -237,29 +227,22 @@ class ExportWorker(QThread):
         self._pattern = pattern
         self._recursive = recursive
         self._cancel = threading.Event()
-        self._exiftool = detect_exiftool()
 
     def cancel(self) -> None:
         self._cancel.set()
 
-    def _inject(self, merged_meta: dict, line_path: Path) -> tuple[Optional[GpsFix], Optional[dict]]:
-        """Overlay the store's GPS + attitude onto *merged_meta* in place.
-
-        Returns the ``(fix, attitude_dict)`` for the JPEG EXIF post-pass.
-        """
+    def _inject(self, merged_meta: dict, line_path: Path) -> None:
+        """Overlay the store's GPS + attitude onto *merged_meta* in place."""
         rec = self._store.lookup(
             line_path, merged_meta.get("sweep", 0), merged_meta.get("frame_in_sweep", 0),
         )
-        fix: Optional[GpsFix] = None
-        attitude: Optional[dict] = None
-        if rec is not None:
-            if rec.has_position:
-                fix = rec.to_gps_fix()
-                merged_meta["gps"] = fix.to_dict()
-            attitude = rec.attitude_dict()
-            if attitude is not None:
-                merged_meta["attitude"] = attitude
-        return fix, attitude
+        if rec is None:
+            return
+        if rec.has_position:
+            merged_meta["gps"] = rec.to_gps_fix().to_dict()
+        attitude = rec.attitude_dict()
+        if attitude is not None:
+            merged_meta["attitude"] = attitude
 
     def _encode_one(
         self,
@@ -267,16 +250,13 @@ class ExportWorker(QThread):
         arr,
         merged_meta: dict,
         cam: CameraInput,
-        fix: Optional[GpsFix],
-        attitude: Optional[dict],
         *,
         resize_width: Optional[int],
     ) -> None:
         """Encode one frame to *out_path* in the selected format.
 
-        TIFF GPS + attitude flow through the encoders via *merged_meta*;
-        JPEG GPS + attitude are stamped with ExifTool afterwards. The same
-        *merged_meta* / *fix* / *attitude* are used for the full-res and the
+        GPS, attitude, and the lens encoder flow through every encoder via
+        *merged_meta*. The same dict is used for the full-res and the
         low-res copy, so both carry identical EXIF.
         """
         if self._export_kind == "jpeg":
@@ -284,9 +264,6 @@ class ExportWorker(QThread):
                 out_path, arr, merged_meta,
                 quality=self._jpeg_quality, flip_lr=cam.flip_lr,
                 resize_width=resize_width,
-            )
-            self._write_jpeg_exif(
-                out_path, fix, attitude, focus_from_payload(merged_meta),
             )
         elif self._export_kind == "tiff_rgb":
             encode_tiff_rgb16(
@@ -300,40 +277,10 @@ class ExportWorker(QThread):
                 resize_width=resize_width,
             )
 
-    def _write_jpeg_exif(
-        self,
-        out_path: Path,
-        fix: Optional[GpsFix],
-        attitude: Optional[dict],
-        focus: Optional[dict] = None,
-    ) -> None:
-        if self._exiftool is None:
-            return
-        try:
-            if fix is not None and fix.has_position:
-                exiftool_geotag(out_path, fix, exiftool_exe=self._exiftool)
-            exiftool_write_frame_tags(
-                out_path, focus=focus, exiftool_exe=self._exiftool,
-            )
-            # Attitude last: ExifTool cannot write the Camera namespace, so we
-            # append the XMP segment ourselves once ExifTool is done rewriting.
-            if attitude is not None:
-                packet = xmp_attitude_packet(attitude)
-                if packet is not None:
-                    insert_jpeg_xmp_packet(out_path, packet)
-        except Exception as exc:
-            self.log_line.emit(f"  JPEG EXIF failed for {out_path.name}: {exc}")
-
     def run(self) -> None:
         cancelled = False
         done = 0
         total = 0
-        if self._export_kind == "jpeg" and self._exiftool is None:
-            self.log_line.emit(
-                "WARNING: ExifTool not found -- JPEG exports will have NO "
-                "GPS/attitude/encoder EXIF. (TIFF GPS still works; TIFF "
-                "attitude + encoder need ExifTool too.)"
-            )
         try:
             from bay14_export_core import discover_lines
 
@@ -363,14 +310,13 @@ class ExportWorker(QThread):
                     if self._cancel.is_set():
                         cancelled = True
                         break
-                    fix, attitude = self._inject(merged_meta, line_path)
+                    self._inject(merged_meta, line_path)
                     ext = "jpg" if self._export_kind == "jpeg" else "tif"
                     out_path = build_export_path(
                         self._out_dir, cam_label, line_path, merged_meta, ext,
                     )
                     self._encode_one(
-                        out_path, arr, merged_meta, cam, fix, attitude,
-                        resize_width=None,
+                        out_path, arr, merged_meta, cam, resize_width=None,
                     )
                     if self._export_low_res:
                         low_path = build_export_path(
@@ -378,7 +324,7 @@ class ExportWorker(QThread):
                             merged_meta, ext,
                         )
                         self._encode_one(
-                            low_path, arr, merged_meta, cam, fix, attitude,
+                            low_path, arr, merged_meta, cam,
                             resize_width=self._low_res_width,
                         )
                     done += 1
@@ -444,8 +390,7 @@ class StudioWindow(QMainWindow):
         self._log.setMaximumHeight(150)
         root.addWidget(self._log)
 
-        backend = "exiftool" if detect_exiftool() is not None else "tifffile / none (JPEG EXIF disabled)"
-        self.statusBar().showMessage(f"Ready. EXIF backend: {backend}")
+        self.statusBar().showMessage("Ready. EXIF backend: native (no ExifTool)")
         build_lab = QLabel(f"Build: {self._build_date}")
         build_lab.setStyleSheet("color: gray;")
         self.statusBar().addPermanentWidget(build_lab)

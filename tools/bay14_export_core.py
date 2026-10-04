@@ -45,19 +45,22 @@ from capture.raw_bay_writer import (  # noqa: E402
     recover_line_chunks,
     unpack_u14,
 )
-# GPS is embedded as a real EXIF GPS sub-IFD at write time: the encoders
-# reserve the GPSIFD (34853) pointer via ``reserved_gpsifd_extratag`` and then
-# append the sub-IFD with ``embed_exif_gps_subifd`` (no full-file rewrite, so
-# it is fast even on a network share). tifffile's ``extratags`` cannot emit a
-# sub-IFD, hence the manual append. The JSON ``gps`` block in
-# ``ImageDescription`` is still written too; the ExifTool post-pass
-# (``capture.tiff_writer.apply_exif_gps_from_image_description``) remains as a
-# fallback for TIFFs produced by older builds.
+# Every encoder here writes its metadata without ExifTool. tifffile's
+# ``extratags`` cannot emit IFD-pointer tags, so the GPS (34853) and Exif
+# (34665) sub-IFDs are appended after the write by ``embed_exif_gps_subifd``
+# and ``embed_exif_user_comment`` -- a few hundred bytes each, where ExifTool
+# would rewrite the whole multi-hundred-MB file. Attitude rides in as XMP
+# (tag 700), which is a plain byte array tifffile writes directly. JPEG gets
+# the same three in two APP1 segments via ``write_jpeg_metadata``. The JSON
+# ``gps`` block in ``ImageDescription`` is still written too; the ExifTool
+# post-pass (``capture.tiff_writer.apply_exif_gps_from_image_description``)
+# remains as a fallback for TIFFs produced by older builds.
 from capture.tiff_writer import (  # noqa: E402
     attitude_from_payload,
     embed_exif_gps_subifd,
-    exiftool_write_frame_tags,
+    embed_exif_user_comment,
     focus_from_payload,
+    write_jpeg_metadata,
     xmp_attitude_packet,
     xmp_extratag,
 )
@@ -483,14 +486,12 @@ def write_tiff_bayer_u16(
     (legacy ``bay14_to_tif`` behaviour).
 
     The per-frame ``gps`` block from the source chunk (if any) is
-    preserved verbatim in the TIFF's ``ImageDescription`` JSON, and a
-    post-export ExifTool pass
-    (:func:`capture.tiff_writer.apply_exif_gps_from_image_description`)
-    migrates it into a real EXIF GPS sub-IFD that Lightroom / Capture
-    One / ``exiftool -GPSLatitude`` all read. We deliberately do **not**
-    write EXIF GPS tags via tifffile's ``extratags`` here, because that
-    path pins them into IFD0 with the wrong namespace and confuses
-    every standard EXIF reader.
+    preserved verbatim in the TIFF's ``ImageDescription`` JSON, and
+    :func:`capture.tiff_writer.embed_exif_gps_subifd` appends it as a real
+    EXIF GPS sub-IFD that Lightroom / Capture One / ``exiftool
+    -GPSLatitude`` all read. We deliberately do **not** write EXIF GPS tags
+    via tifffile's ``extratags`` here, because that path pins them into
+    IFD0 with the wrong namespace and confuses every standard EXIF reader.
 
     Always emits ``ModifyDate`` (IFD0 306) + ``ExifImageWidth``
     (40962) + ``ExifImageHeight`` (40963) so the metadata panel in
@@ -540,10 +541,10 @@ def write_tiff_bayer_u16(
     # small block + patches the reserved 34853 pointer; no strip rewrite).
     if fix is not None and fix.has_position:
         embed_exif_gps_subifd(out_path, fix)
-    # Attitude already went in as XMP via extratags; only the encoder reading
-    # needs ExifTool (UserComment lives in the ExifIFD, which tifffile cannot
-    # create -- same pointer-tag limitation as the GPS sub-IFD).
-    exiftool_write_frame_tags(out_path, focus=focus_from_payload(meta_out))
+    # Attitude already went in as XMP via extratags; the encoder reading needs
+    # its own sub-IFD (UserComment lives in the ExifIFD -- same pointer-tag
+    # limitation as the GPS sub-IFD).
+    embed_exif_user_comment(out_path, focus_from_payload(meta_out))
 
 
 def encode_tiff_rgb16(
@@ -557,10 +558,8 @@ def encode_tiff_rgb16(
     """Demosaic Bayer RG → RGB uint16 TIFF (classic, NOT BigTIFF); applies 14→16 shift first.
 
     The per-frame ``gps`` block (if any) is carried through in the
-    ``ImageDescription`` JSON; run the post-export ExifTool pass
-    (:func:`capture.tiff_writer.apply_exif_gps_from_image_description`)
-    to materialise a proper EXIF GPS sub-IFD that standard EXIF
-    readers recognise.
+    ``ImageDescription`` JSON and appended as a proper EXIF GPS sub-IFD --
+    see :func:`write_tiff_bayer_u16`.
 
     The output is forced to classic TIFF (32-bit offsets) even at the
     13400x9528x3xu16 = 766 MB size point. ExifTool, Lightroom, GIS, etc.
@@ -613,8 +612,8 @@ def encode_tiff_rgb16(
     )
     if fix is not None and fix.has_position:
         embed_exif_gps_subifd(out_path, fix)
-    # Attitude already went in as XMP via extratags -- see encode_tiff_raw16.
-    exiftool_write_frame_tags(out_path, focus=focus_from_payload(merged_meta))
+    # Attitude already went in as XMP via extratags -- see write_tiff_bayer_u16.
+    embed_exif_user_comment(out_path, focus_from_payload(merged_meta))
 
 
 def encode_jpeg(
@@ -630,8 +629,12 @@ def encode_jpeg(
 
     With *flip_lr* True the BGR buffer is mirrored before JPEG encoding,
     so the "flip" GUI option behaves consistently across all three
-    export formats. (JPEG metadata is not emitted by this path -- the
-    full-fidelity metadata copy lives in the matching TIFF export.)
+    export formats.
+
+    GPS, attitude, and the lens encoder are stamped from *merged_meta* the
+    same way the TIFF encoders do it, so a JPEG export carries the same
+    metadata as its TIFF counterpart. The full-fidelity ``ImageDescription``
+    JSON has no JPEG equivalent and still lives only in the TIFF.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -652,6 +655,12 @@ def encode_jpeg(
     if not ok:
         raise RuntimeError(f"{out_path}: cv2.imencode failed")
     out_path.write_bytes(buf.tobytes())
+    write_jpeg_metadata(
+        out_path,
+        gps=_gps_fix_from_meta(merged_meta),
+        attitude=attitude_from_payload(merged_meta),
+        focus=focus_from_payload(merged_meta),
+    )
 
 
 @runtime_checkable

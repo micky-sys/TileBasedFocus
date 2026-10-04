@@ -15,13 +15,17 @@ GPS metadata, when available, is recorded two ways:
 1. **Always** as a structured ``gps`` block inside the ``ImageDescription``
    JSON. This is universally readable, lossless, and is what downstream
    processing should consume.
-2. **Authoritative EXIF GPS sub-IFD** via :func:`exiftool_geotag`. tifffile
-   cannot emit a real GPS sub-IFD (its ``extratags`` parameter pins tags
-   into IFD0, where tag 1=InteropIndex / 2=InteropVersion / ... collide
-   with the GPS namespace and confuse standard readers like Lightroom,
-   Capture One, or ``exiftool -GPSLatitude``). Post-processing with the
-   external ``exiftool`` binary is the only portable way to materialise
-   the canonical sub-IFD layout, so we offload that step to it.
+2. **Authoritative EXIF GPS sub-IFD** via :func:`embed_exif_gps_subifd`.
+   tifffile cannot emit a real GPS sub-IFD (its ``extratags`` parameter
+   pins tags into IFD0, where tag 1=InteropIndex / 2=InteropVersion / ...
+   collide with the GPS namespace and confuse standard readers like
+   Lightroom, Capture One, or ``exiftool -GPSLatitude``), so we append the
+   sub-IFD and its IFD0 pointer ourselves after the write. The lens-encoder
+   reading goes in the same way via :func:`embed_exif_user_comment`.
+   ``exiftool`` is still available here for patching files already on disk
+   (see ``tools/geotag_attitude_exports.py``), but the export path no longer
+   needs it: ExifTool rewrites the whole multi-hundred-MB file to change a
+   handful of metadata bytes.
 
 This writer is synchronous; drive the throughput from a background thread.
 """
@@ -215,31 +219,29 @@ def _build_gps_extratags(gps: GpsFix) -> list[tuple]:
 
 
 # ---------------------------------------------------------------------------
-# Embed a real EXIF GPS sub-IFD at write time (no full-file rewrite)
+# Embed real EXIF sub-IFDs after the write (no full-file rewrite)
 # ---------------------------------------------------------------------------
 #
-# The canonical EXIF GPS layout is a dedicated sub-IFD pointed to by IFD0 tag
-# 34853 (GPSIFD). tifffile cannot emit a sub-IFD, and post-processing with
-# ExifTool rewrites the whole multi-hundred-MB TIFF (slow, especially over a
-# network share). Instead we:
+# GPS belongs in a sub-IFD pointed to by IFD0 tag 34853, and UserComment in
+# one pointed to by 34665. tifffile emits neither: it refuses IFD-pointer
+# tags through ``extratags``. ExifTool can do it, but rewrites the whole
+# multi-hundred-MB TIFF to change a few dozen bytes (slow, and slower still
+# over a network share). Instead, once tifffile has written the file,
+# :func:`_embed_subifd` appends the sub-IFD at EOF, relocates **IFD0 alone**
+# there with one added pointer entry, and repoints the header.
 #
-#   1. Reserve the 34853 pointer (a LONG, placeholder 0) in IFD0 at write
-#      time via :func:`reserved_gpsifd_extratag` so tifffile lays it down in
-#      the correct sorted position -- no later IFD insertion / strip shift.
-#   2. After the file is written, append a small GPS sub-IFD block at EOF and
-#      overwrite the 4-byte pointer to point at it
-#      (:func:`embed_exif_gps_subifd`).
-#
-# Only a few hundred bytes are appended and 4 bytes patched; the pixel strip
-# is never moved, so this is effectively free even on SMB.
+# A few hundred bytes appended, the pixel strip never moved: measured at
+# 0.5 ms for a 255 MB full-frame TIFF.
 
 GPSIFD_TAG = 34853  # IFD0 -> GPS sub-IFD pointer
+EXIFIFD_TAG = 34665  # IFD0 -> Exif sub-IFD pointer
 
 # TIFF field type codes.
 _TT_BYTE = 1
 _TT_ASCII = 2
 _TT_LONG = 4
 _TT_RATIONAL = 5
+_TT_UNDEFINED = 7  # raw bytes; laid out exactly like BYTE
 
 
 def _gps_subifd_entries(gps: GpsFix) -> list[tuple[int, int, int, object]]:
@@ -288,16 +290,21 @@ def _gps_subifd_entries(gps: GpsFix) -> list[tuple[int, int, int, object]]:
     return entries
 
 
-def _build_gps_subifd_block(gps: GpsFix, base_offset: int, byteorder: str) -> bytes:
-    """Serialise a GPS sub-IFD that will live at *base_offset* in the file.
+def _build_subifd_block(
+    entries: list[tuple[int, int, int, object]],
+    base_offset: int,
+    byteorder: str,
+) -> bytes:
+    """Serialise a sub-IFD, tag-sorted *entries*, to live at *base_offset*.
 
     Layout: ``count(2) | entries(N*12) | next_ifd(4)=0 | value pool``.
-    Pooled values (RATIONALs, and ASCII/BYTE longer than 4 bytes) are
-    referenced by absolute file offset; *base_offset* must be even so every
-    pooled value lands on a word boundary (TIFF requirement).
+    Pooled values (RATIONALs, and byte-like values longer than 4 bytes) are
+    referenced by offset from the start of the enclosing TIFF structure;
+    *base_offset* must be even so every pooled value lands on a word
+    boundary (TIFF requirement). For a TIFF file that origin is the file
+    itself, for a JPEG APP1 it is the embedded TIFF header.
     """
     bo = byteorder
-    entries = _gps_subifd_entries(gps)
     n = len(entries)
     ifd_size = 2 + n * 12 + 4
     pool_base = base_offset + ifd_size
@@ -316,7 +323,7 @@ def _build_gps_subifd_block(gps: GpsFix, base_offset: int, byteorder: str) -> by
             if len(pool) % 2:
                 pool += b"\x00"
             val_field = struct.pack(bo + "I", off)
-        elif typ in (_TT_BYTE, _TT_ASCII):
+        elif typ in (_TT_BYTE, _TT_ASCII, _TT_UNDEFINED):
             data = value  # type: ignore[assignment]
             if len(data) <= 4:
                 val_field = data + b"\x00" * (4 - len(data))
@@ -327,20 +334,26 @@ def _build_gps_subifd_block(gps: GpsFix, base_offset: int, byteorder: str) -> by
                     pool += b"\x00"
                 val_field = struct.pack(bo + "I", off)
         else:  # pragma: no cover - defensive
-            raise ValueError(f"unsupported GPS field type {typ}")
+            raise ValueError(f"unsupported sub-IFD field type {typ}")
         out += struct.pack(bo + "HHI", tag, typ, count)
         out += val_field
     out += struct.pack(bo + "I", 0)  # next IFD = none
     return bytes(out) + bytes(pool)
 
 
-def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bool:
-    """Embed a canonical EXIF GPS sub-IFD into a classic TIFF *in place*.
+def _embed_subifd(
+    path: Path,
+    pointer_tag: int,
+    entries: list[tuple[int, int, int, object]],
+    *,
+    fsync: bool = False,
+) -> bool:
+    """Embed a sub-IFD into a classic TIFF *in place*, under *pointer_tag*.
 
-    tifffile refuses to write IFD-pointer tags (e.g. 34853) through its
-    ``extratags`` API, so we add the pointer ourselves. The image strip is
-    never moved: we relocate **only IFD0** to EOF with one extra entry, the
-    GPS pointer (34853), then append the GPS sub-IFD after it and repoint the
+    tifffile refuses to write IFD-pointer tags (34853 GPSIFD, 34665 ExifIFD)
+    through its ``extratags`` API, so we add the pointer ourselves. The image
+    strip is never moved: we relocate **only IFD0** to EOF with one extra
+    entry, the pointer, then append the sub-IFD after it and repoint the
     TIFF header's first-IFD offset. Existing IFD0 entries are copied
     byte-for-byte, so any values they reference by offset (ImageDescription,
     StripOffsets, BitsPerSample, ...) stay valid where they are.
@@ -349,14 +362,15 @@ def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bo
     (Lightroom / Capture One / ``exiftool -GPSLatitude``), produced by
     appending only a few hundred bytes -- fast even over a network share.
 
-    If a GPSIFD (34853) pointer already exists in IFD0 (e.g. a re-embed),
-    its value is patched in place instead of relocating IFD0.
+    If *pointer_tag* already exists in IFD0 (e.g. a re-embed), its value is
+    patched in place instead of relocating IFD0.
 
-    Returns ``True`` when a sub-IFD was written, ``False`` when *gps* has no
-    position. Raises ``ValueError`` for non-classic-TIFF input.
+    Embedding two sub-IFDs means two calls and therefore two IFD0
+    relocations; the stale copy is a few hundred dead bytes in a file of
+    hundreds of MB, which is cheaper than the bookkeeping to avoid it.
+
+    Raises ``ValueError`` for non-classic-TIFF input.
     """
-    if gps is None or not gps.has_position:
-        return False
     path = Path(path)
     with open(path, "r+b") as fh:
         header = fh.read(8)
@@ -371,7 +385,7 @@ def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bo
         magic = struct.unpack(bo + "H", header[2:4])[0]
         if magic != 42:
             raise ValueError(
-                f"{path}: not a classic TIFF (magic={magic}); GPS embed "
+                f"{path}: not a classic TIFF (magic={magic}); sub-IFD embed "
                 f"supports classic TIFF only",
             )
         ifd0_off = struct.unpack(bo + "I", header[4:8])[0]
@@ -386,7 +400,7 @@ def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bo
         existing_ptr_pos: Optional[int] = None
         for i in range(n):
             tag = struct.unpack_from(bo + "H", entries_blob, i * 12)[0]
-            if tag == GPSIFD_TAG:
+            if tag == pointer_tag:
                 existing_ptr_pos = ifd0_off + 2 + i * 12 + 8
                 break
 
@@ -399,43 +413,42 @@ def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bo
             return pos
 
         if existing_ptr_pos is not None:
-            # Re-embed: keep IFD0 where it is, just append a fresh GPS block
-            # and repoint the existing 34853 value.
-            gps_off = _aligned_eof()
-            fh.seek(gps_off)
-            fh.write(_build_gps_subifd_block(gps, gps_off, bo))
+            # Re-embed: keep IFD0 where it is, just append a fresh sub-IFD
+            # block and repoint the existing pointer value.
+            sub_off = _aligned_eof()
+            fh.seek(sub_off)
+            fh.write(_build_subifd_block(entries, sub_off, bo))
             fh.seek(existing_ptr_pos)
-            fh.write(struct.pack(bo + "I", gps_off))
+            fh.write(struct.pack(bo + "I", sub_off))
         else:
-            # Relocate IFD0 (n+1 entries) to EOF, append GPS sub-IFD after it,
+            # Relocate IFD0 (n+1 entries) to EOF, append the sub-IFD after it,
             # repoint the header. Image strip untouched.
-            entries: list[tuple[int, bytes]] = []
+            ifd0_entries: list[tuple[int, bytes]] = []
             for i in range(n):
                 e = entries_blob[i * 12 : i * 12 + 12]
                 tag = struct.unpack_from(bo + "H", e, 0)[0]
-                entries.append((tag, e))
+                ifd0_entries.append((tag, e))
 
             new_ifd0_off = _aligned_eof()
             new_ifd0_size = 2 + (n + 1) * 12 + 4
-            gps_off = new_ifd0_off + new_ifd0_size
+            sub_off = new_ifd0_off + new_ifd0_size
 
-            gps_entry = (
-                GPSIFD_TAG,
-                struct.pack(bo + "HHI", GPSIFD_TAG, _TT_LONG, 1)
-                + struct.pack(bo + "I", gps_off),
-            )
-            entries.append(gps_entry)
-            entries.sort(key=lambda t: t[0])
+            ifd0_entries.append((
+                pointer_tag,
+                struct.pack(bo + "HHI", pointer_tag, _TT_LONG, 1)
+                + struct.pack(bo + "I", sub_off),
+            ))
+            ifd0_entries.sort(key=lambda t: t[0])
 
             new_ifd0 = bytearray()
             new_ifd0 += struct.pack(bo + "H", n + 1)
-            for _, e in entries:
+            for _, e in ifd0_entries:
                 new_ifd0 += e
             new_ifd0 += struct.pack(bo + "I", next_ifd)
 
             fh.seek(new_ifd0_off)
             fh.write(bytes(new_ifd0))
-            fh.write(_build_gps_subifd_block(gps, gps_off, bo))
+            fh.write(_build_subifd_block(entries, sub_off, bo))
 
             fh.seek(4)
             fh.write(struct.pack(bo + "I", new_ifd0_off))
@@ -444,6 +457,93 @@ def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bo
         if fsync:
             os.fsync(fh.fileno())
     return True
+
+
+def embed_exif_gps_subifd(path: Path, gps: GpsFix, *, fsync: bool = False) -> bool:
+    """Embed a canonical EXIF GPS sub-IFD (34853) into a classic TIFF in place.
+
+    Returns ``True`` when a sub-IFD was written, ``False`` when *gps* has no
+    position. See :func:`_embed_subifd` for the mechanics.
+    """
+    if gps is None or not gps.has_position:
+        return False
+    return _embed_subifd(path, GPSIFD_TAG, _gps_subifd_entries(gps), fsync=fsync)
+
+
+# ---------------------------------------------------------------------------
+# The lens encoder reading (Exif sub-IFD / UserComment)
+# ---------------------------------------------------------------------------
+
+_EXIF_VERSION = 36864  # UNDEFINED x 4, "0232" = EXIF 2.32
+_EXIF_USER_COMMENT = 37510  # UNDEFINED: 8-byte charset code, then the text
+
+# EXIF 2.32 prefixes UserComment with a character-set code. Readers that
+# skip the prefix show 8 bytes of leading garbage, so it is not optional.
+_USER_COMMENT_ASCII = b"ASCII\x00\x00\x00"
+
+FOCUS_EXIF_KEYS: tuple[str, ...] = (
+    "encoder_count",
+    "encoder_epoch",
+    "encoder_camera",
+)
+"""``focus`` keys copied into ``EXIF:UserComment``.
+
+``encoder_epoch`` rides along with the count because counts are only
+comparable within one epoch -- differencing two frames from different
+epochs is meaningless, and the consumer cannot tell without it.
+"""
+
+
+def focus_user_comment(focus: dict[str, Any]) -> Optional[str]:
+    """The lens-encoder JSON destined for ``EXIF:UserComment``, or ``None``.
+
+    No standard EXIF tag carries an absolute lens-encoder count, so the
+    reading goes in as compact JSON. ``None`` when there is no count to
+    write -- the epoch alone says nothing. Shared by the native writers and
+    the ExifTool argv builder so the two can't drift apart.
+    """
+    payload = {k: focus[k] for k in FOCUS_EXIF_KEYS if focus.get(k) is not None}
+    if "encoder_count" not in payload:
+        return None
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _exif_subifd_entries(user_comment: str) -> list[tuple[int, int, int, object]]:
+    """Exif sub-IFD entries, sorted by tag: ExifVersion + UserComment.
+
+    ExifVersion is mandatory in an Exif IFD; without it some readers decline
+    to parse the IFD at all and the comment silently disappears.
+    """
+    comment = _USER_COMMENT_ASCII + user_comment.encode("ascii")
+    return [
+        (_EXIF_VERSION, _TT_UNDEFINED, 4, b"0232"),
+        (_EXIF_USER_COMMENT, _TT_UNDEFINED, len(comment), comment),
+    ]
+
+
+def embed_exif_user_comment(
+    path: Path,
+    focus: Optional[dict[str, Any]],
+    *,
+    fsync: bool = False,
+) -> bool:
+    """Embed the lens-encoder reading as EXIF UserComment, in place.
+
+    UserComment lives in the Exif sub-IFD (IFD0 tag 34665) -- another
+    IFD-pointer tag tifffile refuses -- so it goes in by the same
+    append-and-repoint route as the GPS sub-IFD, and for the same reason:
+    ExifTool would rewrite the whole multi-hundred-MB file to add ~60 bytes.
+
+    Returns ``False`` when *focus* carries no encoder count.
+    """
+    if not focus:
+        return False
+    comment = focus_user_comment(focus)
+    if comment is None:
+        return False
+    return _embed_subifd(
+        path, EXIFIFD_TAG, _exif_subifd_entries(comment), fsync=fsync,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +739,84 @@ def xmp_extratag(packet: bytes) -> tuple:
 
 _JPEG_SOI = b"\xff\xd8"
 _JPEG_APP1 = b"\xff\xe1"
+_JPEG_SOS = 0xDA
+_JPEG_APP1_MARKER = 0xE1
 _JPEG_XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+_JPEG_EXIF_HEADER = b"Exif\x00\x00"
+
+
+def _jpeg_app1_segment(body: bytes, *, what: str) -> bytes:
+    """Frame *body* as an APP1 segment (marker + length + body)."""
+    seg_len = len(body) + 2  # the length field counts itself
+    if seg_len > 0xFFFF:
+        raise ValueError(f"{what} too large for one APP1 segment: {seg_len}")
+    return _JPEG_APP1 + struct.pack(">H", seg_len) + body
+
+
+def _jpeg_has_exif(data: bytes) -> bool:
+    """True if the JPEG already carries an APP1 Exif segment.
+
+    Walks the marker chain rather than searching for ``Exif\\0\\0``, which
+    would hit false positives in entropy-coded pixel data.
+    """
+    pos = 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        marker = data[pos + 1]
+        if marker == _JPEG_SOS:  # start of scan: no more metadata segments
+            return False
+        if marker == 0xFF:  # fill byte before the real marker
+            pos += 1
+            continue
+        if 0xD0 <= marker <= 0xD9 or marker == 0x01:  # standalone, no payload
+            pos += 2
+            continue
+        if (
+            marker == _JPEG_APP1_MARKER
+            and data[pos + 4 : pos + 4 + len(_JPEG_EXIF_HEADER)] == _JPEG_EXIF_HEADER
+        ):
+            return True
+        pos += 2 + struct.unpack_from(">H", data, pos + 2)[0]
+    return False
+
+
+def build_exif_app1(
+    *,
+    gps: Optional[GpsFix] = None,
+    focus: Optional[dict[str, Any]] = None,
+) -> Optional[bytes]:
+    """Build a complete APP1 Exif body (GPS + Exif sub-IFDs), or ``None``.
+
+    JPEG carries EXIF as a self-contained little-endian TIFF inside one APP1
+    segment, so the sub-IFD serialiser the TIFF writer uses works here
+    verbatim -- offsets are simply relative to the embedded TIFF header
+    rather than to the file. IFD0 holds nothing but the two pointers.
+
+    ``None`` when neither a position nor an encoder count was supplied.
+    """
+    subifds: list[tuple[int, list[tuple[int, int, int, object]]]] = []
+    if gps is not None and gps.has_position:
+        subifds.append((GPSIFD_TAG, _gps_subifd_entries(gps)))
+    comment = focus_user_comment(focus) if focus else None
+    if comment is not None:
+        subifds.append((EXIFIFD_TAG, _exif_subifd_entries(comment)))
+    if not subifds:
+        return None
+    subifds.sort(key=lambda t: t[0])  # IFD entries must be in tag order
+
+    bo = "<"
+    header = b"II" + struct.pack(bo + "HI", 42, 8)  # IFD0 starts at offset 8
+    ifd0 = bytearray(struct.pack(bo + "H", len(subifds)))
+    blocks = bytearray()
+    # 2 + n*12 + 4 is even and 8 is even, so every block starts word-aligned.
+    offset = 8 + 2 + len(subifds) * 12 + 4
+    for tag, entries in subifds:
+        block = _build_subifd_block(entries, offset, bo)
+        ifd0 += struct.pack(bo + "HHI", tag, _TT_LONG, 1)
+        ifd0 += struct.pack(bo + "I", offset)
+        blocks += block
+        offset += len(block)
+    ifd0 += struct.pack(bo + "I", 0)  # no IFD1: we write no thumbnail
+    return _JPEG_EXIF_HEADER + header + bytes(ifd0) + bytes(blocks)
 
 
 def insert_jpeg_xmp_packet(path: Path, packet: bytes) -> bool:
@@ -652,26 +829,53 @@ def insert_jpeg_xmp_packet(path: Path, packet: bytes) -> bool:
     if not data.startswith(_JPEG_SOI):
         log.warning("not a JPEG, skipping XMP insert: %s", path)
         return False
-    body = _JPEG_XMP_HEADER + packet
-    seg_len = len(body) + 2  # the length field counts itself
-    if seg_len > 0xFFFF:
-        raise ValueError(f"XMP packet too large for one APP1 segment: {seg_len}")
-    segment = _JPEG_APP1 + struct.pack(">H", seg_len) + body
+    segment = _jpeg_app1_segment(_JPEG_XMP_HEADER + packet, what="XMP packet")
     path.write_bytes(data[:2] + segment + data[2:])
     return True
 
 
-FOCUS_EXIF_KEYS: tuple[str, ...] = (
-    "encoder_count",
-    "encoder_epoch",
-    "encoder_camera",
-)
-"""``focus`` keys copied into ``EXIF:UserComment``.
+def write_jpeg_metadata(
+    path: Path,
+    *,
+    gps: Optional[GpsFix] = None,
+    attitude: Optional[dict[str, Any]] = None,
+    focus: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Stamp GPS, lens encoder, and attitude into a JPEG in one rewrite.
 
-``encoder_epoch`` rides along with the count because counts are only
-comparable within one epoch -- differencing two frames from different
-epochs is meaningless, and the consumer cannot tell without it.
-"""
+    GPS and the encoder go in as a standard APP1 Exif segment; attitude keeps
+    its own APP1 XMP segment, because Pix4D's ``Camera`` namespace has no
+    EXIF equivalent. Exif is written first, as EXIF 2.32 expects it to be the
+    leading APP1.
+
+    Returns ``False`` when nothing was written -- no metadata supplied, or
+    the file is not a JPEG.
+    """
+    data = path.read_bytes()
+    if not data.startswith(_JPEG_SOI):
+        log.warning("not a JPEG, skipping metadata insert: %s", path)
+        return False
+
+    segments: list[bytes] = []
+    exif = build_exif_app1(gps=gps, focus=focus)
+    if exif is not None:
+        if _jpeg_has_exif(data):
+            # We build a segment from scratch rather than merging into one,
+            # and a second Exif APP1 is ignored by readers that stop at the
+            # first -- so adding ours would quietly do nothing. Attitude
+            # still goes in: XMP is a separate segment.
+            log.warning("JPEG already has an Exif segment, keeping it: %s", path)
+        else:
+            segments.append(_jpeg_app1_segment(exif, what="EXIF block"))
+    packet = xmp_attitude_packet(attitude) if attitude is not None else None
+    if packet is not None:
+        segments.append(
+            _jpeg_app1_segment(_JPEG_XMP_HEADER + packet, what="XMP packet")
+        )
+    if not segments:
+        return False
+    path.write_bytes(data[:2] + b"".join(segments) + data[2:])
+    return True
 
 
 def _exiftool_frame_tags_argv(
@@ -727,14 +931,10 @@ def _exiftool_frame_tags_argv(
         wrote_any = True
 
     if focus is not None:
-        # No standard EXIF tag carries an absolute lens-encoder count, so the
-        # reading goes into UserComment as compact JSON.
-        payload = {k: focus[k] for k in FOCUS_EXIF_KEYS if focus.get(k) is not None}
-        if "encoder_count" not in payload:
+        comment = focus_user_comment(focus)
+        if comment is None:
             raise ValueError(f"focus block has no encoder_count for {path}")
-        args.append(
-            "-EXIF:UserComment=" + json.dumps(payload, separators=(",", ":"))
-        )
+        args.append("-EXIF:UserComment=" + comment)
         wrote_any = True
 
     if not wrote_any:

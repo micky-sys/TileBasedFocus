@@ -5406,3 +5406,103 @@ quantization notice, not a failure.
 * Session logs are buffered and live on the Drive path, so the minutes before a hard crash are
   lost. Worth moving to local disk if the BSODs continue.
 * Both apps rebuilt to `C:\Parallax Apps` (§4 rules: local NTFS workpath, then mirror).
+
+---
+
+## 50. ExifTool out of the export path for real (2026-10-04)
+
+Started as a question about §49.3: if we made ExifTool irrelevant, why does the studio still
+open it on every frame?
+
+Because §49.3 only retired it from **attitude**, and in the same breath gave it a new job.
+The encoder reading went into `EXIF:UserComment`, which lives in the ExifIFD — a pointer tag
+`tifffile` refuses — so that write called ExifTool. Worse, it called it *more* often than the
+old attitude write ever did: the attitude call was guarded by `if attitude is not None`, while
+§49.2's `$ENC` numbering fix is precisely what made the focus block stop being omitted. A
+JPEG export with GPS was spawning ExifTool **twice per frame** (geotag, then UserComment);
+TIFF once. The TIFF case is the expensive one — `-overwrite_original` rewrites the file
+wholesale, so a 766 MB RGB frame was fully re-written to append ~60 bytes of JSON.
+
+Nothing was broken. It was just paying a rewrite-the-world cost to move a handful of bytes,
+and claiming in three docstrings that ExifTool was doing the GPS work it had stopped doing.
+
+### 50.1 The ExifIFD is the GPS sub-IFD again, with a different tag number
+
+Almost no new code. `embed_exif_gps_subifd` was already doing the exact surgery — relocate
+**IFD0 alone** to EOF with one extra pointer entry, append the sub-IFD, repoint the header,
+never touch the pixel strip. Splitting its body into `_embed_subifd(path, pointer_tag,
+entries)` made 34665 (ExifIFD) a caller alongside 34853 (GPSIFD).
+
+Measured on a real full-size frame (13400×9528, 255 MB): **0.5 ms per embed, 888 bytes
+appended for both**. That is what the ExifTool pass was costing a 255 MB rewrite to achieve.
+
+Two sub-IFDs means two calls and therefore two IFD0 relocations, leaving one stale copy of a
+few hundred dead bytes. Cheaper than the bookkeeping to avoid it, and the file stays valid.
+
+⚠️ **`ExifVersion` is not optional.** An Exif IFD without 36864 is declined outright by some
+readers and the comment silently disappears — the same class of silent-loss failure as §49.3's
+unregistered XMP namespace. It goes in as `UNDEFINED "0232"` next to the comment. `UserComment`
+itself needs its 8-byte `ASCII\0\0\0` charset prefix or readers show eight bytes of garbage.
+
+### 50.2 JPEG EXIF is just a TIFF in a box
+
+JPEG carries EXIF as a self-contained little-endian TIFF inside one APP1 segment, so the same
+sub-IFD serialiser works unchanged — only the offset origin moves from the file to the
+embedded TIFF header. `build_exif_app1` assembles an IFD0 holding nothing but the two
+pointers; `write_jpeg_metadata` lays down Exif and XMP in one rewrite, Exif first.
+
+`cv2.imencode` emits no EXIF at all, so we build the segment from scratch rather than merging.
+`_jpeg_has_exif` walks the marker chain instead of searching for `Exif\0\0`, which would hit
+false positives in entropy-coded pixel data; if a foreign JPEG already has one we keep it and
+still write the XMP.
+
+The payoff is in `encode_jpeg`: it now reads `gps`/`attitude`/`focus` out of `merged_meta`
+exactly like the TIFF encoders, which deleted the studio's whole `_write_jpeg_exif` method,
+its ExifTool detection, the "JPEG exports will have NO EXIF" warning, and the `(fix, attitude)`
+tuple that was being threaded down two call levels. ~90 lines out of the GUI.
+
+**Note:** `encode_jpeg` is also Bay14Reader's, so its JPEGs start carrying EXIF too. Consistent
+with the TIFF behaviour, but it is a change outside the studio.
+
+### 50.3 What this does NOT cover
+
+`tools/geotag_attitude_exports.py` and the `sbf_geotag_*` tools still shell out — they patch
+TIFFs already on disk. That is now solvable with this same machinery (it is the "IFD surgery of
+the `embed_exif_gps_subifd` kind" §49.3 asked for), with one extra piece: XMP tag 700 is a
+value tag, not a pointer, so adding it to an existing file needs IFD0 relocation with arbitrary
+entries rather than a sub-IFD. Left alone deliberately.
+
+`ExifImageWidth`/`Height` (40962/40963) are still pinned in IFD0 rather than moved into the
+real ExifIFD we now create. Cosmetic.
+
+### 50.4 Verification, and the gap in it
+
+`tools/test_bay14_export_core.py` gains four checks: the TIFF UserComment round-trip (read back
+with `tifffile` **and** Pillow, confirming `encoder_stale` never reaches the file and the GPS
+sub-IFD survives the second IFD0 relocation), the JPEG APP1 round-trip, an ExifTool cross-check,
+and `test_export_path_never_spawns_exiftool`, which swaps `tiff_writer.subprocess` for a stub
+that raises on any call. That last one is the regression guard — verified it actually fires by
+calling the old path under the stub.
+
+⚠️ **The ExifTool cross-check did not run.** `detect_exiftool()` returns `None` on this dev box,
+so it soft-skipped. Two independent parsers (tifffile, Pillow) agree with us, which is good
+evidence but not the strict second opinion. **Run the suite once on a machine that has
+`C:\ExifTool\exiftool-13.58_64\exiftool.exe`.**
+
+373 tests pass across `tools/`.
+
+### 50.5 Build & deploy
+
+Rebuilt and mirrored to `C:\Parallax Apps\Parallax Export Studio` per §4 (PyInstaller onedir to
+`%LOCALAPPDATA%\ParallaxExportStudioBuild`, then `robocopy /MIR`). COLLECT took **20 s**, well
+under the 30 s local-NTFS mark — the §4 smoking gun for an accidental on-Drive build is ~160 s.
+7166 files / 1.03 GB, zero failures.
+
+Smoke-tested **twice**: the local build first, so a bad bundle could not clobber a working
+install, then the deployed EXE. Both reported a non-empty `MainWindowTitle`. Since a title alone
+does not prove *this* code shipped, the deployed window was captured with `PrintWindow` and its
+status bar reads **"Ready. EXIF backend: native (no ExifTool)"**.
+
+> Capture tip: `SetForegroundWindow` from an agent shell is blocked by Windows, so
+> `CopyFromScreen` grabs whatever is on top. `PrintWindow` with `PW_RENDERFULLCONTENT` (flag 2)
+> renders the target window directly, occluded or not.

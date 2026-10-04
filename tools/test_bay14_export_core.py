@@ -30,6 +30,14 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+try:
+    # Second-opinion EXIF reader for the native-metadata tests. Not a
+    # declared dependency of its own -- it arrives with matplotlib, which
+    # the export studio needs anyway.
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -43,6 +51,7 @@ from bay14_export_core import (  # noqa: E402
     _flip_genicam_pixel_format,
     apply_fliplr_to_frame,
     build_standard_extratags,
+    encode_jpeg,
     encode_tiff_rgb16,
     resize_to_width,
     write_tiff_bayer_u16,
@@ -667,6 +676,194 @@ def test_encode_tiff_rgb16_resize_width_shrinks_output() -> None:
             shape = tf.pages[0].shape
     assert shape[1] == 16, shape  # width honoured
     assert shape[0] == 16, shape  # square input -> square output
+
+
+# ─── Native EXIF writing (no ExifTool) ──────────────────────────────────────
+
+_EXIF_IFD_POINTER = 0x8769
+_GPS_IFD_POINTER = 0x8825
+_USER_COMMENT = 0x9286
+
+
+def _meta_with_gps_attitude_focus() -> dict:
+    """A merged_meta carrying all three metadata blocks the encoders emit."""
+    return {
+        "bayer_pattern": "RG",
+        "bit_depth": 14,
+        "container": "bay14line_v1",
+        "gps": {
+            "latitude_deg": 32.0853,
+            "longitude_deg": 34.7818,
+            "altitude_m": 41.2,
+            "timestamp_utc": "2026-05-26T12:00:00.123+00:00",
+            "satellites": 11,
+            "fix_quality": 1,
+        },
+        "attitude": {"yaw_deg": 88.5, "pitch_deg": -89.0, "roll_deg": 1.3},
+        # encoder_stale must NOT reach the file: a stale reading is the last
+        # value the shared SPI bus held, not this frame's focus.
+        "focus": {
+            "encoder_count": 2048.0,
+            "encoder_epoch": "20260915T101500",
+            "encoder_camera": 2,
+            "encoder_stale": False,
+        },
+    }
+
+
+def _decoded_user_comment(exif) -> dict:  # noqa: ANN001 (PIL Exif object)
+    """Parse the encoder JSON back out of an EXIF UserComment."""
+    raw = exif.get_ifd(_EXIF_IFD_POINTER)[_USER_COMMENT]
+    # EXIF 2.32: 8-byte character-set code, then the text.
+    assert raw.startswith(b"ASCII\x00\x00\x00"), raw[:8]
+    return json.loads(raw[8:].decode("ascii"))
+
+
+def _encode_bayer(path: Path, arr: np.ndarray, meta: dict) -> None:
+    """``write_tiff_bayer_u16`` with the scaling choice pinned, so it has the
+    same signature as the other encoders and can go in a table."""
+    write_tiff_bayer_u16(path, arr, meta, scale_14_to_16=True)
+
+
+def _pil_dms_to_deg(dms) -> float:  # noqa: ANN001 (tuple of PIL IFDRational)
+    """Pillow hands back IFDRationals, already divided; see _dms_to_deg for
+    the raw ``(num, den)`` form the tifffile-side tests read."""
+    return float(dms[0]) + float(dms[1]) / 60.0 + float(dms[2]) / 3600.0
+
+
+def test_tiff_encoder_reading_lands_in_a_real_exif_subifd() -> None:
+    """The lens encoder goes into ExifIFD (34665) UserComment natively.
+
+    Written alongside GPS to prove the two sub-IFD embeds compose: the
+    second embed relocates IFD0 again and must carry the first one's
+    pointer across intact. Read back with somebody else's parser, so the
+    test fails if we emit bytes only we can understand.
+    """
+    bayer = (np.arange(64 * 64, dtype=np.uint16) % 4096).reshape(64, 64)
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, encode in (
+            ("bayer.tif", _encode_bayer),
+            ("rgb.tif", encode_tiff_rgb16),
+        ):
+            path = Path(tmp) / name
+            encode(path, bayer, _meta_with_gps_attitude_focus())
+            with tifffile.TiffFile(str(path)) as tf:
+                tags = tf.pages[0].tags
+                exif_ifd = tags.get(34665)
+                assert exif_ifd is not None, f"{name}: no Exif sub-IFD (34665)"
+                exif_values = exif_ifd.value
+                # Relocating IFD0 twice must leave the pixels reachable.
+                assert tf.pages[0].asarray().shape[:2] == (64, 64), name
+                assert tags.get(34853) is not None, (
+                    f"{name}: GPS sub-IFD lost by the Exif embed"
+                )
+            assert exif_values["ExifVersion"] == "0232", name
+            payload = json.loads(exif_values["UserComment"])
+            assert payload["encoder_count"] == 2048.0, (name, payload)
+            assert payload["encoder_epoch"] == "20260915T101500", (name, payload)
+            assert payload["encoder_camera"] == 2, (name, payload)
+            assert "encoder_stale" not in payload, (name, payload)
+
+            # Second opinion from Pillow, which also checks the 8-byte
+            # character-set prefix tifffile strips for us.
+            if Image is None:
+                continue
+            with Image.open(path) as im:
+                exif = im.getexif()
+                gps = exif.get_ifd(_GPS_IFD_POINTER)
+                assert _decoded_user_comment(exif) == payload, name
+            assert abs(_pil_dms_to_deg(gps[2]) - 32.0853) < 1e-5, (name, gps)
+
+
+def test_jpeg_carries_gps_encoder_and_attitude_in_app1() -> None:
+    """JPEG gets the same three blocks: EXIF APP1 (GPS + encoder) + XMP."""
+    if Image is None:
+        return  # Pillow is the only JPEG EXIF reader here; soft-skip.
+
+    bayer = (np.arange(64 * 64, dtype=np.uint16) % 4096).reshape(64, 64)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "frame.jpg"
+        encode_jpeg(path, bayer, _meta_with_gps_attitude_focus(), quality=90)
+        raw = path.read_bytes()
+        with Image.open(path) as im:
+            exif = im.getexif()
+            gps = exif.get_ifd(_GPS_IFD_POINTER)
+            payload = _decoded_user_comment(exif)
+
+    assert gps, "GPS sub-IFD missing from the APP1 Exif block"
+    assert gps[1] == "N", gps
+    assert abs(_pil_dms_to_deg(gps[2]) - 32.0853) < 1e-5, gps
+    assert abs(_pil_dms_to_deg(gps[4]) - 34.7818) < 1e-5, gps
+    assert payload["encoder_count"] == 2048.0, payload
+    assert "encoder_stale" not in payload, payload
+    # Attitude keeps its own APP1 XMP segment; EXIF 2.32 wants Exif first.
+    assert b"Camera:Yaw" in raw
+    assert raw.index(b"Exif\x00\x00") < raw.index(b"Camera:Yaw")
+
+
+def test_export_path_never_spawns_exiftool() -> None:
+    """Every encoder must write metadata in-process.
+
+    ExifTool rewrites a whole multi-hundred-MB TIFF to change ~60 bytes, so
+    reaching for it per frame is the regression this guards. Any subprocess
+    at all from the writer fails the test.
+    """
+    sys.path.insert(0, str(HERE.parent / "host"))
+    from capture import tiff_writer as tw  # noqa: WPS433
+
+    class _NoSubprocess:
+        def run(self, argv, **kwargs):  # noqa: ANN001, ANN003
+            raise AssertionError(f"export path spawned a subprocess: {argv}")
+
+    bayer = (np.arange(64 * 64, dtype=np.uint16) % 4096).reshape(64, 64)
+    real_subprocess = tw.subprocess
+    tw.subprocess = _NoSubprocess()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            meta = _meta_with_gps_attitude_focus()
+            _encode_bayer(Path(tmp) / "a.tif", bayer, meta)
+            encode_tiff_rgb16(Path(tmp) / "b.tif", bayer, meta)
+            encode_jpeg(Path(tmp) / "c.jpg", bayer, meta, quality=90)
+    finally:
+        tw.subprocess = real_subprocess
+
+
+def test_exiftool_reads_our_native_tags_back() -> None:
+    """Cross-check against the tool we stopped calling, when it is installed.
+
+    Pillow agreeing with us is not proof the bytes are standards-correct --
+    ExifTool is the stricter second opinion.
+    """
+    sys.path.insert(0, str(HERE.parent / "host"))
+    import subprocess as _sp  # noqa: WPS433
+
+    from capture import tiff_writer as tw  # noqa: WPS433
+
+    exiftool_exe = tw.detect_exiftool()
+    if exiftool_exe is None:
+        return  # nothing installed; soft-skip so the suite still passes.
+
+    bayer = (np.arange(64 * 64, dtype=np.uint16) % 4096).reshape(64, 64)
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, encode in (
+            ("frame.tif", _encode_bayer),
+            ("frame.jpg", lambda p, a, m: encode_jpeg(p, a, m, quality=90)),
+        ):
+            path = Path(tmp) / name
+            encode(path, bayer, _meta_with_gps_attitude_focus())
+            out = _sp.run(
+                [
+                    str(exiftool_exe), "-s", "-s", "-s", "-n",
+                    "-EXIF:GPSLatitude", "-EXIF:UserComment", "-XMP-Camera:Yaw",
+                    str(path),
+                ],
+                check=True, capture_output=True, text=True, timeout=30,
+            ).stdout
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            assert len(lines) == 3, (name, out)
+            assert abs(float(lines[0]) - 32.0853) < 1e-5, (name, lines)
+            assert json.loads(lines[1])["encoder_count"] == 2048.0, (name, lines)
+            assert abs(float(lines[2]) - 88.5) < 0.01, (name, lines)
 
 
 def main() -> int:
