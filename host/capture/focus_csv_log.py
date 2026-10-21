@@ -29,7 +29,9 @@ class FocusCsvLogger:
     logging session; construction opens the file and writes the header, and
     :meth:`write_row` appends until :meth:`close`."""
 
-    def __init__(self, log_dir: Optional[str] = None) -> None:
+    def __init__(self, log_dir: Optional[str] = None, header=CSV_HEADER, prefix: str = "Iron661_focus") -> None:
+        """``header`` / ``prefix`` let another telemetry stream (the w10 autofocus run) reuse the
+        same folder, naming and never-fatal I/O; rows then go through :meth:`write`."""
         self._lock = threading.Lock()
         self._fh = None
         self._writer = None
@@ -38,12 +40,12 @@ class FocusCsvLogger:
 
         directory = log_dir or default_log_dir()
         stamp = self.start_time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(directory, f"Iron661_focus_{stamp}.csv")
+        path = os.path.join(directory, f"{prefix}_{stamp}.csv")
         try:
             os.makedirs(directory, exist_ok=True)
             self._fh = open(path, "w", encoding="utf-8", newline="")
             self._writer = csv.writer(self._fh)
-            self._writer.writerow(CSV_HEADER)
+            self._writer.writerow(list(header))
             self._fh.flush()
             self.path = path
         except Exception as exc:  # pragma: no cover - I/O environment dependent
@@ -53,12 +55,16 @@ class FocusCsvLogger:
 
     def write_row(self, timestamp: str, frame: int, encoder, focus_score: float) -> None:
         """Append one telemetry row and flush (so a crash keeps the tail)."""
+        self.write([timestamp, int(frame), encoder, float(focus_score)])
+
+    def write(self, row) -> None:
+        """Append one row of the instance's ``header`` and flush."""
         with self._lock:
             w = self._writer
             if w is None:
                 return
             try:
-                w.writerow([timestamp, int(frame), encoder, float(focus_score)])
+                w.writerow(list(row))
                 self._fh.flush()
             except Exception as exc:  # pragma: no cover - I/O environment dependent
                 print(f"FocusCsvLogger: write failed: {exc!r}", file=sys.stderr)

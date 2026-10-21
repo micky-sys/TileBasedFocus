@@ -1986,6 +1986,7 @@ try:  # pragma: no cover - exercised only inside the GUI app
         finished = Signal(bool, dict)        # one camera completed
         run_state_changed = Signal(bool)     # True = a run (single or all) is active
         sample = Signal(int, float, bool)    # (lens pulses, score, fine_metric) per measurement
+        roi_sample = Signal(int, object)     # w10 AF: (raw encoder, [w10 of the five ROIs, NaN = none])
 
         def __init__(
             self,
@@ -1999,6 +2000,7 @@ try:  # pragma: no cover - exercised only inside the GUI app
             full_res_multi_cb: Optional[Callable[[list], Optional[list]]] = None,
             observe_row_cb: Optional[Callable[[dict], None]] = None,
             profile_cb: Optional[Callable[[dict], None]] = None,
+            pin_rois_cb: Optional[Callable[[Optional[list]], None]] = None,
             config: Optional[AutoFocusConfig] = None,
             algorithm: str = "sweep_and_hold",
             encoder_read: Optional[Callable[[], float]] = None,
@@ -2015,6 +2017,7 @@ try:  # pragma: no cover - exercised only inside the GUI app
             self._full_res_multi_cb = full_res_multi_cb
             self._observe_row_cb = observe_row_cb
             self._profile_cb = profile_cb   # AF3 only: live station-profile preview
+            self._pin_rois_cb = pin_rois_cb  # w10 only: pin the five sec.52 ROIs on the active pipeline
             self._config = config
             self._encoder_read = encoder_read
             self._encoder_present = encoder_present
@@ -2028,6 +2031,8 @@ try:  # pragma: no cover - exercised only inside the GUI app
         @staticmethod
         def _normalise_algorithm(name: str) -> str:
             key = str(name).lower()
+            if key in ("w10", "psf", "af4"):
+                return "w10"
             if key in ("field_profile", "field-profile", "af3", "v3"):
                 return "field_profile"
             if key in ("sweep_and_hold", "sweep-and-hold", "v2"):
@@ -2050,7 +2055,23 @@ try:  # pragma: no cover - exercised only inside the GUI app
                 full_res_score=self._full_res_score_cb,
                 sample=self.sample.emit,
             )
-            if algorithm == "field_profile":
+            if algorithm == "w10":
+                # AF4: the sec.54 PSF-width engine. No tracker, no tile -- every gated frame is a
+                # (raw encoder, w10) sample and the V fit is the whole algorithm. It reads the raw
+                # encoder itself (W10Focus lives in the recorded frames' encoder frame) and takes
+                # the signed counts/pulse from the shared app config.
+                from .autofocus_w10 import AutoFocusEngineW10
+
+                engine = AutoFocusEngineW10(
+                    encoder_read=self._encoder_read,
+                    encoder_present=self._encoder_present,
+                    counts_per_pulse=getattr(self._config, "encoder_counts_per_pulse", 1.0),
+                    pin_rois_cb=self._pin_rois_cb,
+                    roi_sample=self.roi_sample.emit,
+                    parent=self,
+                    **common,
+                )
+            elif algorithm == "field_profile":
                 # AF3: same skeleton as v2 (it subclasses it), but the climb measures
                 # the across-field profile instead of one patch's score. Kept a
                 # separate algorithm string so reverting to v2 is a one-line change.
@@ -2215,6 +2236,12 @@ try:  # pragma: no cover - exercised only inside the GUI app
             fn = getattr(self._engine, "step", None)
             if callable(fn):
                 fn()
+
+        def feed_crops(self, crops) -> bool:
+            """A full-res ROI batch from the pipeline. True when the running engine owns the
+            batch (w10), so the caller does not paint or score it itself."""
+            fn = getattr(self._engine, "feed_crops", None)
+            return bool(fn is not None and self._engine.running and fn(crops))
 
         def feed_frame(self, frame) -> None:
             if self._engine.running:

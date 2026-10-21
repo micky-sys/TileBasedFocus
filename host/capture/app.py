@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -92,10 +93,14 @@ from .pipeline import (
     CaptureContext,
     M4_FINE_PICK_TILE_H,
     M4_FINE_PICK_TILE_W,
+    PREVIEW_DISPLAY_GAIN_MAX,
+    PREVIEW_DISPLAY_GAIN_MIN,
     PREVIEW_MAX_EDGE,
+    _u16_to_gray8,
 )
 from .serial_client import SerialClient
 from .session_log import SessionLogger, build_date, default_log_dir
+from .w10_live import W10LiveScorer, format_score
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +158,7 @@ class _PreviewDisplayLabel(QLabel):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._gps_overlay: Optional[QLabel] = None
+        self._w10_overlay: Optional[QLabel] = None
         self._corner_button: Optional[QWidget] = None
 
     def minimumSizeHint(self):  # noqa: N802 -- Qt naming
@@ -179,10 +185,27 @@ class _PreviewDisplayLabel(QLabel):
         button.show()
         self._reposition_corner_button()
 
+    def set_w10_overlay(self, overlay: QLabel) -> None:
+        """Attach a child label pinned to the bottom-right (the live w10 readout, sec.54.12)."""
+        self._w10_overlay = overlay
+        overlay.setParent(self)
+        overlay.show()
+        self._reposition_w10_overlay()
+
     def resizeEvent(self, event):  # noqa: N802 -- Qt naming
         super().resizeEvent(event)
         self._reposition_gps_overlay()
+        self._reposition_w10_overlay()
         self._reposition_corner_button()
+
+    def _reposition_w10_overlay(self) -> None:
+        ov = self._w10_overlay
+        if ov is None:
+            return
+        ov.adjustSize()
+        ov.move(max(0, self.width() - ov.width() - self.OVERLAY_MARGIN),
+                max(0, self.height() - ov.height() - self.OVERLAY_MARGIN))
+        ov.raise_()
 
     def _reposition_gps_overlay(self) -> None:
         ov = self._gps_overlay
@@ -770,6 +793,10 @@ class MainWindow(QMainWindow):
         self._last_preview_qimage: Optional[QImage] = None
         # 100% full-resolution preview toggle (top-left of preview window).
         self._preview_zoom_on = False
+        # Software-only brightness multiplier on the preview image (lets the
+        # operator fly at minimum analog gain and still see the ground).
+        # Never applied to recorded data.
+        self._preview_display_gain = 1.0
         # Split-screen preview: when on, every connected camera streams a
         # decimated preview composited side by side. Resolution is fixed at
         # a low subsample so three feeds stay cheap without user tuning.
@@ -1637,6 +1664,52 @@ class MainWindow(QMainWindow):
     # "NO GPS"? 2 s is comfortably more than one full sweep cycle.
     _GPS_OVERLAY_STALE_S = 2.0
 
+    def _on_w10_toggle_toggled(self, checked: bool) -> None:
+        """Operator switch for the live w10: attach / detach the scorer on every pipeline."""
+        self._w10_live_enabled = bool(checked)
+        self._w10_toggle_btn.setText("Live w10: On" if checked else "Live w10: Off")
+        for p in self._pipelines:
+            p.acq.set_w10_live(self._w10_live if checked else None)
+        if checked:
+            self._w10_live.disabled_line = None     # a fresh start also clears the fail-safe
+        else:
+            self._w10_last.clear()
+            self._w10_off_note = ""
+            self._w10_overlay_label.hide()
+        self._log(f"w10 live scoring {'on' if checked else 'off'} (operator)")
+
+    @Slot(dict)
+    def _on_w10_live_scored(self, s: dict) -> None:
+        """One live w10 score (W10LiveScorer.scored): log it, show the latest line per camera."""
+        if not self._w10_live_enabled:
+            return                                  # a score that was in flight when switched off
+        line = format_score(s)
+        self._log("w10 " + line)
+        cam = int(s.get("camera", 0))
+        w = s.get("w10")
+        short = f"cam{cam} S{s.get('sweep', '?')} w10 " + (f"{w:.2f} px" if isinstance(w, float) and w == w else "--")
+        if not s.get("ok"):
+            short += " (gated)"
+        self._w10_last[cam] = short
+        self._w10_refresh_overlay()
+
+    @Slot(str)
+    def _on_w10_live_notice(self, msg: str) -> None:
+        """Fail-safe on/off (W10LiveScorer.notice): log it and flag the overlay while scoring is off."""
+        self._log("w10 " + msg)
+        self._w10_off_note = "" if self._w10_live.disabled_line is None else "w10 OFF (recording drop)"
+        self._w10_refresh_overlay()
+
+    def _w10_refresh_overlay(self) -> None:
+        lines = [self._w10_last[k] for k in sorted(self._w10_last)]
+        if self._w10_off_note:
+            lines.append(self._w10_off_note)
+        if not lines:
+            return
+        self._w10_overlay_label.setText("\n".join(lines))
+        self._w10_overlay_label.show()
+        self._preview_label._reposition_w10_overlay()
+
     def _refresh_gps_overlay(self) -> None:
         """Update the preview's top-right GPS readout from the correlator.
 
@@ -2211,6 +2284,29 @@ class MainWindow(QMainWindow):
         )
         self._preview_label.set_gps_overlay(self._gps_overlay_label)
 
+        # Live w10 readout -- bottom-right. One frame per sweep (F7) of every recording camera
+        # is scored off the recording path (w10_live.W10LiveScorer, sec.54.12); the latest line
+        # per camera is shown here and every score goes to the log. Hidden until the first score.
+        self._w10_overlay_label = QLabel("", self._preview_label)
+        self._w10_overlay_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._w10_overlay_label.setStyleSheet(
+            "QLabel {"
+            "  background: rgba(0, 0, 0, 160);"
+            "  color: #80ff80;"
+            "  font-family: Consolas, monospace;"
+            "  font-size: 10pt;"
+            "  padding: 3px 6px;"
+            "  border-radius: 3px;"
+            "}"
+        )
+        self._preview_label.set_w10_overlay(self._w10_overlay_label)
+        self._w10_overlay_label.hide()
+        self._w10_last: dict[int, str] = {}   # camera number -> latest overlay line
+        self._w10_off_note = ""               # overlay line while the fail-safe has scoring off
+        self._w10_live = W10LiveScorer(parent=self)
+        self._w10_live.scored.connect(self._on_w10_live_scored)
+        self._w10_live.notice.connect(self._on_w10_live_notice)
+
         # Zoom toggle -- top-left corner of the preview window. Switches
         # the M0/M1 preview between the whole-frame low-res view and a
         # 100% (1:1) full-resolution centre crop. Disabled in M4 (the
@@ -2301,6 +2397,27 @@ class MainWindow(QMainWindow):
         )
         sensor_layout.addWidget(self._preview_gain_edit)
 
+        sensor_layout.addWidget(QLabel("Display gain:"))
+        self._preview_display_gain_spin = QDoubleSpinBox()
+        self._preview_display_gain_spin.setRange(
+            PREVIEW_DISPLAY_GAIN_MIN, PREVIEW_DISPLAY_GAIN_MAX
+        )
+        self._preview_display_gain_spin.setDecimals(1)
+        self._preview_display_gain_spin.setSingleStep(1.0)
+        self._preview_display_gain_spin.setValue(self._preview_display_gain)
+        self._preview_display_gain_spin.setSuffix("×")
+        self._preview_display_gain_spin.setMaximumWidth(80)
+        self._preview_display_gain_spin.setToolTip(
+            "Software brightness multiplier on the PREVIEW image only. "
+            "Lets you run the sensor at minimum analog gain and still see "
+            "the scene. Takes effect immediately; recorded frames are "
+            "never changed."
+        )
+        self._preview_display_gain_spin.valueChanged.connect(
+            self._on_display_gain_changed
+        )
+        sensor_layout.addWidget(self._preview_display_gain_spin)
+
         self._preview_sensor_apply = QPushButton("Apply")
         self._preview_sensor_apply.setToolTip(
             "Write exposure and/or gain to the currently previewed camera. "
@@ -2325,6 +2442,21 @@ class MainWindow(QMainWindow):
         )
         self._log_toggle_btn.toggled.connect(self._on_log_toggle_toggled)
         preview_hdr.addWidget(self._log_toggle_btn, 0)
+
+        # Live w10 on/off (sec.54.12). Default on; off detaches the scorer from every pipeline
+        # so the recording path does not even see the offer -- the operator's switch for a
+        # flight where the live score is not worth any risk to the recording.
+        self._w10_live_enabled = True
+        self._w10_toggle_btn = QPushButton("Live w10: On")
+        self._w10_toggle_btn.setCheckable(True)
+        self._w10_toggle_btn.setChecked(True)
+        self._w10_toggle_btn.setToolTip(
+            "Score one frame per sweep (F7) of every recording camera with the w10\n"
+            "sharpness metric and show it in the preview and the log. Off detaches the\n"
+            "scorer completely; the recording path then does nothing extra."
+        )
+        self._w10_toggle_btn.toggled.connect(self._on_w10_toggle_toggled)
+        preview_hdr.addWidget(self._w10_toggle_btn, 0)
 
         preview_hdr.addStretch(1)
         preview_hdr.addWidget(self._preview_sensor_bar, 0)
@@ -2527,9 +2659,11 @@ class MainWindow(QMainWindow):
                 full_res_multi_cb=self._af_full_res_multi,
                 observe_row_cb=self._on_observe_row,
                 profile_cb=self._on_af_profile,
+                pin_rois_cb=self._af_pin_rois,
                 config=af_cfg,
-                # AF2 stays the default; set IRON661_AF=af3 to run the station walk.
-                algorithm=os.environ.get("IRON661_AF", "sweep_and_hold"),
+                # w10 (sec.54) is the default; IRON661_AF=sweep_and_hold / af3 selects the
+                # older engines. Must agree with the focus panel's first "AF:" combo entry.
+                algorithm=os.environ.get("IRON661_AF", "w10"),
                 encoder_read=lambda: self._serial.encoder_position,
                 encoder_present=lambda: self._serial.encoder_present,
             )
@@ -2551,6 +2685,7 @@ class MainWindow(QMainWindow):
             self._autofocus.finished.connect(self._on_autofocus_finished)
             self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
             self._autofocus.sample.connect(self._on_af_sample)
+            self._autofocus.roi_sample.connect(self._on_af_roi_sample)
             # DEBUG step-gate: SPACE releases the AF engine's per-phase pause so the
             # operator can inspect encoder/image between phases (app-wide so it fires
             # regardless of which widget has focus).
@@ -2705,6 +2840,7 @@ class MainWindow(QMainWindow):
         # see ``self`` as the receiver and use QueuedConnection
         # automatically, the same way ``preview_ready`` already works.
         pipeline.acq.raw_focus_frame.connect(self._on_raw_focus_frame_slot)
+        pipeline.acq.set_w10_live(self._w10_live if self._w10_live_enabled else None)
         pipeline.acq.raw_focus_tile_rgb.connect(self._on_raw_focus_tile_rgb_slot)
         pipeline.acq.raw_focus_roi_u16.connect(self._on_raw_focus_roi_u16_slot)
         pipeline.acq.raw_focus_preview_crops.connect(self._on_raw_focus_preview_crops)
@@ -3199,6 +3335,8 @@ class MainWindow(QMainWindow):
                 f"Record ARMED in M4 on cam{cam} only: writing .bay14line "
                 "with encoder stamps."
             )
+            if exp := self._focus_panel.exposure_summary():
+                self._log(f"exposure at arm: {exp}")
         else:
             self._close_all_lines()
             self._log("Record disarmed in M4: lines closed.")
@@ -3508,10 +3646,11 @@ class MainWindow(QMainWindow):
             is_active = (p.camera_number == camera_number)
             p.set_preview(is_active)
             p.set_focus_tap(in_focus and is_active)
-            # Keep the zoom flag + crop size current on whichever camera
-            # is now emitting preview frames.
+            # Keep the zoom flag + crop size + display gain current on
+            # whichever camera is now emitting preview frames.
             try:
                 p.set_preview_zoom(self._preview_zoom_on)
+                p.set_preview_gain(self._preview_display_gain)
             except Exception:
                 pass
         if self._preview_zoom_on:
@@ -4349,6 +4488,9 @@ class MainWindow(QMainWindow):
             # and it also paces the motor, so it must not also go to the panes.
             fm.feed(crops or [])
             return
+        af = self._autofocus
+        if af is not None and af.feed_crops(crops):
+            return   # w10 AF: the five sec.52 ROIs, scored off the GUI thread by the engine
         if self._af_crops_active:
             # AF owns the ROI slots: this batch is either a climb's A/B calibration pair
             # or an observation's N patches. Either way every crop comes out of the same
@@ -4390,7 +4532,7 @@ class MainWindow(QMainWindow):
             # 8-bit -- ~4x sharper than the old coarse-tap crop, cheap enough for the
             # GUI thread.
             g = crop[0::2, 1::2]
-            gray.append((g >> 6).clip(0, 255).astype("uint8"))
+            gray.append(_u16_to_gray8(g, self._preview_display_gain))
         self._focus_panel.receive_object_crops(gray)
 
     def _on_focus_submode_changed(self, sub: FocusSubMode) -> None:
@@ -4479,6 +4621,24 @@ class MainWindow(QMainWindow):
                 p.set_focus_roi(tuple(int(v * scale) for v in roi))
         except Exception as exc:
             self._log(f"AF set_focus_roi failed: {exc}")
+
+    def _af_pin_rois(self, rois) -> None:
+        """w10 AF (sec.54): pin its five fixed full-res ROIs on the active pipeline so the
+        acquisition thread ships them from the held slot each frame (the two-object
+        preview path, ``_on_raw_focus_preview_crops``, routes the batch to the engine).
+        ``_af_crops_active`` keeps the scene trackers from re-pinning them mid-run; the
+        run-state handler's ``_af_enable_full_res(False)`` clears everything at the end."""
+        if not rois:
+            return
+        p = self._active_pipeline()
+        if p is None:
+            return
+        self._af_enable_full_res(True)
+        self._af_crops_active = True
+        try:
+            p.set_preview_rois(list(rois))
+        except Exception as exc:
+            self._log(f"w10 AF: set_preview_rois failed: {exc}")
 
     def _af_enable_full_res(self, enable: bool) -> None:
         """Turn full-res emission on (active camera) / off (all AF cameras).
@@ -5160,6 +5320,14 @@ class MainWindow(QMainWindow):
         if enc is not None:
             self._focus_panel.focus_scatter_add_point(enc, float(score))
 
+    def _on_af_roi_sample(self, enc: int, widths) -> None:
+        """w10 AF: the five per-ROI widths of one gated frame -> the scatter's per-ROI
+        view ('ROIs' checkbox). The encoder is the engine's own (raw) reading, the same
+        frame as the pooled sample; a ROI without a w10 (NaN) draws nothing."""
+        for k, wv in enumerate(widths or ()):
+            if wv == wv:
+                self._focus_panel.focus_scatter_add_point(float(enc), float(wv), roi=k)
+
     def _emit_focus_telemetry(
         self, score, ts_iso: Optional[str] = None, *, to_csv: bool = True
     ) -> None:
@@ -5277,6 +5445,8 @@ class MainWindow(QMainWindow):
     @Slot(bool, dict)
     def _on_autofocus_finished(self, ok: bool, report: dict) -> None:
         self._log(f"autofocus finished: ok={ok} {report}")
+        if exp := self._focus_panel.exposure_summary():
+            self._log(f"exposure at AF end: {exp}")
         self._log(
             f"af full-res usage: fresh={self._af_fresh_ct} "
             f"stale/fallback={self._af_stale_ct}"
@@ -5713,9 +5883,20 @@ class MainWindow(QMainWindow):
         # Clear the stale frame so we don't briefly show the old
         # (wrong-scale) image before the next preview frame arrives.
         self._last_preview_qimage = None
-        self._log(
-            f"preview zoom {'ON (100% full-res crop)' if checked else 'OFF (fit window)'}"
-        )
+
+    @Slot(float)
+    def _on_display_gain_changed(self, gain: float) -> None:
+        """Push the preview-only brightness multiplier to every pipeline (M0/M1 preview
+        and the M4 Fine tile, built on the acquisition thread) and to the focus panel
+        (M4 Coarse preview and AF tile zoom, built on the GUI thread)."""
+        self._preview_display_gain = float(gain)
+        for p in self._pipelines:
+            try:
+                p.set_preview_gain(self._preview_display_gain)
+            except Exception:
+                pass
+        self._focus_panel.set_display_gain(self._preview_display_gain)
+        self._log(f"display gain {self._preview_display_gain:g}x (preview only)")
 
     @Slot(int, int)
     def _on_below_cam_split_moved(self, _pos: int, _index: int) -> None:
@@ -6019,6 +6200,15 @@ class MainWindow(QMainWindow):
         if pool is not None:
             self._af_score_pool_obj = None
             pool.shutdown(wait=True)
+        # Same reason: the live w10 thread is non-daemon; detach it from the pipelines first so no
+        # new offer lands while it drains (at most one ~150 ms score).
+        for p in self._pipelines:
+            p.acq.set_w10_live(None)
+        self._w10_live.shutdown()
+        # And the w10 AF engine's scorer thread (same one-score drain), if that engine is selected.
+        af_engine = getattr(getattr(self, "_autofocus", None), "_engine", None)
+        if hasattr(af_engine, "shutdown"):
+            af_engine.shutdown()
         if self._pending_end_line_timer is not None:
             self._pending_end_line_timer.stop()
             self._pending_end_line_timer.deleteLater()

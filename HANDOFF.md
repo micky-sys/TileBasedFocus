@@ -5506,3 +5506,1196 @@ status bar reads **"Ready. EXIF backend: native (no ExifTool)"**.
 > Capture tip: `SetForegroundWindow` from an agent shell is blocked by Windows, so
 > `CopyFromScreen` grabs whatever is on top. `PrintWindow` with `PW_RENDERFULLCONTENT` (flag 2)
 > renders the target window directly, occluded or not.
+
+## 51. "Save focus view" writes raw Bayer, and the vertical ghost that proves it (2026-10-04)
+
+Reported from the 30 Sep flight: `cam2439008_20260930_project_focus_150835_741.tif` and its
+neighbours show **clear duplication in the vertical direction**. Every edge is doubled, and a
+fine checkerboard lies over the whole frame.
+
+It is not a double exposure, not a mirror step mid-integration, and not a frame-assembly
+repeat. The vertical autocorrelation decays smoothly with **no secondary peak**, so there is no
+second copy of the scene at any offset; and no horizontal band of the frame matches any other
+band. What the pixels actually do is alternate on a strict period of 2 rows. A column mean
+straight down a roof edge:
+
+```
+11660  9931  11470  9944  11434  9835  11309  9706  11285  9697  11179  9582 ...
+```
+
+That is the **Bayer mosaic, stored unprocessed and then viewed as greyscale**. With the `RG`
+pattern the even rows are `R G R G` and the odd rows are `G B G B`, so each row's mean is
+`(R+G)/2` or `(G+B)/2`. On a blurred image a 15.7% row-to-row step reads to the eye as a
+doubled edge.
+
+![Bayer ghost](docs/images/51_bayer_ghost_cam8_150835_741.png)
+
+*Left: the crop as stored. Middle: the same pixels with one green phase taken
+(`crop[0::2, 1::2]`) -- the ghost and the checkerboard are gone and no scene detail is lost.
+Right: column mean per row, as stored (top) and green-only (bottom). Row-to-row step falls from
+**15.7%** of the mean to **1.1%**.*
+
+### 51.1 The proof it is the mosaic, and why cam8 shows it worst
+
+Take the mean of each of the four 2x2 phases. On raw Bayer these are R, G1, G2, B, so the two
+green phases must agree while R and B diverge. On an already-extracted green plane all four are
+samples of one channel and must agree within noise.
+
+| camera | (0,0) | (0,1) | (1,0) | (1,1) | spread |
+|---|---|---|---|---|---|
+| cam6 | 1804 | 1772 | 1768 | 1714 | 5.1% |
+| cam7 | 1451 | 1415 | 1416 | 1402 | 3.5% |
+| cam8 (target frame) | 3565 | **3460** | **3461** | 3271 | 8.5% |
+| cam8 (S161_F6) | 2790 | **3025** | **3017** | 3415 | 20.4% |
+
+The two middle columns track each other to within a count or two in every file on every
+camera; the outer two do not. **All three cameras write raw Bayer.** The artifact's visibility
+scales with how colourful the ground is -- cam8 over red-roofed houses hits a 20% phase spread,
+cam7 over grey cloud only 1.7%, which is why this went unnoticed until a frame with real colour
+in it.
+
+### 51.2 Two save paths, one checkbox -- this is what §45.1 got wrong
+
+§45.1 states that the saved focus TIFs "are ALREADY the green sub-grid". That is true of **one**
+of the two writers, and the files on the camera drive come from the other.
+
+* `_save_af_crops` ([app.py](host/capture/app.py)) dumps AF-run patches and does take the green
+  sub-grid. Its own docstring says so: *"Saves the GREEN sub-grid (`crop[0::2, 1::2]`) -- exactly
+  the pixels `focus_measure_full_res` scores."* Names look like `..._OID029_y1147_s305.tif`.
+* The **"Save focus view"** focus crops ([pipeline.py](host/capture/pipeline.py)) are a plain
+  slice of the Bayer frame with no extraction at all:
+  `crop_u16 = full_u16[best.y0:best.y1, best.x0:best.x1].copy()`, handed straight to
+  `write_frame`. Names look like `Cam2439008_20260930_Project_focus_150835_741.tif`.
+
+Both are gated behind the same **one** "Save focus view" checkbox, which is how they came to be
+described as one thing. The docstring on `focus_measure_green` ([autofocus.py](host/capture/autofocus.py))
+repeats the error -- *"'Save focus view' writes the green plane, not the Bayer crop"* -- and is
+the comment most likely to mislead the next reader, because it sits on the function you would
+reach for.
+
+### 51.3 Why this matters more than it looks: 89% of the "sharpness" is mosaic
+
+On the target frame, Laplacian variance of the crop as stored is **2 884 556**; of a single 2x2
+phase, **309 562**. The fixed checkerboard supplies **89%** of the high-frequency energy, and it
+is a function of scene colour and illumination, not of focus.
+
+So `focus_measure_green` must never be handed one of these files. It takes an
+already-extracted green plane (`focus_measure_full_res` is the entry point that extracts first),
+and feeding it raw Bayer measures mostly the mosaic.
+
+`tools/focus_jitter.py` did exactly that for the whole 30 Sep analysis. Re-scoring its 218
+held runs -- same ground at NCC >= 0.97, identical encoder count, textured, unclipped -- both ways:
+
+| scoring | median peak-to-peak | p90 |
+|---|---|---|
+| raw Bayer into `focus_measure_green` (what was done) | 16.9% | 57.3% |
+| green sub-grid extracted first (correct) | **44.3%** | **93.7%** |
+
+The two agree on *which* runs are jittery (r = +0.82), so the relative conclusions stand, but
+the mosaic acted as a large constant energy floor that **diluted** the measurement. The flight's
+focus wander at a parked encoder is ~44% peak-to-peak, not ~17% -- the finding is stronger, not
+weaker, than first reported. `focus_jitter.py` now extracts green in `build()` (the NCC match
+and the anisotropy too, both being high-frequency measurements); rebuilt from scratch it gives
+**45.1% median / 93.6% p90** over 191 runs.
+
+One conclusion did weaken. The lag-1 autocorrelation of the within-run residual, which was the
+evidence that the wander is a coherent physical movement rather than noise, falls from **+0.34
+to +0.07** (lag-2 +0.16, shuffled control -0.09) once the mosaic is out. The *magnitude* case
+is now much stronger and the *temporal-structure* case is marginal, so "the optics move at a
+parked encoder" rests on 45% >> the 10-15% noise floor, not on the autocorrelation.
+
+⚠️ Anything that re-scores files from the camera drive must decide which writer produced them.
+`tools/af_crop_review.py` has the opposite bug (§45.1): it pushes already-green AF crops through
+`focus_measure_full_res` and decimates twice. Both bugs are the same root cause -- the file
+does not say which plane it holds, and the metadata's `bayer_pattern: "RG"` is written
+unconditionally by `tiff_writer` either way, so it cannot be trusted to answer the question.
+The reliable test is the four-phase comparison in §51.1.
+
+### 51.4 The mosaic modulates BOTH axes, and a case that is NOT the mosaic
+
+A second frame was reported with "duplication in a different direction":
+`Cam2439008_20260930_Project_focus_151043_419_S34_F13.tif`, the last frame of sweep 34. Two
+separate things turned out to be true, and they are worth keeping apart.
+
+**The mosaic is not directional.** §51's worked example is a row effect, but RGGB alternates
+columns just as much as rows: rows differ by `(R+G1-G2-B)/2`, columns by `(R+G2-G1-B)/2`, and
+with `G1 = G2` both reduce to `(R-B)/2`. Measured exactly (mean of even lines minus mean of odd
+lines, which no smooth scene gradient can fake):
+
+| frame | row parity | col parity | predicted `(R-B)/2` |
+|---|---|---|---|
+| 150835_741 | 4.26% | 4.28% | 4.27% |
+| 151043_419 | 1.38% | 1.11% | 1.24% |
+
+So there is no "different direction" of the defect -- there is one 2x2 checkerboard, equal on
+both axes, and which way a viewer notices it is a property of the picture. Do not read a
+horizontal-looking ghost as a different fault from a vertical-looking one.
+
+![column parity](docs/images/51_bayer_ghost_columns.png)
+
+**Part of what you see on this frame is real ground.** Its mosaic is only ~1.2% because the
+roof is near-neutral (R 2734, G 2767/2775, B 2803) -- too weak to be what stands out. There
+genuinely is an industrial/greenhouse roof of regularly spaced bays, **period 39 green px**
+(78 sensor px), and the comb appears only where the roof is:
+
+| region | horizontal autocorrelation at lag 39 |
+|---|---|
+| roof | **+0.198** |
+| open ground 400 px away, same frame | +0.006 |
+
+![roof periodicity](docs/images/51_roof_periodic_cam8_151043_419.png)
+
+Also true, so the next reader does not redo it: the five frames across the S34/S35 boundary are
+**pixel-wise distinct** (SHA-1 of the buffers, no frame written twice), and the scene moves only
+4.8 green px between F12 and F13, which is healthy ROI tracking, not a stall.
+
+⚠️ **The real roof is NOT the whole story on this frame, and an earlier revision of this section
+wrongly closed it as "all real ground".** There IS a second copy of the scene on top of the real
+roof. The test that missed it -- template-matching a block against the whole green plane and
+finding no second peak -- cannot work here: the copy is only ~7 green px away, well inside the
+width of the correlation peak itself, so it hides under the main lobe. See §51.5.
+
+### 51.5 The frames really are imaged twice, and it is the airframe, not the lens
+
+Reported by the operator against `..._151043_419_S34_F13.tif`: on the same greenhouse, the sharp
+`..._151048_080_S36_F5.tif` shows single lines where F13 shows lines that repeat closely.
+
+Defocus and a double image both just look "soft", and the focus score cannot separate them, so
+this matters: a shaking airframe is easy to misread as a lens that will not hold focus.
+`tools/ghost_check.py` settles it without assuming a model -- it takes a sharp frame of the same
+ground and solves `suspect = sharp (*) k` for the point spread function by regularised division
+in the Fourier domain, then looks at `k`. One compact blob is defocus; **two blobs mean the
+sensor integrated the scene at two places during one exposure**; a streak would be steady smear.
+
+![double image](docs/images/51_double_image.png)
+
+Against the 15:10:48 reference, over 23 frames on the same ground:
+
+| frames | t vs reference | result |
+|---|---|---|
+| S34_F12 .. S35_F10 | -4.9 s to -2.1 s | **two lobes**, 5.0-7.8 green px apart (10-16 sensor px), axis 34 deg +/- 13, second copy 49-95% as bright |
+| S35_F11 .. S36_F8 | -1.8 s to +0.8 s | single blob, plain defocus |
+
+The separation decays smoothly (7.8 -> 5.0 -> 0) on a consistent axis and then stops. A lens
+cannot make two copies of a scene at any focus setting, and the decay rules out the scene. A
+sinusoidal vibration dwells longest at the two turning points of its travel, which is exactly a
+two-lobe PSF whose **lobe separation is the peak-to-peak shake amplitude** -- here ~16 sensor px
+dying away over about three seconds. This is hypothesis B from the 30 Sep flight review
+(undamped vibration in the aircraft), now measured, and it is a direct contributor to the focus
+scatter at a fixed encoder reading in §50.
+
+⚠️ Two traps this cost real time on, both guarded in the tool now:
+
+- **`S##_F##` is not unique.** The same sweep/frame label repeats on every pass, so three
+  different files are called `S36_F5` and they are three different scenes. Identify frames by
+  timestamp, never by sweep/frame alone.
+- **Deconvolving against ground that is not the same ground returns noise with peaks in it**,
+  which reads as a convincing double image. `ghost_check.py` gates on the correlation of the
+  registered analysis window (`MIN_OVERLAP`), not just on the registration shift; the four
+  frames after +1.0 s score ~0.0 and are dropped.
+
+`py -3 tools/ghost_check.py --self-check` injects three known double images (recovered to
+<1 px and <10 deg) and five pure blurs plus the identity (all must read as one blob). Run it
+before trusting any result from this tool.
+
+### 51.6 A doubled black line that is NOT an artifact, and why the focus score said otherwise
+
+Reported against `..._151050_420_S37_F1.tif`: a doubled black line along the top-left side of
+the diagonally parked cars, present in F1 and F3, absent in F2, different again in F12.
+
+**It is real ground.** The structure across the line is bright ridge / dark line / bright ridge;
+together with the car's own dark body that reads as two parallel black lines separated by a thin
+bright one. Over all twelve frames of the sweep, registered onto common ground, the dark line
+sits at **-0.04 +/- 0.29 green px** and the two bright ridges are **4.28 +/- 0.28 green px**
+apart. A double image cannot do that -- the S34 episode in §51.5 swung its separation from 7.8
+to 5.0 px over a comparable interval. Fixed geometry is the discriminator, not polarity.
+
+![dark line vs focus](docs/images/51_dark_line_focus.png)
+
+**Why all the cars show it.** They are identical objects parked in identical bays at the same
+heading under one sun, so every one of them carries the same shadow and gap on the same side. A
+repeated scene gives a repeated feature; that on its own is not evidence of an artifact. What
+rules an artifact out is that **no image-formation mechanism adds anything at these edges**:
+
+- the mean edge profile over ~400 car edges, binned into eight gradient directions, is monotone
+  in every bin in every frame, with undershoot <=0.007 of the edge step -- no ringing, no second
+  dark dip, in any direction;
+- `ghost_check.py` recovers a single-blob PSF for all 15 frames of the burst (overlap
+  0.97-1.00), so nothing was imaged twice here, unlike §51.5;
+- **F1 is just F11 blurred**: one Gaussian, sigma 1.40 green px, maps F11 onto F1 over a
+  180x150 patch covering ten cars with a 2.5% residual, and a defocus disc fits no better
+  (2.4% vs 2.4%), so there is no contrast reversal either. A Gaussian cannot create a line that
+  was not there, so F1 cannot hold any dark line that F11 lacks -- it holds strictly less.
+
+**The blur is field-dependent, and that is the one real finding here.** Fitting F11 -> F1 tile
+by tile across the frame, the left edge needs sigma 1.9-2.3 green px where the centre needs
+1.4-1.6, and the left tiles fit an isotropic kernel distinctly worse (5.6% residual vs 2.0%),
+so the left field is both softer and asymmetrically aberrated. A focus score measured on a
+left-field tile will not agree with one measured centrally -- the autofocus tool has to either
+always score the same field position or model the difference.
+
+⚠️ An earlier revision of this section claimed the line's visibility tracks local blur at
+r = -0.98. **That number was circular** -- the blur sigma was fitted to the same 1-D profile
+whose depth was then measured against it, so a deeper line necessarily fitted as sharper. The
+1-D fit was also unreliable in absolute terms (10-12% residual on F1/F2/F3, against 2.5% for the
+honest 2-D fit above) because it is sensitive to sub-pixel registration of a single short
+segment. Fit the blur over a whole patch, not over the feature being measured.
+
+⚠️ Three traps, all of which cost time here:
+
+- **A whole-crop sharpness score pointed the wrong way.** High-frequency energy over the 110x80
+  crop made F1 the *sharpest* frame (0.0065 vs F11's 0.0040) when the honest 2-D fit says F1 is
+  F11 blurred by sigma 1.40. The car carries a near-saturated specular glint, which is close to
+  a point source and dumps broadband energy into any global score. A glint in the window will
+  lie to the autofocus tool about which frame is in focus -- this is a live risk, not a
+  curiosity.
+- **"A black doubling doesn't seem additive" does not discriminate.** An additive ghost
+  `I = (S + S_shifted)/2` duplicates dark features too, at roughly half depth. Only a narrow dark
+  line flanked by something very bright escapes, because the shifted bright copy floods the gap.
+- **Green-only analysis is blind to anything living between the Bayer planes.** §51.5 and the
+  first pass here both ran on `img[0::2, 1::2]`. Measuring plane-to-plane registration instead
+  (each plane resampled onto a common grid first, since a raw half-pixel shift is the worst case
+  for phase correlation's peak interpolation) shows plane **(0,0) displaced from the two green
+  planes by up to 1.5 sensor px, varying frame to frame**; the green-vs-green control reads
+  <=0.15 px, so this is not method bias. It is **not** the cause of the line above -- F1 is the
+  best-registered frame of the set at 0.2 px and shows the line plainly -- but it is real and
+  currently unexplained. Worth a look before trusting any colour product from these files.
+
+### 51.7 Open
+
+Not fixed here; this is a report. The choice is to either extract green in the focus-view write
+path (matching `_save_af_crops`, costs the colour information) or leave the files raw and fix
+the three docstrings plus every consumer. Leaving them raw is probably right -- the full Bayer
+crop is the more useful artifact for a focus study, it is what the lens actually delivered, and
+`focus_measure_full_res` already exists to score it correctly.
+
+---
+
+## 52. `w10` — the content-independent PSF width used for the 2026-09-30 flight analysis (2026-10-12)
+
+The focus-sweep survey of the 2026-09-30 flight (`D:\_flight_quality\`, README there) ranked
+every frame by a single number, **`w10`**: the 10-90 % rise width, in pixels, of the sharpest
+decile of natural step edges in the frame. It is the number behind the focus V-curves, the gear-
+lash finding, the "same encoder, different focus" examples and the in-focus TIFF folder. This
+section is the exact recipe so another agent can reproduce it bit-for-bit. Code:
+**`tools/flight_edges.py`** (`edge_widths()` + `frame_edges()`), self-check
+**`tools/test_flight_edges_floor.py`**.
+
+### 52.1 Why not a sharpness score
+
+Laplacian variance, high-frequency energy and spectral cut-off all measure *how much texture the
+scene has* as much as how sharp it is: a city reads sharper than fields at identical focus, a
+specular glint makes a soft frame score sharpest (§51.6). An edge spread function measures the
+blur of a step regardless of how many steps there are, so frames of different ground can be
+compared. It still has biases (52.5), but they are second order and known.
+
+### 52.2 Input
+
+- Raw `BayerRG14` TIFF as written by the capture app (13400 x 9528, uint16, 14-bit << 2). Read
+  with a `numpy.memmap` at `tifffile` `page.dataoffsets[0]` -- do **not** `imread` the full
+  frame, and read contiguous row bands, not strided ROIs (the archive is on a USB HDD: a band
+  read is ~0.5 s, a strided ROI read was 20 s).
+- Five ROIs of **1024 x 1024** raw pixels at (x, y) centres **(3350, 2382), (10050, 2382),
+  (6700, 4764), (3350, 7146), (10050, 7146)**. They avoid the frame margins; 52.5 says what that
+  cost. An ROI is **skipped** if more than 0.5 % of its raw pixels are >= 65000 (cloud, sun
+  glint; the 0.5 % tolerates hot pixels).
+- Each ROI is demosaiced with `cv2.cvtColor(roi, cv2.COLOR_BayerBG2RGB)[..., 1]` (the OpenCV
+  pattern name that matches this sensor's layout -- see §51.5 for the plane order) and cast to
+  `float32`. Everything below runs on that **green plane at full raw resolution**.
+
+### 52.3 Per-ROI edge extraction (`edge_widths(g)`)
+
+1. `gs = GaussianBlur(g, sigma 1.0)`; `gx, gy = Sobel(gs, ksize 3)`. The blur is for the
+   gradient and the detector only -- the profile in step 5 is sampled from the **unblurred** `g`.
+2. Stretch `gs` to 8-bit between its 1st and 99th percentiles; `Canny(40, 100)`. Discard edge
+   pixels within 16 px of the ROI border.
+3. **Straightness:** structure tensor `Jxx, Jyy, Jxy` = 15 x 15 box filters of `gx*gx, gy*gy,
+   gx*gy`; coherence `sqrt((Jxx-Jyy)^2 + 4 Jxy^2) / (Jxx+Jyy)`; keep edge pixels with coherence
+   **> 0.8**. This drops corners, texture and curved edges.
+4. If more than **1500** edge pixels remain, take a random subset of 1500
+   (`np.random.default_rng(0)`, so the result is deterministic).
+5. **Edge spread function:** at each kept pixel the edge normal is `atan2(gy, gx)`. Sample `g`
+   bilinearly (`cv2.remap`, `BORDER_REFLECT`) on a grid of **41 points along the normal, -10 to
+   +10 px in 0.5 px steps**, at **13 offsets along the edge, -6 to +6 px in 1 px steps**, and
+   average the 13 rows -> one 41-sample profile per edge.
+6. **Accept the profile as a step** only if: contrast `|b - a|` (means of the outer 6 samples on
+   each side) is >= `max(300 ADU, 0.05 * (|a| + |b|))`; after normalising to 0..1 it stays inside
+   **[-0.15, 1.15]** (rejects lines and ringing); the 0.1 and 0.9 crossings both exist, the 0.1
+   crossing is not the first sample, the 0.9 crossing is not the last.
+7. **Width** = position of the 0.9 crossing minus the 0.1 crossing, each linearly interpolated
+   between the two bracketing samples. Return the widths and the edge-normal angles (deg mod 180).
+
+### 52.4 Per-frame statistics (`frame_edges(path)`)
+
+Pool the widths of all non-skipped ROIs (`n_edges` = pooled count). Then:
+
+| column | definition |
+|---|---|
+| `w10` | 10th percentile of pooled widths -- **the PSF number**. Requires >= 40 widths, else NaN |
+| `w20`, `w50` | 20th percentile and median (w50 tracks the *typical* edge, ~1.6x w10) |
+| `r{k}_w10` | 10th percentile per ROI k (needs >= 40 widths in that ROI), k in the order of 52.2 |
+| `w20_ang{0,30,...,150}` | 20th percentile of widths whose edge-normal falls in that 30 deg bin (needs >= 20) -- used for the directional test in 52.6 |
+
+**Reliability gates applied downstream** (not inside the function): a frame-level `w10` was
+trusted only with **`n_edges >= 300`** (plots, V-curves), and the in-focus TIFF selection used
+**`n_edges >= 1000`, >= 4 of 5 ROIs valid, and max-min of the valid `r{k}_w10` <= 2 px**. The
+tighter gate exists because `FOCUS_C2_145634_L1_S4_F6` scored 4.49 from 963 edges in two
+cloud-adjacent ROIs while the ground in it measures 6.5 px -- a 10th percentile over few edges
+next to cloud is biased low. Also exclude frames whose ROI mean exceeds ~22000 ADU (cloud).
+
+### 52.5 Calibration, floor and known biases
+
+`tools/test_flight_edges_floor.py` pushes synthetic step-edge scenes (pixel-integrated, Bayer
+mosaicked, flight-like shot + read noise, optional Gaussian optical PSF) through the identical
+pipeline:
+
+| optical sigma (px) | w10 |
+|---|---|
+| 0 (perfect optics) | **1.75** |
+| 1.0 (FWHM 2.4) | 3.0 |
+| 2.0 (FWHM 4.7) | 5.1 |
+| 2.5 (FWHM 5.9) | 6.2 |
+
+so **`w10 ~= sqrt(1.75^2 + (2.4 sigma)^2)`**, inverting to `sigma = sqrt(w10^2 - 1.75^2) / 2.4`
+(green px; FWHM = 2.355 sigma). The 1.75 px floor is pixel integration + bilinear green demosaic
++ the 0.5 px profile sampling. The coefficient is 2.4 rather than the exact Gaussian 2.563 because
+the 10th percentile picks the edges that noise happened to sharpen. Flight anchors: best cam-2
+frames 4.5 -> sigma ~1.7 px (FWHM ~14 um); typical frame at best focus 5.5-6; production 8-12.
+
+Biases to keep in mind when reading single frames:
+
+- **Edge density.** In the clear city run `w10` correlates 0.68 with `n_edges`: dense texture puts
+  neighbouring edges inside the +-10 px window and widens the profile. Compare frames of similar
+  density, or use binned medians over many frames (the V-curves do).
+- **Haze / thin cloud** lowers contrast and reads as 1-3 px of extra width without any defocus.
+- **Sea, dark ground, few edges** give unstable 10th percentiles (hence the gates above).
+- **Directional blur is nearly invisible to it.** A 3.6 px double image on a 6 px core widens one
+  orientation from 6.0 to 7.0 px -- inside the scatter of the 30-deg bins. The bins give the
+  *direction* once a frame is known to be smeared (within ~10-20 deg of the relative-PSF result),
+  but they flagged 0 of 13 kernel-confirmed smears as a detector. Use the relative kernel
+  (52.6) or `ghost_check.py` to count smears; use `w10` for defocus.
+- **Field coverage.** The five ROIs span x 2838-10562, y 1870-7658; the outer ~2800 px columns
+  and ~1900 px rows are not sampled. A 5 x 4 grid over the full frame (scratch
+  `flight_field_map.py`, in `D:\_flight_quality\scripts\`) showed the good frames uniform to
+  +-0.7 px over the whole field, so this did not matter on 2026-09-30; it might with a tilted
+  lens.
+- **Frame-to-frame scatter** at a fixed encoder is ~0.7 px rms on reliable frames, of which
+  ~0.5 is the estimator and the rest the vibration doubles. One frame is not a focus reading;
+  the median of a 13-frame sweep is.
+
+### 52.6 Companion measurements (scratch, `D:\_flight_quality\scripts\`)
+
+- `flight_kernel.py` / `flight_kernel_scan.py`: **relative PSF** `k` with `A ~= k * B` between a
+  frame and its predecessor, from the Wiener-regularised averaged cross-spectrum over 150 aligned
+  textured tiles (lambda = 3 x median power). Content cancels; elongation of `k` above half-max
+  (sqrt of major/minor second moment) > ~2 flags a directional smear with ~2 px sensitivity.
+  Cannot give absolute focus. ~3 s per pair.
+- `flight_smear.py`: cos(2 theta) fit of the `w20_ang` bins -> isotropic core, smear length and
+  direction. Only sensitive to smears > ~8 px for the reasons in 52.5.
+- `flight_crops.py` + `flight_zoom.py`: labelled 700-px crops (w10, edge count, brightness) for
+  eyeballing; the crop picker skips windows with mean > 18000 (cloud) and ranks by band-pass
+  texture so noise does not win.
+
+### 52.7 Reproduce
+
+```powershell
+py -3 tools/test_flight_edges_floor.py                                   # ~40 s, asserts the 52.5 table
+py -3 tools/flight_edges.py out.csv "D:\Parallax_Data_Collection 2026_09_30\2439008" --step 3
+```
+
+~0.5-2 s per frame from the USB disk. The flight CSVs this section was derived from are
+`D:\_flight_quality\edges_<serial>.csv` (cam 2 every 3rd frame, cam 1 every 5th, cam 3 every
+4th, FOCUS and production runs), with the frame index/encoder columns joined from
+`index_<serial>.csv` alongside (cam 2's index is `index.csv`).
+
+## 53. Bench PSF of the 400 mm (cam 2439007) vs flight, and the aperture test (2026-10-12 .. 10-15)
+
+Question asked: is the in-flight softness the optics or the flight? Answer, in one paragraph:
+**wide open (f/5.6) the lens is the single largest blur term and it is fixable by stopping down
+one click; everything else is flight-side.** Measured on the bench, mirror removed, camera
+looking straight out the open window at the city: w10 at best focus **4.93 px at f/5.6 ->
+4.03 at the first click (~f/8)**, and the second click gives a further 0.3-0.5 px in local
+windows across the field (the frame-wide decile hides it, 53.4). The flight's best frames were
+4.5 (§52.5), so one click puts the bench *below* the best the flight ever did.
+Stopping down also **moves best focus by +500 encoder counts** (spherical aberration) and
+widens the depth of focus 400 -> 800 -> 1000 counts. Everything below is the evidence, the
+traps, and what is still open (vibration).
+
+### 53.1 Tooling (all in `tools/`, untracked at the time of writing)
+
+- `flight_edges.py` now also reads **`.bay14line`** recordings directly (every frame of every
+  `p*` file, label `<file>#S<sweep>_F<frame>`, encoder from the per-frame `focus` block), accepts
+  **globs** (quote them) and folders, and reads **debayered RGB TIFFs** from Export Studio
+  (`demosaic_opencv_rgb` = `BayerBG2RGB`/`BayerRG2RGB`, honours `flipped_lr` and
+  `value_linear_scale`; the `src` column says what it saw). Two fixes made raw-ROI and
+  full-frame-RGB scoring **bit-identical**: the ROI is demosaiced with a 2-px margin so the
+  green plane equals the full-frame demosaic, and the `rng` default argument no longer carries
+  state between calls. Usage: `py -3 tools/flight_edges.py out.csv <tif|bay14line|folder|glob>...
+  [--step N]`.
+- **`w10_vcurve.py`** (new, pure ASCII on purpose -- see traps): bins a CSV by encoder
+  (`--bin`), prints the V-curve (frames / median / min / edges per park), the bowl bottom with
+  sigma and FWHM from the §52.5 calibration, the per-ROI field at best focus, and the flight
+  anchors (**best frames 4.5, typical 5.75**; the "production 8-12" anchor was removed at the
+  operator's request -- those runs were hand-focused under cloud and are not a lens reference).
+  **`--dir up|down`** keeps one sweep direction; by default it splits by the sign of the encoder
+  change over +-2 neighbours, reports the lash between the two directions' bowl bottoms, and
+  uses the direction with more frames. `--png` writes the curve; `--self-check` runs synthetic
+  cases (V shape, stale/sparse drop, field asymmetry, no-encoder flight CSV, lash split).
+- `bay14_encoder_check.py --root D:\Project` before trusting any recording (100 % present, 0
+  stale on every run here).
+- Scratch, in `%TEMP%` (re-create from the description if gone): `edge_sbs.py` -- picks the
+  sharpest down-direction frame within +-80 counts of a given park in each run, demosaics the
+  green plane, registers runs to the first by phase correlation at 1/8 res plus a per-patch
+  refinement, picks the strongest-edge 256-px patch in each cell of a 3x2 grid over the overlap,
+  and tiles them run-by-run at 2x nearest (per-crop stretch, so sharpness is compared, not
+  brightness). `ratio.py` -- brightness ratio of two runs at the same encoder, blurred 15 px,
+  sky and ground separately, with the pointing shift printed.
+
+### 53.2 Flight vs bench, apples to apples (June 2026 flight, `E:\Old files`)
+
+Export Studio RGB TIFFs of the 2026-06-23 flight scored with the same pipeline (bit-identical to
+raw, above). 2439008 = 300 mm, 2439007 = 400 mm:
+
+| | 400 mm (2439007) | 300 mm (2439008) |
+|---|---|---|
+| w10 best decile / median of in-sweep frames | 5.54 / 6.46 px | 4.40 / 5.27 px |
+| same, as angle (w10 * 3.45 um / f) | 48 / 56 urad | 51 / 61 urad |
+| within-sweep scatter at fixed encoder | 0.54 px rms | 0.70 px rms |
+| bench scatter, same estimator (§53.3) | 0.23 px rms | -- |
+
+Same angular blur on both lenses -> the external (air + airframe) term dominates the *flight*
+numbers and is common to both cameras. Both show the **bottom-left ROI softest** (~0.4-0.5 px)
+and a dependence on mirror position (F3/F11 worse, F6 best); the flight blur is **isotropic**
+in the `w20_ang` bins (no along-track axis), which rules out forward motion as the smear
+mechanism and points at random-direction angular vibration (§51.5, §53.6). Blur budget in
+quadrature on w10^2 for the 400 mm at best focus: sensor/estimator floor ~3, lens wide open
+~21-24 (4.9 px, ~15 um FWHM), air + airframe ~7, flight frame-to-frame ~11.
+
+### 53.3 Bench sessions and recordings (`D:\Project\...FOCUS_C1_L1_<time>_p*.bay14line`)
+
+| date | setup | recording | CSV / PNG (`D:\Project\...`) | bowl bottom (down) |
+|---|---|---|---|---|
+| 10-12 | mirror on, far city | 102251 | `bench_w10_2439007.csv` | 5.48 @ -1300 |
+| 10-13 | mirror on, near building in ROI0/1 | -- | `bench_w10_2439007_near.csv` | near 4.94 @ 2000-2200, far 5.68 @ 2800-3000 |
+| 10-14 | **mirror off**, f/5.6, 250 us, haze | 144429 | `aperture\nomirror_f56.*` | 5.70 @ 3000-3100 |
+| 10-14 | click 1, 500 us, camera tilted down | 144918 | `aperture\nomirror_f8.*` | 4.48 @ 3400 |
+| 10-15 | f/5.6, 250 us, clear | 103548 | `aperture\day2_f56.*` | **4.93 @ 3700** |
+| 10-15 | click 1, 500 us | 103908 | `aperture\day2_c1.*` | **4.03 @ 4200** |
+| 10-15 | click 2, 1000 us | 104751 | `aperture\day2_c2.*` | **3.97 @ 4200-4400** |
+| 10-15 | click 3, 1000 us, 36 min later | 112417 | `aperture\day2_c3.*` | 4.76 @ 4300 (air, see 53.4) |
+
+Near target vs far target on 10-13: the distant city reads ~0.7 px wider than a building at
+~100 m through the same lens at the same time -> that is the ground-level air term, and why the
+10-15 runs kept the near building in the lower third of the frame. With the mirror removed the
+image is **upright** (sensor top = scene top); with the mirror the §52 ROI mapping
+(top-L/top-R/centre/bottom-L/bottom-R inverted) applies. `peek_*.png` next to each CSV shows
+the frame with the five ROIs drawn.
+
+### 53.4 Aperture test, 2026-10-15 (pointing fixed, Gain 3, sweeps down, same encoder range)
+
+| | f/5.6, 250 us | click 1, 500 us | click 2, 1000 us | click 3, 1000 us |
+|---|---|---|---|---|
+| bowl bottom w10 (median) | 4.93 | 4.03 | **3.97** | 4.76 |
+| best single frame | 4.84 | 3.92 | 3.83 | 4.66 |
+| PSF FWHM (§52.5 calibration) | 15.6 um | 12.3 um | 12.1 um | 15.0 um |
+| best park, encoder | 3700 | 4200 | 4200-4400 | 4300 |
+| flat bottom (<= bottom + 0.3) | ~400 cts | ~800 | ~1000 | ~1000 |
+| ROI0 tower (far) / ROI1 facade (far) | 4.89 / 4.61 | 4.44 / 3.68 | 4.39 / 3.59 | 5.03 / 4.75 |
+| ROI2 (mid) / ROI3 trees+wall (near) | 6.03 / 6.00 | 4.31 / 4.86 | 4.16 / 4.77 | 4.40 / **3.93** |
+| light vs previous click | -- | x1.0 at 2x exposure = 1 stop | sun rising, inconclusive | x0.53 at equal exposure = 1 stop |
+| wall clock | 10:36 | 10:39 | 10:48 | 11:24 |
+
+Readings:
+
+- **One click buys most of the gain** (4.93 -> 4.03). The frame-wide bowl bottom then barely
+  moves at click 2 (3.97) -- but that number is the 10th percentile of all pooled edges and is
+  set by the few hundred sharpest edges, which already sit near the estimator floor. The
+  **per-area local w10** (512-px windows on the saved best frames, `best_frames\area_*.png`,
+  registration response gated) shows **click 2 sharper than click 1 in 6 of 9 areas, by
+  0.3-0.5 px, including far targets** -- the operator saw this by eye first:
+
+  | area (distance) | f/5.6 | click 1 | click 2 | click 3 |
+  |---|---|---|---|---|
+  | tower facade (far) | 5.34 | 4.94 | **4.61** | 4.64 |
+  | crane mast vs sky (far) | **3.98** | 4.10 | 4.37 | 4.69 |
+  | right tower windows (far, hazy) | 5.06 | 4.03 | **3.72** | 4.90 |
+  | Microsoft sign (mid) | 5.05 | 4.43 | **3.91** | 4.11 |
+  | billboard text (mid) | 5.86 | 5.52 | **5.04** | 5.26 |
+  | water tower (mid) | 4.72 | 4.11 | **3.52** | 4.14 |
+  | near building windows | 6.29 | 5.02 | **3.11** | 4.03 |
+  | near wall / AC unit | 7.01 | 6.07 | 5.11 | **4.76** |
+  | palm fronds (near) | 6.30 | 5.58 | 5.33 | **3.96** |
+
+  The near targets improving monotonically to click 3 is **depth of field** (focus was set on
+  the far/mixed scene), not PSF; the mid/far improvement from click 1 to click 2 is the lens.
+  Use local windows, not the frame-wide decile, to compare apertures.
+- **Best focus moves +500 counts** from wide open to click 1 and then stays. Camera untouched
+  (pointing drift measured <= 160 px). Same sign as the +300 seen on 10-14 (which had a
+  re-pointing confound). Spherical aberration: **focus found at f/5.6 is ~500 counts off at the
+  shooting aperture, which is more than the f/5.6 depth of focus. Focus at the aperture you
+  shoot with.**
+- **Depth of focus** 400 -> 800 -> 1000 counts: welcome against lash and encoder wander.
+- **Click 3 is not a measurement of diffraction.** The far ROIs got much worse (3.59 -> 4.75)
+  while the near ROI got *better* (4.77 -> 3.93); diffraction would hit all ROIs alike, so this
+  is the air at 11:24 vs 10:48. The f/16 Airy disc (21 um, 6 px) predicts a real penalty, but
+  these data cannot show it. To settle: alternate click 2 / click 3 back-to-back (2-3-2-3,
+  ~90 s each) so the air is common.
+- **Detents.** Clicks 1 and 3 measured as clean full stops (x1.0 brightness at doubled exposure;
+  x0.53 at equal exposure). The 10-14 estimate of "1.3 stops per click" was the sun: ground
+  brightness changed up to 50 % between runs minutes apart. So the ring is most likely
+  5.6 -> 8 -> 11 -> 16, but only a 20-s bracket at fixed light can prove it.
+- Visual: `D:\Project\aperture\day2_edges_4clicks.png` (and `_left/_right` halves), six scene
+  patches x four runs; `edges_f56_vs_f8.png` for 10-14.
+
+Recommendation carried to the flight: **click 2 (~f/11) if the light budget allows it at an
+exposure the vibration smear tolerates (53.6); click 1 (~f/8) as the floor** -- click 1 buys
+most of the sharpness for one stop, click 2 a further 0.3-0.5 px across the field plus ~25 %
+more depth of focus for a second stop. Re-focus at the shooting aperture either way.
+
+### 53.5 Lash, measured from the images
+
+Every sweep that reversed direction produced a V-curve with two bottoms: **down passes bottom at
+~3000-3100, up passes at ~4100 (10-14, 1000 counts)**; 10-15 runs had too few up frames to use.
+This is the §49 motor-side encoder backlash seen directly in focus, and it means a V-curve or a
+park comparison is only valid **within one sweep direction** -- hence `w10_vcurve --dir` and
+the operator protocol "sweep down, return fast". The 10-14 curve looked noisy and
+non-monotonic until split by direction; after the split it is smooth.
+
+### 53.6 Vibration: what is known and the measurement that is missing
+
+Forward motion is too small to matter at these exposures (`smear = v*t/GSD`; 400 mm at
+10,000 ft, 100 kn: GSD 2.63 cm -> 0.49 px at 250 us, 1.96 px at 1 ms; a box smear of b px adds
+~0.8 b to w10 in quadrature). The flight blur is isotropic (53.2) and §51.5 measured 10-16 px
+two-lobe PSFs inside single exposures, so **angular vibration is the prime suspect for the
+flight-side term**, and it cannot be measured on the bench. Planned, not done:
+
+- **Exposure bracket on the airframe** (engine at cruise RPM on the ground, or one flight
+  line): same aperture, 250/500/1000/2000 us alternating, >= 100 frames each; fit
+  `w10^2 = w10_static^2 + (0.8 * omega * f * t / p)^2` for the rms angular rate `omega`;
+  `ghost_check.py` for the two-lobe fraction per exposure; `w20_ang` bins for the axis.
+- **Gyro on the camera body**, synced to the exposure: ISM330DHCX breakout (Adafruit 4502,
+  6.67 kHz ODR, 5 mdps/rtHz -> ~0.1 px-equivalent noise over a 2 kHz band) logged over SPI by a
+  Teensy 4.1 / RP2040 Adalogger, with the camera trigger or exposure-active line timestamped
+  in the same log. Then per frame `smear_px = (integral of omega over the exposure) * f / p`
+  against that frame's w10 -- a model-free split of vibration vs everything else, plus the
+  spectrum that says what to damp. ICM-42688-P breakouts were unobtainable in 10-2026.
+- **Photon-transfer run** (20 frames x 6 exposures x each gain, static scene) to get K
+  (e-/ADU), read noise, full well and whether `Gain` is analog -> an SNR model in electrons that
+  transfers from the dim hazy bench to a downward noon view. Then the plan
+  `w10_total^2 = w10_lens(N)^2 + (0.8 t)^2 [(v/GSD)^2 + (omega f/p)^2]` with SNR as the
+  constraint and gain set last to put the 99th percentile at ~85 % FS (§41 rule: percentile
+  target, clip fractions as guardrails). Analog gain is free for sharpness, digital gain is
+  never worth using.
+
+### 53.7 Traps (each cost time)
+
+- **Direction.** Never bin a V-curve across sweep reversals (53.5).
+- **Pointing.** ROI numbers are only comparable if the ROI looks at the same thing: 10-14's
+  click-1 run was tilted 1473 px and the "field" changed meaning. Measure the shift (phase
+  correlation) before comparing ROIs or brightness; `edge_sbs.py` / `ratio.py` print it.
+- **Registration on a featureless window silently fails.** A crop aimed into the sky above a
+  roof produced two noise crops and two crops of the roof corner at different places, with
+  "local w10" numbers from noise edges -- the operator caught it by eye. Gate on the phase-
+  correlation response (< ~0.1 is junk) and on >= 150 edges before printing a local w10.
+- **Brightness comparisons must be registered and must be fast.** Comparing the top 150 rows
+  of two differently-pointed frames said "equal"; the registered ratio said x0.78. And the sky
+  dimmed 4-10 % *within* a 90-s run while the ground brightened 50 % between runs 9 min apart
+  -- any ratio across minutes is illumination-contaminated. A fixed-light bracket is 20 s.
+- **Exposure is not in the `.bay14line` metadata.** It is in the app log
+  (`cam1 ExposureTime=500 -> OK`), as are `Gain` and the Record ARMED / line OPEN / CLOSE
+  events. A sweep done without pressing **Record** opens a plain `L1_<time>` line (`sweep=sweep`)
+  that captures ~2 frames -- 10-14's third run was lost this way.
+- **Saturation gate.** The white wall of the near building puts ROI4 over the 0.5 % saturated
+  threshold already at 250 us wide open, so ROI4 reads "-" on 10-15; at click 2 / 1000 us the
+  sky p99 was 14781/16383 with 0.29 % clipped -- use ~1500 us, not 2000, for a further click.
+- **Encoding.** On this machine the editor's write path turns a file containing any non-ASCII
+  into UTF-16, which Python reports as "source code cannot contain null bytes". After every edit
+  of a `.py` or `.md`: `$b=[IO.File]::ReadAllBytes($p); if (($b|?{$_ -eq 0}).Count -gt 0)
+  {$t=[IO.File]::ReadAllText($p,[Text.Encoding]::Unicode);
+  [IO.File]::WriteAllText($p,$t,(New-Object Text.UTF8Encoding $false))}`. `w10_vcurve.py` is
+  kept pure ASCII ("sec." not the section sign) for this reason.
+- **Inline python in PowerShell** fights the quoting; put scratch in `%TEMP%\*.py` and run it.
+- **App lifetime.** The app ran from 10-14 14:37 through all of 10-15 without a restart; the
+  bring-up/teardown rule (`.cursor/rules/app-launch-kill-safety.mdc`) was never exercised.
+  Scoring a closed `.bay14line` while the app records the next one is fine (disk has ~2x
+  headroom at the delivered frame rate).
+
+### 53.8 Exposure vs gain: photon-limited, gain is linear and free (2026-10-15 14:52)
+
+Three parked lines at click 2, encoder 4129, ~30 frames each (`FOCUS_C1_L1_145234 / 145259 /
+145352`); per-pixel temporal variance vs mean on the raw green plane, flat unsaturated pixels
+only (gradient < 15 ADU/px, so pointing jitter x scene gradient cannot pose as noise -- an
+unmasked fit on a swept run gave K 0.22 with a *negative* read-noise intercept). Scratch
+`%TEMP%\ptc.py`, outputs `D:\Project\aperture\ptc_*.txt`.
+
+| | 1000 us, gain 3 | 500 us, gain 6 | 250 us, gain 7.5 |
+|---|---|---|---|
+| frame median ADU (predicted from run 1) | 6389 | 6397 (6389) | 3840 (3994) |
+| K e-/ADU from the shot-noise slope (predicted 0.26 x 3/gain) | 0.26 | 0.12 (0.13) | 0.10 (0.104) |
+| mid-grey SNR (predicted, proportional to sqrt exposure) | 39 | 28 (28) | 19 (19.5) |
+| ADC clip, electrons (16383 x K) | ~4200 | ~2000 | ~1700 |
+
+- **`Gain` is a linear multiplier** (3 -> 6 doubled the brightness to 0.1 %); the camera
+  rejects `Gain=8` (`FGSTATUS_INVALID_VALUE`), range tops out at **7.5**.
+- **Analog, no noise penalty measurable:** K and SNR follow pure photon statistics within
+  2-3 %. SNR is set by **photons = exposure x aperture** alone. The read-noise intercepts of
+  these fits (20-46 ADU) are extrapolations from 1600-10000 ADU and are not to be trusted.
+- **Gain 3 throws away dynamic range for nothing:** the ADC clips at ~4200 e- of a well that
+  is likely 12-13 ke- (K ~0.78 at unity), which is why the sky (15.7 % of the frame) was
+  saturated at 1000 us this afternoon. At gain 1 the same frame sits at a third of full scale,
+  nothing clips, SNR unchanged (read noise 2-3 e- is still ~3 ADU at unity). §41's "lower the
+  gain, not the exposure", now measured.
+- Flight: ~19 at 250 us, ~28 at 500 us mid-grey SNR at click 2 on a scene of this brightness;
+  exposure is a smear-vs-SNR trade only; gain = lowest value that keeps the brightest ground
+  of interest under clip (sky may clip).
+- Unexplained: w10 at the same park was ~5.1, ~4.0, ~5.1 across the three lines 25-50 s apart
+  (+-0.15 within each). Not noise (the noisiest line is not the sharpest); seeing or lens
+  settling. Recorded, not concluded.
+
+### 53.9 Reproduce
+
+```powershell
+py -3 tools/bay14_encoder_check.py --root D:\Project
+py -3 tools/flight_edges.py "D:\Project\aperture\day2_c1.csv" "D:\Project\Cam2439007_20261015_Project_FOCUS_C1_L1_103908_p*.bay14line"
+py -3 tools/w10_vcurve.py "D:\Project\aperture\day2_c1.csv" --bin 100 --png "D:\Project\aperture\day2_c1.png"   # auto --dir
+py -3 tools/w10_vcurve.py --self-check
+py -3 tools/flight_edges.py flight_2439007.csv "E:\Old files\*2439007*.tif"            # RGB TIFFs, same numbers as raw
+```
+
+~1 s per frame from D:; a 450-frame line takes ~7 min. Operator protocol for an aperture
+run: mirror off, near target (< 100 m) in the lower third, pointing untouched between runs,
+Record in M4, sweep down over the same range with a fast return, exposure x2 per click,
+`sat = 0 %` on the sky.
+
+## 54. Autofocus on `w10`: fast metric, frame budget, decision module (2026-10-15)
+
+Offline round only (agreed scope): the metric was made fast without changing a single number,
+the recorded flights were re-scored at every frame to measure how many frames a focus decision
+needs, and the algorithm exists as a hardware-free decision module validated by replay. Live
+integration is the follow-on (54.8). Pure ASCII section ("sec." not the section sign, 53.7).
+
+### 54.1 What exists
+
+| file | role |
+|---|---|
+| `host/capture/psf_w10.py` | the sec.52 metric, moved so the app can import it: `edge_widths`, `array_edges`, `frame_ok`, the gates and constants. Bit-identical to the old `tools/flight_edges.py` code. |
+| `tools/flight_edges.py` | readers + CLI only, imports the metric. New `--list FILE` (one path per line) and `--step N`. |
+| `tools/test_psf_w10_identical.py` | keeps a verbatim copy of the OLD per-edge loop; asserts identical widths/angles on synthetic edges at sigma 0..4 and identical every-column output on 23 recorded frames (`D:\_flight_quality\af_study\ref_old_w10.csv`); prints old vs new ms/frame. |
+| `tools/test_flight_edges_floor.py` | unchanged sec.52.5 floor table, still 1.73/3.05/5.06 vs predicted 1.75/2.97/5.11. |
+| `tools/w10_af_study.py` | the data study (54.3-54.5): noise model, V per run and direction, estimator bootstrap, sequential stopping rule. `--self-check`. |
+| `host/capture/af_w10.py` | `W10Focus.feed(encoder, stats) -> Action` decision module, no Qt, no hardware (54.6). |
+| `tools/af_w10_replay.py` | drives `W10Focus` with recorded sweeps (54.7) and a synthetic lens with backlash (`--self-check`). |
+| `D:\_flight_quality\af_study\` | every-frame CSVs: `edges_full_2439008_best.csv` (FOCUS_C2 145634/150849/151309, 1677 frames), `edges_full_2439008_141526_part.csv` (first 701 of 141526), `edges_full_2439007_part.csv` + `edges_full_2439007_rest.csv` (FOCUS_C3), `edges_full_2439008_prod.csv` (production 154517, step 2), `edges_full_2439006.csv` (FOCUS_C1), `june_2439008.csv` / `june_2439007.csv` (E:\Old files, lens fixed). `job_*.txt` / `list_*.txt` are the input lists, `log_*.txt` the scorer logs. |
+
+### 54.2 Speed, bit-identical (question 1)
+
+`array_edges` on an in-RAM 09-30 frame, 5 ROIs, this machine (`test_psf_w10_identical.py`):
+**old 460-560 ms -> new 130-165 ms** (3.4-3.5x; the spread is machine load, two runs on
+10-15). The frame period is 209 ms, so the metric now fits inside one frame; the plan's ~150 ms
+target is met on a quiet machine and the remainder is GIL-bound Python.
+
+What changed (and what did not): the per-edge width loop (contrast gate, 0..1 normalisation,
+overshoot gate, first 0.1/0.9 crossings, interpolation) is now array ops in `_widths`, in the
+same float32 arithmetic (numpy 2.4 NEP 50 keeps float32 for python-float operands, which is
+what makes identity possible); coherence is computed only at Canny candidate pixels (boxFilter
+stays full-ROI); the percentile stretch runs in one float64 buffer; the band is copied only when
+it is a memmap; demosaic + scoring of the 5 ROIs run in a 5-thread pool (cv2 releases the GIL).
+`rng` is per call, so results are deterministic. Upgrade path if 164 ms is still too slow in the
+app: a process pool over ROIs (the GIL is the ceiling now), or 3 ROIs instead of 5 (54.3 says
+that costs noise: 0.55 vs 0.45 px per frame). Both `test_psf_w10_identical.py` runs on 10-15
+printed "every column identical" for the 23 recorded frames.
+
+Disk is the real limit offline: ~0.85 s/frame from the USB HDD in ONE process; two concurrent
+readers thrash to 3.2 s/frame EACH. Score sequentially.
+
+### 54.3 Noise model (question 2, part 1)
+
+From `w10_af_study.py` on the every-frame CSVs (cam 2439008 FOCUS runs + June fixed-focus lines):
+
+- **(a) one frame, same ground, fixed encoder: sd 0.45 px** pooled over 5 ROIs (1736 consecutive
+  pairs). Per ROI it is 0.58-0.63 px, each ROI valid in ~86 % of gated frames; the median of
+  ROIs 0-2 only would be 0.55 px. Keep 5 ROIs.
+- **(b) content floor, different ground, lens fixed** (June lines): sweep-median spread 0.32 px
+  (cam 2439008, 16 sweeps of ~10) and 0.21 px (2439007, 13 of ~13) against 0.14 / 0.12 expected
+  from frame noise alone -> **content bias ~0.17-0.28 px** that does NOT average down with dwell.
+- (c) regressing w10 on log(n_edges) (sec.52.5) takes the per-frame sd from 0.76 to 0.62 px
+  (cam 8) and 0.64 to 0.59 (cam 7): modest, not used by the engine. On the 09-30 production run
+  154517 (cam 2, step 2, 122/429 gated) r = 0.78: the frames that barely pass the edge gate read
+  high, so a thin-edge frame is a biased frame, and the gate threshold is the real control.
+- Cam 2439007 (cam 3, FOCUS_C3_152517): frame sd **0.54 px** pooled, 0.65-0.76 per ROI, each ROI
+  valid in only 78-84 % of gated frames; station-to-station content bias is visibly larger than
+  on cam 2 (adjacent 150-c bins with 100+ frames each differ by 0.5-0.8 px).
+- **Gate yield** matters more than noise: 141526 (cam 2, cloud) passed 146/701 frames; the June
+  2439008 line dropped 40/206 as cloud; 152517 (cam 3) passed 1864/2907 (most drops are
+  `no_w10`, i.e. no ROI with enough edges); the clear cam-2 runs passed 95 %. The engine budgets
+  for this with `max_bad_frames` (60 consecutive gated-out frames before FAIL), not with a timer.
+
+Consequence (as the plan expected): with content bias between stations larger than the frame
+noise divided by sqrt(dwell), **one frame per station, many stations** (creep) beats dwelling.
+
+### 54.4 V curves and depth of focus
+
+`w10^2 = w0^2 + c (e - e0)^2`, robust lstsq per run and direction (sweeps are never binned
+across a reversal, 53.5). Cam 2439008, 2026-09-30:
+
+| run | dir | frames | vertex (95 % CI) | w0 | +0.3 px at | bracketed |
+|---|---|---|---|---|---|---|
+| FOCUS_C2_145634 | up | 254 | 128635 (128541..128698) | 5.96 | +-678 c | yes |
+| FOCUS_C2_151309 | down | 632 | 126913 (126894..126932) | 5.35 | +-308 c | yes |
+| FOCUS_C2_150849 | down | 690 | 125803 (wide) | 4.35 | +-749 c | NO (one flank) |
+| FOCUS_C2_141526 | down | 146 | 129520 (wide) | 5.74 | +-1165 c | NO (cloud) |
+
+- Up vs down vertex differs by 1722 c on the same camera within 6 min: the lash (1000-1290 c,
+  sec.49/53.5) plus whatever drifted. The engine never mixes directions.
+- **The V is not a parabola far out.** Binned medians of 151309: the low side is a shelf
+  (6.0-6.5 px over 126200-126800) and the high side rises fast (5.3 -> 6.9 px in 200 c); the
+  actual minimum sits at 126970-127070 while the global parabola says 126913. A long tail leans
+  any parabola's vertex ~100 c toward itself, which is why the engine refits on the bowl only
+  (`fit_window_depths = 2.5`) and why the replay scores against two references (54.7).
+- Depth of focus (+0.3 px) is 300-700 c on cam 2.
+- **Cam 2439007 (cam 3), FOCUS_C3_152517 up, 1834 gated frames, 11048..15339**: global vertex
+  12010 (CI 11937..12064), w0 7.00 px, +0.3 px at +-740 c; bowl-local fit 12066 / 6.96 px /
+  +-685 c; binned minimum 12250-12400 at 6.2-6.5 px. NOT bracketed: the low side is a 7.0-7.2 px
+  shelf over 11048-11950 that never rises, so the recording cannot be replayed (the engine would
+  have backed off further). Depth is cam-2-like; w0 is 1.6 px softer (53.2).
+- **Cam 2439006 (cam 1), FOCUS_C1_142517 up + production 154517** (`edges_full_2439006.csv`,
+  3780 frames): only 613 pass the gates (2741 `no_w10`; median ROI mean 28500, i.e. cloud for
+  most of the run), frame sd 0.69 px, each ROI valid in only 41-56 % of gated frames. The global
+  fit is degenerate (a few 10-12 px frames 2000-6000 c below the bowl); the bowl-local fit on the
+  564 gated frames in 113870-115380 gives **vertex 114611, w0 7.08 px, +0.3 px at +-415 c**,
+  residual 1.08 px: adjacent 100-c bins with 30-70 frames each swing 6.4-8.8 px, i.e. ~1 px of
+  station content bias through the cloud gaps. Not bracketed, no replay. The 16 % gate yield is
+  the AF problem on this camera, not the curve.
+- **The other FOCUS runs** (`c1_151553.csv`, `c1_145844.csv`, `c1_145401.csv`, `c3_144221.csv`,
+  every 2nd frame, replayed with `--all`): cam 1's best focus is 114250-114600 (w0 ~6.5 px) on
+  all three of its sweeps; FOCUS_C1_145401 up is the clean bowl (7.4 -> 6.45 -> 12 px over
+  113700-118000) and the engine parked **8/8 at 114409-114621, spread 61 c, rms 75 c** vs the
+  binned minimum in 13-33 gated frames. 151553 (latest) is only 1950 c wide for a +-900 c depth
+  and 145844 has no frames between 113000 and 114600, so neither can be replayed honestly.
+  Cam 3's FOCUS_C3_144221 down is a clean bowl (8.9 -> 6.5 -> 9.3 px over 10200-13200, bottom
+  11700-12000): **8/8 at 11753-12087, spread 93 c, rms 96 c**, 14-43 gated frames. Its up-sweep
+  barely sampled the bottom (7/8, spread 152 c). Down vs up bottoms on cam 3 differ by ~400-450 c
+  (144221 down 11800-11900 vs 144221/152517 up ~12250): this camera's lash looks smaller than
+  the bench camera's 1000-1290 c (one data point). Frame sd on these runs 0.47-0.59 px.
+
+### 54.5 Frame budget (question 2, part 2)
+
+Estimator bootstrap: frames resampled from the recorded sweeps to emulate three designs, error
+of the fitted vertex against the full-data vertex, rms / p90 in counts:
+
+| total frames | dwell 5/station | creep 1/step | two-pass | | dwell | creep | two-pass |
+|---|---|---|---|---|---|---|---|
+| | 145634 (depth +-678) | | | | 151309 (depth +-308) | | |
+| 10 | 135 / 196 | 117 / 188 | 107 / 171 | | 124 / 170 | 101 / 136 | 107 / 147 |
+| 15 | 109 / 179 | 57 / 93 | 106 / 186 | | 112 / 130 | 119 / 118 | 157 / 218 |
+| 20 | 116 / 187 | 61 / 102 | 131 / 225 | | 326 / 123 | 70 / 94 | 790 / 224 |
+| 30 | 66 / 99 | 57 / 90 | 112 / 180 | | 62 / 103 | 42 / 61 | 109 / 172 |
+| 45 | 56 / 95 | 63 / 107 | 48 / 79 | | 67 / 112 | 34 / 55 | 116 / 181 |
+| 60 | 34 / 53 | 66 / 108 | 60 / 99 | | 40 / 68 | 27 / 40 | 132 / 195 |
+| 90 | 25 / 42 | 63 / 104 | 47 / 84 | | 30 / 48 | 20 / 33 | 109 / 158 |
+
+Reading: creep reaches 40-70 c rms (0.1-0.2 depth) by **15-30 frames = 3-6 s**; dwell needs
+60-90 frames for the same; two-pass is unreliable below 45 frames (the coarse pass picks the
+wrong bowl). Creep's floor (~60 c on 145634) is the content bias, not the frame count.
+
+The decision module in replay on the same recordings (54.7; 8 random starts each, the full
+engine with back-offs, lash take-up skipped because the recordings are one-directional):
+
+| sweep | parks | error vs nearer reference (rms) | park spread over starts (sd) | gated frames used | wall frames |
+|---|---|---|---|---|---|
+| 145634 up, depth +-511 (local fit) | 8/8 | 61 c | 41 c | 24-40 (one 82) | median 42 = 9 s |
+| 151309 down, depth +-264 | 8/8 | 68 c | 88 c | 12-43 | median 49 = 10 s |
+
+So **20-30 gated frames (4-6 s of measurement) per focus**, plus motion: one or two back-offs
+of `start_offset` and the park return of `lash_counts`. In the harness the park return costs a
+25-frame stall wait because the recording ends; a real lens just drives there. The park lands
+within 0.12-0.26 of a depth of focus (<= 0.03 px of w10) of the truth, and is reproducible to
+41-88 c across starting points. (The `[sequential]` section of the study tool reports 100 and
+443 frames for the same rule because it replays the recorded dwell sweeps frame by frame, i.e.
+10-30 frames per station; the engine moves every frame, so that figure is the dwell design's,
+not the engine's.)
+
+### 54.6 Algorithm (`host/capture/af_w10.py`)
+
+`W10Focus.feed(encoder, stats) -> Action(kind, target, reason)`, `kind` in hold / move / done /
+fail; `stats` is the `array_edges` dict (or None if the frame was not scored). Gates are
+`frame_ok`: `n_edges >= 300`, `n_roi >= 1`, `med_mean <= 22000`, not `enc_stale`.
+
+States START -> SWEEP -> REFINE -> PARK -> DONE, or FAIL:
+
+- **START**: back off `start_offset` (3500 c) against the sweep direction from wherever the lens
+  is, so the sweep comes through the vertex in the bench direction (down, 53.5).
+- **SWEEP**: one gated frame per step of `step_counts` (100 c). Frames inside the first
+  `takeup_counts` (1200 c) after the reversal are not sampled (motor turns, lens does not). The
+  step is taken from the further of the encoder reading and the last target (a lagging reading
+  must not shrink the step). Refit on every gated frame; the first fit needs `min_frames` (8).
+  Leave SWEEP when `bracketed`: on EACH side of e0 at least 3 frames beyond one depth whose
+  median w10 is >= rise/2 above the near frames' median (`flank_seen`).
+- **Start past the vertex** (`_started_past_vertex`, checked once `min_frames` samples exist from
+  the current start): either the fit's vertex lies inside the travelled range and the end flank
+  passes `flank_seen` while the start flank does not, or (model-free, for a spurious bowl
+  fitted on a shelf) the first third of the travel is the sharpest and w10 rises with travel
+  (segment medians, corr > 0.6). Then back off again from the start point; `max_backoffs` 3.
+- **REFINE**: keep stepping (fine `refine_step` 50 c inside the bowl, normal steps once a depth
+  past the vertex, for lever arm) until the bootstrap 95 % CI half-width of e0 <= `tol` =
+  clamp(`tol_frac` 0.5 x depth, 40, 300) c, or `max_refine_frames` 40. Standing still would only
+  re-sample one patch of ground (54.3 b).
+- **PARK**: drive `lash_counts` (1500 c, > take-up) past the vertex on the start side, then
+  approach e0 in the sweep direction. DONE when within `settle_counts` (60 c), or passed in the
+  sweep direction, or stalled.
+- **Fit**: global robust parabola, then a refit on samples within `fit_window_depths` (2.5)
+  depths of its vertex (54.4). CI by frame bootstrap (`n_boot` 60) on the same window. Known
+  limit: the frame bootstrap does not see station-to-station content bias, so the CI is
+  optimistic by roughly the content floor; `tol_frac` 0.5 absorbs that (1/3 was unreachable:
+  CI +-250-400 c at 30 frames).
+- **Stall** = a commanded move with the encoder flat for `stall_frames` (25). FAIL in SWEEP
+  (limit or dead drive), proceed in PARK, re-base in START. FAIL also after `max_bad_frames`
+  (60) consecutive gated-out frames, no encoder, `span_counts` (7000 c) swept without a bracket,
+  or `max_backoffs` exhausted.
+- `report()` gives state, vertex, w0, CI, depth, frames, seconds.
+
+Depth and tolerance adapt per camera automatically (they come from the fit), so one constant
+set serves cams 1-3; only `direction`, `takeup_counts` and `lash_counts` are mechanical.
+
+### 54.7 Replay harness (`tools/af_w10_replay.py`)
+
+`RecordedLens` serves recorded frames by commanded encoder: a random frame within `--window`
+(120 c) of the position, clamped to the recorded range (at the clamp it serves varied end frames
+at a flat encoder, so the stall detector sees what a real limit looks like), a gap is filled
+from the nearest frame ahead in the sweep direction. Starts are placed so the first back-off
+lands inside the recording; `takeup_counts` is 0 because the recordings were taken in one
+direction. Pass = parked within half a depth of the NEARER of two vertex references, the
+bowl-local parabola and the minimum of smoothed binned medians, because on these recordings they
+disagree by 100-270 c and the data cannot say which is right; park spread across starts is
+printed as the precision. `--from ENC` forces the start point (e.g. 2900 c above focus on 145634:
+parked +70 c from the fitted vertex in 26 gated frames), `--trace` prints every frame (encoder,
+w10, n_edges, sampled or why not, fit, action), `--min-edges` / `--min-roi` override the gates.
+Starts beyond the recording are clamped, and a sweep that runs off the end of a recording gets
+frames at one flat encoder, which drags the fit (151309 from its top: -300 c); the random-start
+statistics are the ones to quote. `--self-check`: a synthetic lens with a real backlash model (the lens
+follows only once the motor crosses +-lash/2), 0.6 px frame noise, 0.4 px content blocks every
+8 frames, 8 % cloud, 4 seeds: done in 63-80 frames with lens error -102..+4 c; a vertex far
+outside the span must FAIL; all-cloud must FAIL on the gate.
+
+### 54.8 Integration prerequisites (follow-on plan)
+
+- The M4 tap gives `_on_raw_focus_frame` a **4x-decimated** frame; w10 needs the five full-res
+  1024-px ROIs at the sec.52.2 centres. Either extend `set_preview_rois` (two panes today) to
+  five crops or crop the full-res slot directly. At 164 ms the scoring fits one frame period
+  but must run off the GUI thread (`_POOL` already exists in `psf_w10.py`).
+- Drive `EncoderAxis` from the `Action`s: `move` targets are absolute encoder counts; the engine
+  assumes nothing about speed, only that the reading advances (stall detector) and that the
+  frame's encoder is the frame's (`enc_stale` gate).
+- Panel readout: state, vertex +- CI, depth, frames; `report()` has them.
+- Mechanical constants to confirm on the aircraft: `takeup_counts` 1200 and `lash_counts` 1500
+  were taken from 53.5 (1000-1290 c); motor speed decides how long a 3500 c back-off takes.
+- Depths are 300-750 c on all three cameras, so one constant set serves them (`tol_min` 40 and
+  `refine_step` 50 would only be too coarse below ~100 c).
+- Cams 1 and 3 carry larger station-to-station content bias (0.5-1 px, 54.3-54.4) than cam 2,
+  so their park spread will be wider than cam 2's 41-88 c; their depths (+-400-750 c) absorb
+  that. Their real risk is gate yield (16 % on cam 1 through cloud): `max_bad_frames` 60 is
+  12 s of cloud before FAIL; raise it, or let the operator retry, rather than loosen the gates
+  (54.3 c: frames that barely pass read high).
+
+### 54.9 Reproduce
+
+```powershell
+py -3 tools/test_psf_w10_identical.py                                   # identity + old/new ms
+py -3 tools/test_flight_edges_floor.py
+py -3 tools/flight_edges.py D:\_flight_quality\af_study\out.csv --list D:\_flight_quality\af_study\job_2439008_best.txt
+py -3 tools/w10_af_study.py --self-check
+py -3 tools/w10_af_study.py D:\_flight_quality\af_study\edges_full_2439008_best.csv --fixed D:\_flight_quality\af_study\june_2439008.csv D:\_flight_quality\af_study\june_2439007.csv --tol-frac 0.5
+py -3 tools/af_w10_replay.py --self-check
+py -3 tools/af_w10_replay.py D:\_flight_quality\af_study\edges_full_2439008_best.csv --starts 8 [--verbose]
+```
+
+### 54.10 Traps
+
+- Two scorer processes on the USB HDD: 3.2 s/frame each vs 0.85 s alone. One at a time.
+- `Set-Content -Encoding UTF8` writes a BOM; use `New-Object Text.UTF8Encoding $false` (53.7).
+- "Truth" on a recorded sweep is only good to ~100-200 c (54.4); judge the engine by its park
+  spread and by half-a-depth pass/fail, not by rms against one parabola.
+- A harness that re-serves the same end frame at the range limit makes a perfect flat shelf and
+  corrupts the fit; serve varied frames at a flat encoder instead.
+- The early (8-frame) fit extrapolates a vertex anywhere; never let a rule that backs off or
+  fails act on a fit whose vertex is outside the travelled range, and require fresh samples
+  from the current start before judging it.
+- **A stricter frame gate is not free.** Gated frames cost nothing but time (the lens holds and
+  takes the next frame), but on 145634 the frames nearest the vertex had the FEWEST edges
+  (325-1000 vs 3000-6000 on the flanks: that ground, not the optics). `--min-edges 1000
+  --min-roi 3` turned 16/16 parks into 14/16 with twice the spread; `2000 / 4` starved the
+  up-sweep to FAIL. If weak frames are the worry, correct w10 by log(n_edges) (54.3 c) rather
+  than raise the threshold.
+
+
+### 54.11 Which percentile? (2026-10-17)
+
+Question: does a lower percentile (fewer, "realer" edges) or a higher one (more averaging) give a
+steadier focus reading than w10? `tools/w10_pct_score.py` scores frames with w2..w50 of the pooled
+widths plus k30/k100/k300 (mean of the k sharpest edges, a size-independent "few real edges");
+`tools/w10_pct_study.py` compares them. Data: FOCUS_C2_151309 (651 gated frames, dense dwell
+sweep) and the June 2439008 fixed-focus line (162 frames, different ground), CSVs
+`pct_151309.csv` / `pct_june_2439008.csv` in `D:\_flight_quality\af_study\`.
+
+| stat | frame sd (px) | slope px/1000c | noise in counts | creep vertex rms, 20 / 30 frames | content floor (px / counts) |
+|---|---|---|---|---|---|
+| w2 | 0.50 | 1.34 | 373 | 116 / 73 | 0.27 / 197 |
+| w5 | 0.48 | 1.49 | 320 | 131 / 58 | 0.24 / 160 |
+| **w10** | 0.45 | 1.60 | 277 | 130 / 54 | **0.23 / 143** |
+| w15 | 0.46 | 1.65 | 276 | 114 / 49 | 0.38 / 228 |
+| w20 | 0.43 | 1.69 | 251 | 71 / 45 | 0.41 / 245 |
+| w30 | 0.42 | 1.75 | 238 | 73 / 40 | 0.35 / 200 |
+| w50 | 0.41 | 1.93 | 211 | **53 / 32** | 0.46 / 238 |
+| k30 | 0.41 | 1.13 | 359 | 109 / 86 | ~0 |
+| k300 | 0.40 | 1.45 | 275 | 75 / 61 | ~0 |
+
+- Frame-to-frame noise does fall with a higher percentile, but only 0.50 -> 0.41 px from w2 to
+  w50; going lower than 10 % adds noise (fewer edges in the tail).
+- Higher percentiles also respond MORE to defocus (slope 1.3 -> 1.9 px per 1000 c), so in encoder
+  counts one frame of w50 is worth 211 c against w10's 277, and the engine's creep fit locates the
+  vertex ~1.7x more precisely on this sweep (32 vs 54 c at 30 frames).
+- The price is content dependence: at fixed focus over different ground w10 moves 0.23 px, w15-w50
+  0.35-0.46 px (in counts 143 vs 200-245). The median width is a property of the scene, not the
+  lens. A constant offset does not move a V's vertex, but ground changing along a sweep tilts it,
+  and the higher percentiles are twice as exposed to that. One sweep over benign ground (151309)
+  cannot show this risk; the June line does.
+- Fixed-count sharpest edges (k30..k300) have no measurable content floor and the lowest noise,
+  but the lowest slope: the k sharpest of noisy widths are partly noise-selected, so they flatten
+  toward a floor and respond less to defocus; vertex precision is the worst of the table.
+- All statistics put the full-sweep vertex within 100 c of each other (126906-127005), so none is
+  systematically off on this sweep; the choice is about precision vs content exposure.
+
+Verdict: keep **w10** as the reported score (lowest content dependence, the calibrated number of
+sec.52.5). For the AF fit a higher percentile (w20-w50) would buy precision on ground like 151309
+at the cost of 2x the content exposure; before changing the engine, run `w10_pct_score.py` on
+145634 (up, other ground), the cam-1/cam-3 clean bowls (54.4) and the June 2439007 line, and
+look for the trend term (vertex shift of w50 vs w10 across sweeps), not just the noise.
+
+### 54.12 Live w10 while recording (M0/M1/M3), 2026-10-17
+
+One frame per sweep (F7) of every recording camera is scored with the sec.52 metric and shown
+in the preview (bottom-right overlay, latest line per camera) and in the log
+(`w10 cam2[2439008] L1 S51 F7  w10 5.31 px  (1832 edges, 5 ROI, enc 128612)`; a frame that
+fails the sec.52.4 gate is still logged, tagged `[gated: cloud]` / `[gated: few edges]`).
+
+- `host/capture/w10_live.py` `W10LiveScorer`: `offer(pool, slot_idx, meta)` is called by the
+  acquisition thread inside `_submit_slot` while it still owns the slot, just before
+  `pool.submit(job)`. It copies the five 1028x1028 ROIs (~10 MB, a few ms; `psf_w10.crop_rois`)
+  and returns; one background thread runs `psf_w10.score_rois` (~150 ms) and `scored` carries
+  the dict to `MainWindow._on_w10_live_scored` (queued to the GUI thread).
+- **Recording first**: the offer is skipped, not queued, when a score is already in flight (one
+  across all cameras) or when `free_q` holds fewer than `min_free_slots` (3) free slots (writer
+  behind). Any exception inside is swallowed and debug-logged; the submit path never sees it.
+  Counters `skipped_busy` / `skipped_pressure` / `scored_count` on the scorer.
+- Per camera: one score per ~2.7 s sweep -> 3 cams ~ 0.17 core. The ROI copy happens on the
+  acquisition thread once per sweep; the score runs in `psf_w10._POOL` (5 threads, cv2 releases
+  the GIL) so GIL contention with the acquisition thread is a few ms per sweep.
+- Operator switch: `Live w10: On/Off` button in the preview header next to `Show log`
+  (`MainWindow._on_w10_toggle_toggled`). Default on. Off detaches the scorer from every pipeline
+  (`set_w10_live(None)`), hides the overlay and ignores a score that was in flight; on re-attaches
+  and clears the fail-safe. Both go to the log as `w10 live scoring on/off (operator)`. Pipelines
+  connected later honour the current state. A live-vs-off comparison in flight (since black
+  frames on the bench do not load the writer like real ground, 54.12 above) is: fly a line with
+  it on and one with it off and compare `dropped:N` and the writer counters.
+- Frame choice: `W10LiveScorer(frame_in_sweep=7)`. M3 only scores while collecting (frames outside `?`/`!` are not submitted, so they have
+  no F index). M4/M5 are not covered (no writer submit) -- the focus panel owns those.
+- `array_edges` is now `score_rois(crop_rois(...))`; `test_psf_w10_identical.py` still passes
+  (bit-identical). `tools/test_w10_live.py`: fake pool + synthetic frame; live score == array_edges,
+  busy and pressure skips, metadata round-trip, queued delivery, closed after `shutdown()`.
+- Shutdown: `closeEvent` detaches the scorer from every pipeline, then `shutdown()` joins the
+  one worker (<= one ~150 ms score), before the grabber teardown (same reason as `_af_score_pool`).
+- **Fail-safe (2026-10-17)**: "no interference" cannot be proven offline (the ROI copy latency
+  on the operational machine, GIL contention from the Python parts of the score, Qt load are
+  all plausible but unmeasured), so the scorer steps aside on evidence. The pipeline calls
+  `W10LiveScorer.note_drop(cam, line)` at the three places a recording frame is lost to
+  backpressure: pool has no free slot (`AcquisitionThread.run`, `_dropped_writer_not_ready`),
+  `work_q` full (`_submit_slot`, `_dropped_due_to_queue_full`), and the SDK callback's
+  `frame_queue` full while holding a full-res slot (`CameraPipeline._on_backend_frame`,
+  `_dropped_full_queue` -- the one the scorer could cause via the GIL). The first drop on a
+  line sets `disabled_line`; every offer on that line is refused (`skipped_disabled`) and the
+  overlay shows `w10 OFF (recording drop)`; the next line re-arms it. Both transitions go to
+  the GUI log through the `notice` signal ("... dropped a recording frame on line N; live
+  scoring off for the rest of this line (scored K, in flight: bool)" / "live scoring back on
+  (line N+1)"). Not attributed: any backpressure drop stands it down, ours or not -- the cheap
+  side. `note_drop` is a comparison in the common case and safe from the SDK callback thread;
+  drops before the first offer are ignored. In M0 without line markers the line number does
+  not change, so "off" lasts until the next line / restart.
+- Each score line now ends with `copy N ms, score N ms` (ROI copy on the acquisition thread,
+  score on the worker), so a ground run gives numbers, not just a yes/no. Synthetic frame on
+  the dev machine: copy 3 ms, score 131 ms.
+- Not yet exercised live. The measurement has to be on the operational machine (3 cameras;
+  the bench grabber has 2 channels): a few minutes of M0 with Record on, scorer attached and
+  detached (`pipeline.acq.set_w10_live(None)`), comparing `dropped:N`, `acq hz`, written/failed,
+  the `copy`/`score` ms in the log, and the `notice` lines. A clean run shows `dropped:0`, one
+  `w10` line per sweep per camera, no `w10 OFF`.
+
+### 54.13 w10 behind the M4 Autofocus button (2026-10-18)
+
+The 54.8 follow-on. `host/capture/autofocus_w10.py` `AutoFocusEngineW10` is a fourth engine
+behind `AutoFocusController` (`algorithm="w10"`, now the default; `IRON661_AF=sweep_and_hold` /
+`af3` select the old ones; focus-panel combo `AF: w10 (PSF)` first). Same start/stop/feed_frame
+surface as v2/v3, so the button, Stop, the status line, the AF graph and the scatter all work
+unchanged. Not exercised on hardware yet.
+
+- **Frames.** `start()` calls `pin_rois_cb(psf_w10.roi_boxes())` -> `MainWindow._af_pin_rois`:
+  full-res emission on, `set_preview_rois` with the five 1028x1028 sec.52.2 boxes (apron
+  included, Bayer-quad aligned; identical pixels to `crop_rois`), `_af_crops_active` so the
+  scene trackers leave the pins alone. Each batch reaches `_on_raw_focus_preview_crops`, which
+  hands it to `controller.feed_crops` before the old v2/v3 branch. One `score_rois` at a time on
+  the engine's own worker thread (~150 ms); a batch arriving while one is in flight is skipped.
+  The run-state(False) handler's `_af_enable_full_res(False)` clears the pins at the end.
+- **Encoder.** Raw `serial.encoder_position`, read on the GUI thread when the batch arrives (the
+  frame of the recorded V-curves and of `W10Focus`; not the per-run axis position). Known
+  limit: the ~10 Hz encoder lags the exposure by up to a frame; the step the engine attributes
+  a sample to can be one step late. Stale by frame-lag, not by camera (`enc_stale` is "").
+- **Polarity is measured every run.** The focus motors are brushed DC and each lens may have its
+  leads the other way round: the first live press (cam 2439007, 10:16) ran the back-off the
+  wrong way on the sec.23.6 sign (-24 c per '+' pulse was measured on another lens). The engine
+  now starts with an 8-pulse '+' probe, waits for the encoder to settle and takes the sign of
+  the move as the run's counts/pulse sign (`w10 AF: polarity: '+' x8 moved the encoder -190 c
+  (-23.8 c/pulse) -> '+' = -24 c/pulse`). Under 2 pulses of motion it retries once the other
+  way (probe into an end stop), then FAILs. The encoder is motor-side of the lash so the probe
+  reads cleanly; its ~200 c are swallowed by the back-off. The v2/v3 engines still trust the
+  config sign (`af_counts_per_pulse`) -- per camera, that is a guess.
+- **"Settled" means moved-then-flat, not just flat.** The 10:27 repeat runs FAILed `motor did
+  not move on the polarity probe` while the panel buttons moved the lens fine: the probe was
+  judged 445 ms after it was sent. Command -> `$S0*` ack (~90 ms) -> pulse line -> next 10 Hz
+  `$ENC` report is ~0.5 s = 2-3 frames in which the encoder still reads the OLD value, and the
+  first glue version counted those as "2 flat frames, settled". `_settled()` (one helper for the
+  probe and every transit burst) now returns settled only once the encoder has CHANGED since the
+  burst and then read flat for 2 frames; "no motion" is declared only after `no_motion_frames`
+  (6, ~1.3 s). During a no-motion wait the transit feeds the engine unscored each frame (stall
+  detector) and re-sends the pulses every 6 frames. The synthetic check models the latency
+  (`lag_frames=3`); the first version fails it the same way the bench did.
+- **Drive.** `W10Focus` assumes a move has landed by the next frame (replay semantics), so the
+  glue owns the transit: a `move` is one str0 burst toward the target (counts/pulse magnitude
+  from the shared app config, sign from the probe), capped at 50 pulses per line (the manual spinbox's
+  envelope; longer lines untested on the PCB) and, beyond 4 pulses, aimed 0.75 of the way so an
+  uncalibrated long-burst counts/pulse cannot overshoot the final approach onto the vertex.
+  Frames with the encoder still > `settle_counts` from the target are neither scored nor fed;
+  the next burst goes only after the encoder has moved and then reads flat for 2 frames (motor
+  stopped, encoder caught up) -- no re-command on stale feedback (23.7). A burst that moves
+  nothing is fed to the engine unscored so its own stall detector sees the limit. Stop holds in
+  place (v2 rule).
+  Cost: a 3500 c back-off is ~6 bursts / ~15 frames; a synthetic run parks in 100-135 frames.
+- **Engine fix** (`af_w10.py`): a back-off that stops SHORT of its start point (end stop) read
+  as "already past it" (`travelled > 0`), began the take-up from a position never reached and
+  then failed on the generic stall. `landed` is now tracked from the back-off command until the
+  encoder is within `settle_counts` of the start (or beyond it); a stall before that re-bases
+  ("back-off stopped short ... sweeping from here"). `af_w10_replay.py --self-check` unchanged
+  (63-80 frames, -102..+4 c).
+- **Log lines.** `w10 AF: start at enc N, sweeping down`; every engine state line (`[sweep] f12
+  bracketed: vertex ... CI ... depth ... tol`); a progress line every 10th frame (`[sweep] f20
+  enc 129400  w10 17.41 px (3000 edges)  fit e0 ... -> target (move)`); `w10 AF: DONE (parked)
+  vertex N +-CI c, w0 W px, depth +-D c; S samples in F frames` or `FAILED (reason)`.
+- **First live park, 2026-10-18 10:23, cam 2439007 (bench, 400 mm):** probe `'+' x8 -> +163 c
+  (+20.4 c/pulse)`, i.e. this lens is wired opposite to the sec.23.6 sign and a multi-pulse str0
+  line delivers slightly LESS per pulse than the single-pulse 24. Back-off to 3663, sweep down,
+  bracketed at f114: `vertex -1010 CI +-41, depth +-373, tol +-187`; park via +482, `DONE at
+  -966` (44 c from the vertex, ~depth/8), w0 3.53 px, 42 gated samples (2400-ish edges/frame),
+  122 frames (~25 s). Operator judged the parked image good. Still open: the operator protocol
+  (hand-focus to NEAR focus first; the back-off is 3500 c, `span_counts` 7000), repeatability
+  across starts (park spread, 54.4 says expect 40-90 c on cam 2), cams 1/3 through cloud, and
+  `approach_frac` -> 1 now that long bursts are known not to over-deliver.
+- Display gain (preview spinbox) now also drives the M4 views: Coarse preview, AF tile zoom,
+  Fine tile + insets, two-object panes (`FocusPanel.set_display_gain`, `gain=` through
+  `m4_*_tile_rgb_from_frame`). Preview only; nothing scored or written changes.
+- Bench repeatability, three camera positions (10:23, 10:34, 10:36): park landed +44/+37/+44 c
+  from the vertex every time (it stops inside `settle_counts` approaching from the far side --
+  a constant ~40 c bias, ~depth/9, removable by aiming past the vertex). w0 3.53/3.61/4.21 px
+  with depth +-373/+-382/+-733: the third is a different V, not a worse park -- a broader,
+  higher-floored curve for the same lens means the five ROIs disagree on focus (target tilt /
+  scene depth) or the sharpest edges in view are softer. Since 14:30 the DONE/FAILED line ends
+  with the parked frame's per-ROI widths (`; rois TL 3.6 TR 3.7 C 5.1 BL 4.4 BR -- px`, `--` =
+  no w10 from that ROI; `report()["roi_w10"]`) -- a spread across the five is tilt / uneven
+  depth, a uniform rise is a soft scene.
+- **Every run writes a CSV** to the Session logs folder, `Iron661_w10af_<stamp>.csv`
+  (`FocusCsvLogger` with its own header/prefix; path on the polarity line and on the DONE line,
+  `report()["csv"]`). One row per frame the engine saw -- scored, gated out, or an unscored
+  transit/stall frame (w10 empty): `timestamp, frame, state, encoder, gated, w10, n_edges,
+  n_roi, med_mean, w10_TL..w10_BR, fit_e0, ci_half, depth, action, target, reason`. `state` is
+  the engine state the frame was fed in, `action`/`target` its decision. The flight's per-ROI
+  V-curves (field tilt per camera) come out of these files for free.
+
+- **Counts/pulse is measured too, and learned (2026-10-20, 300 mm on cam 2439008).** The probe
+  read -33 and -41 c per '+' pulse on this lens against the configured 24 (the 400 mm, 23.6).
+  The first run still parked (DONE -9078, vertex -9021 +-218, w0 4.94 px, depth +-607 c, only
+  the centre ROI sees the jig target: `rois TL -- TR -- C 4.79 BL -- BR --`), but the second hunted
+  around its park return forever: inside the 4-pulse "exact" zone a 100 c error got a 4-pulse
+  burst that moved 160 c, overshot the 60 c settle window, came back, overshot again. The glue
+  now takes the probe's magnitude (|delta| / 8) as the run's counts/pulse and, after every
+  settled drive burst of >= 4 pulses whose sign agrees with the probe, moves the estimate
+  half-way to (encoder moved / pulses sent) -- long str0 lines deliver differently from the
+  8-pulse probe, so the first long burst re-calibrates the rest. The DONE line ends with the
+  learned value (`'+' = -38.2 c/pulse`; `report()["counts_per_pulse"]`). The config value is
+  now only the fallback magnitude before the probe. Unscored transit frames are not in the CSV,
+  so a hunt shows up there only as a run whose last row is the park `move` with no `done`.
+
+- **A shelf on the start side defeated the fit (2026-10-21, f/4, day-2 replication).** The
+  operator had left the lens 2300 c above focus, so the back-off landed 5700 c out, where the
+  metric sits on its ~11 px ceiling (the ESF window is +-10 px): 23 flat frames, then a textbook
+  bowl (3.5 px at 1350, both flanks to 7+ px), yet `FAIL swept 7018 counts without bracketing`.
+  Two causes, both in `af_w10.py`: (1) `fit_v` on ALL samples found no convex parabola (ceiling
+  + descent reads concave) and `fit_v_local` only refits inside a window around a global vertex
+  it never got -- now, when the global fit is None, the bowl is seeded model-free
+  (`bowl_mask`: samples within 2 px of the 3-sample running-median minimum) and refined as
+  usual; (2) `flank_seen` wanted >= 3 samples within HALF a depth of the vertex, which at the
+  100 c sweep step holds 2 on a +-263 c lens -- the near window is now one depth. The recorded
+  frames fed back through the fixed engine bracket at f69 (vertex 1349 +-32, depth +-269) and
+  park; the replay seeds, the orthophoto sim and the engine self-check are unchanged; a `Shelf`
+  lens (w10 clipped at 11, back-off 6000 c out) is in `af_w10_replay.py --self-check`. Operator
+  rule still stands (hand-focus near first), but the engine no longer needs it.
+
+### 54.14 Closed loop over a real orthophoto (`tools/w10_sim_tiff.py`, 2026-10-18)
+
+The replay (`af_w10_replay.py`) can only serve frames the recorded sweeps contain. This harness
+RENDERS them: a 13400 x 9528 window rolls along `Running TIF/Bnei_brak.tif` (77786 x 15021) or
+`Pardes_hana.tif` (127454 x 15877) at 40 m/s with 5 cm/px (167 px per 209 ms frame, random
+column/row start on opaque ground), the five sec.52 ROIs are cut from it (strip-LZW decoded
+regionally through tifffile's zarr store, ~80 ms per crop), blurred with an isotropic Gaussian
+`sigma = hypot(1.26, |lens - e0| / 600)` px (w0 3.5 px, +0.3 px at +-380 c: the bench V of
+54.13), scaled x64 to the camera's 16-bit level, given 60 DN of noise and scored with the real
+`score_rois`; `W10Focus` (live `W10Config`) drives a `SyntheticLens` (1000 c lash, +-2 c encoder
+noise) from a start within +-1500 c of a random true focus. Truth is exact, so the number
+reported is the LENS's residual defocus at park, with the w10 the parked frame scores against the
+same frame rendered in perfect focus. `--self-check` renders a step lattice and asserts the
+scorer reproduces the lens model (within 0.35 px, symmetric, monotone).
+
+Results, 38 parks (seeds 0-4, 3-4 starts per picture, starts -1419..+943 c from focus), lens
+error at park: all 38 inside half a depth, no failures, 36-78 frames (8-16 s), one back-off each.
+Bnei Brak (19): mean +0 c, sd 24 c, worst -37 c. Pardes Hana (19): mean +4 c, sd 59 c, worst
++127 c, 74 % within +-50 c, 84 % within +-100 c (the 4 parks beyond 100 c cost +0.03..0.04 px).
+Pooled: mean +2 c (no bias), sd 44 c, 87 % within +-50 c, 92 % within +-100 c. Pardes Hana is
+the harder ground -- lower-density suburbs/fields give fewer and softer edges (in-focus w10
+3.0-3.5 vs 2.7-2.9 px, CIs up to +-82 c) and its 2.4x wider spread comes from the frames with
+the widest CIs. w10 at park within 0.01-0.14 px of the perfect-focus w10 every time. The motor vertex sits
+~-500 c from the lens truth, i.e. half the 1000 c lash, as it must for a lens approached from
+one side. Wall time ~25-45 s per run (TIFF reads dominate). The ortho reads sharper than the
+camera (2.7-3.3 px in focus against 3.5 on the bench): orthophotos are resampled and sharpened,
+so the floor is lower; the test is about the residual, which does not depend on it. Not modelled:
+field tilt between ROIs, motion blur, the per-frame encoder lag of the real rig.
+
+### 54.15 M4 exposure histogram and the green coarse tap (2026-10-21)
+
+"How much of the sensor am I using" is now answered in M4 by a top-left overlay
+(`focus_panel._ExposureHistGraph`, `Hist` checkbox next to `ROIs`, default on): a log-y
+histogram of the coarse frame's RAW 14-bit counts (`pipeline.exposure_stats`, 256 bins of
+64 DN, a further 2x decimation, ~9 ms per frame on the GUI thread), x ticked in stops below
+16383, dashed p0.1 / p50 / p99.9, the clipped bin (DN >= 16320) in red, and a readout:
+`p50 <DN> (<% of full scale>)  p99.9 <DN>  clip <%>  head <stops to full scale>  used
+<stops p0.1..p99.9>`. Display gain does not touch it -- it reports what goes to disk. The
+same line is logged as `exposure at arm:` when M4 Record is armed and `exposure at AF end:`
+when an AF run finishes (`FocusPanel.exposure_summary`).
+
+To make it see the channel that clips first, the SDK-callback decimation moved from the red
+phase to the GREEN one: `view[::4, 1::4]` in `kyfg_backend.py` (same in `demo_backend`).
+Every coarse-frame consumer (M4 preview, trackers, legacy AF tile pick, alignment) now sees
+G instead of R, i.e. a brighter, luminance-like picture; shapes are unchanged (same
+dimensions, 1 sensor px shift). ROI/tile maths is in multiples of the step, so nothing had
+to change. If a coarse preview looks ~1.5-2x brighter than before at the same display gain,
+this is why. Check: `py -3 tools/test_exposure_hist.py`.
+
+Aperture decision for the 300 mm (cam 2439008): click 3 (f/4 + 3 clicks), from the two-day
+test in 54.13 and the recorded best frames (`D:\Project\aperture\day3_*`, centre w10 4.39 ->
+4.05 -> 3.73 -> 3.57 px over f/4 .. click 3; no diffraction turn-over seen yet).
+

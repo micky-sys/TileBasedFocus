@@ -85,8 +85,23 @@ def test_scatter_ring_buffer_trims_to_cap() -> None:
     assert len(g._score) == cap, f"score not trimmed: {len(g._score)}"
     # Trimming keeps the NEWEST points (a ring buffer, oldest dropped).
     assert g._enc[-1] == float(cap + 249), g._enc[-1]
+    assert len(g._roi) == cap, "roi tags not trimmed with the points"
     g.clear()
-    assert not g._enc and not g._score, "clear() left data"
+    assert not g._enc and not g._score and not g._roi, "clear() left data"
+    # Per-ROI view: pooled and ROI dots share the buffer; each view draws (and auto-scales
+    # over) only its own kind, and both views paint without error at any fill level.
+    from PySide6.QtGui import QImage, QPainter
+    g.add_point(100.0, 5.0)
+    for k in range(5):
+        g.add_point(100.0, 3.0 + k, roi=k)
+    for per_roi in (False, True):
+        g.set_per_roi(per_roi)
+        drawn = [i for i, r in enumerate(g._roi) if (r is not None) == per_roi]
+        assert len(drawn) == (5 if per_roi else 1), (per_roi, drawn)
+        img = QImage(g.width(), g.height(), QImage.Format.Format_ARGB32)
+        g.render(img)   # paintEvent runs offscreen
+    g.clear(); g.set_per_roi(True)
+    g.render(QImage(g.width(), g.height(), QImage.Format.Format_ARGB32))   # empty ROI view paints too
 
 
 def main() -> int:

@@ -43,11 +43,12 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, BinaryIO, Optional
 
 import numpy as np
 import tifffile
@@ -341,6 +342,40 @@ def _build_subifd_block(
     return bytes(out) + bytes(pool)
 
 
+_EMBED_REOPEN_DELAYS_S: tuple[float, ...] = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0)
+"""Backoff between reopen attempts in :func:`_open_rplus_waiting_out_locks`."""
+
+
+def _open_rplus_waiting_out_locks(path: Path) -> BinaryIO:
+    """Open *path* ``r+b``, waiting out a transient third-party lock.
+
+    A just-closed multi-hundred-MB TIFF is routinely held for a moment by
+    an on-access AV scanner or the search indexer. The reopen then fails
+    with ``PermissionError`` (Windows maps the sharing violation to
+    EACCES), which used to abort a whole export run over one frame.
+
+    ponytail: blind backoff rather than asking who holds the handle --
+    identifying the holder needs Sysinternals and tells us nothing we'd
+    act on. Ceiling: a lock outliving the ~7 s budget still raises;
+    upgrade path is for the caller to skip and report that frame.
+    """
+    waited = 0.0
+    for delay in _EMBED_REOPEN_DELAYS_S:
+        try:
+            fh = open(path, "r+b")
+        except PermissionError:
+            time.sleep(delay)
+            waited += delay
+            continue
+        if waited:
+            log.warning(
+                "%s: reopened for EXIF embed after %.2f s of lock contention",
+                path.name, waited,
+            )
+        return fh
+    return open(path, "r+b")  # budget spent -- let the error surface
+
+
 def _embed_subifd(
     path: Path,
     pointer_tag: int,
@@ -372,7 +407,7 @@ def _embed_subifd(
     Raises ``ValueError`` for non-classic-TIFF input.
     """
     path = Path(path)
-    with open(path, "r+b") as fh:
+    with _open_rplus_waiting_out_locks(path) as fh:
         header = fh.read(8)
         if len(header) < 8:
             raise ValueError(f"{path}: too short for a TIFF header")

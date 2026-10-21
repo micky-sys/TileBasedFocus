@@ -184,7 +184,7 @@ class DemoCamera:
         full = self._ensure_full_template()
         offset = (self._frame_index * step * 3) % full.shape[1]
         rolled = np.roll(full, offset, axis=1)
-        return rolled[::step, ::step].copy()
+        return rolled[::step, 1::step].copy()  # green phase, as kyfg_backend
 
     def _emit_loop(self) -> None:
         interval = 1.0 / DEMO_FPS

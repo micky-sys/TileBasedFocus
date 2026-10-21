@@ -1271,11 +1271,16 @@ class KyfgCamera:
             # 1) Small (preview) copy. ALWAYS produced. The copy() is
             # required: ``view`` references the SDK buffer which the
             # SDK reuses immediately after the callback returns.
+            # Column offset 1: BayerRG puts G at (0,1), so a step-4 grid from
+            # there is ALL green -- the channel that clips first, which is what
+            # the M4 exposure histogram must see (from (0,0) it would be all red
+            # and under-report saturation ~1.5-2x). Same 1-px shift for every
+            # consumer; ROI/tile maths is in multiples of the step so nothing cares.
             step = self.SUBSAMPLE_FACTOR
             if view.dtype == np.uint16:
-                small = view[::step, ::step].copy()
+                small = view[::step, 1::step].copy()
             else:
-                small = view[::step, ::step].astype(np.uint16, copy=True)
+                small = view[::step, 1::step].astype(np.uint16, copy=True)
 
             # 2) Full-res copy. ONLY produced when the pipeline has
             # explicitly opted in via set_full_res_emission(True). The

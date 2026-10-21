@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 from math import ceil
 from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QImage,
@@ -55,7 +56,10 @@ from PySide6.QtWidgets import (
 )
 
 from .mode_controller import FocusSubMode
-from .pipeline import CameraPipeline, _downsample_bayer_to_gray8
+from .pipeline import (
+    SENSOR_FULL_SCALE, CameraPipeline, _downsample_bayer_to_gray8, _u16_to_gray8,
+    exposure_line, exposure_stats,
+)
 from .serial_client import SerialClient
 
 log = logging.getLogger(__name__)
@@ -282,11 +286,17 @@ class _FocusScatterGraph(QWidget):
     value are simply multiple dots stacked in Y."""
 
     _MAX = 600  # dots kept (ring buffer)
+    # w10 AF per-ROI dots: roi_boxes order TL, TR, C, BL, BR (sec.52.2)
+    ROI_NAMES = ("TL", "TR", "C", "BL", "BR")
+    ROI_COLORS = (QColor(255, 110, 110), QColor(255, 200, 80), QColor(120, 230, 160),
+                  QColor(110, 170, 255), QColor(220, 130, 255))
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._enc: list[float] = []
         self._score: list[float] = []
+        self._roi: list[Optional[int]] = []   # None = pooled / manual-creep score, 0..4 = one ROI's w10
+        self._per_roi = False                 # view: pooled dots (False) or the five ROI traces (True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFixedSize(230, 130)
         self.hide()
@@ -294,14 +304,22 @@ class _FocusScatterGraph(QWidget):
     def clear(self) -> None:
         self._enc.clear()
         self._score.clear()
+        self._roi.clear()
         self.update()
 
-    def add_point(self, encoder: float, score: float) -> None:
+    def set_per_roi(self, on: bool) -> None:
+        """Both point kinds are kept; this only picks which are drawn, so the switch works mid-run."""
+        self._per_roi = bool(on)
+        self.update()
+
+    def add_point(self, encoder: float, score: float, roi: Optional[int] = None) -> None:
         self._enc.append(float(encoder))
         self._score.append(float(score))
+        self._roi.append(roi)
         if len(self._enc) > self._MAX:
             del self._enc[:-self._MAX]
             del self._score[:-self._MAX]
+            del self._roi[:-self._MAX]
         if not self.isVisible():
             self.show()
         self.update()
@@ -316,7 +334,15 @@ class _FocusScatterGraph(QWidget):
         cyan = QColor(90, 200, 255)
         p.setPen(cyan)
         p.drawText(5, 11, "score vs enc")
-        n = len(self._enc)
+        if self._per_roi:
+            x = 80
+            for name, col in zip(self.ROI_NAMES, self.ROI_COLORS):
+                p.setPen(col)
+                p.drawText(x, 11, name)
+                x += 28
+        # which dots this view draws: one ROI's w10 each, or the pooled / manual score
+        idx = [i for i, r in enumerate(self._roi) if (r is not None) == self._per_roi]
+        n = len(idx)
         if n < 1:
             p.end()
             return
@@ -324,24 +350,91 @@ class _FocusScatterGraph(QWidget):
         pad_t, pad_b = 15, 14
         plot_w = w - pad_l - pad_r
         plot_h = h - pad_t - pad_b
-        emin, emax = min(self._enc), max(self._enc)
-        smin, smax = min(self._score), max(self._score)
+        enc = [self._enc[i] for i in idx]
+        sc = [self._score[i] for i in idx]
+        emin, emax = min(enc), max(enc)
+        smin, smax = min(sc), max(sc)
         erng = (emax - emin) or 1.0
         srng = (smax - smin) or 1.0
         dot = QColor(120, 230, 160)
         newest = QColor(255, 170, 60)
-        for i in range(n):
+        last = idx[-1]
+        for k, i in enumerate(idx):
             x = pad_l + plot_w * (self._enc[i] - emin) / erng
             y = pad_t + plot_h * (1.0 - (self._score[i] - smin) / srng)
-            p.setPen(QPen(newest if i == n - 1 else dot, 1))
-            r = 2.5 if i == n - 1 else 1.5
+            col = self.ROI_COLORS[self._roi[i]] if self._per_roi else dot
+            is_newest = i == last if not self._per_roi else i >= last - 4   # the newest frame's five
+            p.setPen(QPen(newest if (is_newest and not self._per_roi) else col, 1))
+            r = 2.5 if is_newest else 1.5
             p.drawEllipse(int(x - r), int(y - r), int(2 * r), int(2 * r))
         # Corner labels: encoder span (X) and score at the newest dot.
         p.setPen(QColor(170, 170, 170))
         p.drawText(pad_l, h - 3, f"{int(emin)}")
         p.drawText(w - 46, h - 3, f"{int(emax)}")
-        p.setPen(newest)
-        p.drawText(5, h - 15, f"{self._score[-1]:.1f}")
+        p.setPen(newest if not self._per_roi else self.ROI_COLORS[self._roi[last]])
+        p.drawText(5, h - 15, f"{self._score[last]:.1f}")
+        p.end()
+
+
+class _ExposureHistGraph(QWidget):
+    """Top-left overlay: histogram of the coarse frame's RAW 14-bit counts (green
+    phase), log-y, x ticked in stops below full scale. Markers at p0.1 / p50 / p99.9,
+    the clipped bin drawn red, and a readout line. Display gain does not move it:
+    it answers "how much of the sensor am I using" for what is written to disk."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._st: Optional[dict] = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(230, 130)
+        self.hide()
+
+    def set_stats(self, st: Optional[dict]) -> None:
+        self._st = st
+        self.update()
+
+    def paintEvent(self, ev):  # noqa: N802 -- Qt naming
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(0, 0, 0, 150))
+        p.setPen(QPen(QColor(90, 90, 90), 1))
+        p.drawRect(0, 0, w - 1, h - 1)
+        p.setPen(QColor(90, 200, 255))
+        p.drawText(5, 11, "exposure (raw G, 14-bit)")
+        st = self._st
+        if st is None or st.get("n", 0) == 0:
+            p.end()
+            return
+        pad_l, pad_r, pad_t, pad_b = 6, 6, 15, 28
+        plot_w, plot_h = w - pad_l - pad_r, h - pad_t - pad_b
+        hist = st["hist"]
+        top = math.log1p(float(hist.max()))
+        bw = plot_w / len(hist)
+        for i, c in enumerate(hist):
+            if c == 0:
+                continue
+            bh = plot_h * math.log1p(float(c)) / top
+            if i == len(hist) - 1:  # clipped bin: red and 3 px wide so a marker can't hide it
+                p.fillRect(QRectF(pad_l + plot_w - 3, pad_t + plot_h - bh, 3, bh), QColor(255, 80, 80))
+            else:
+                p.fillRect(QRectF(pad_l + i * bw, pad_t + plot_h - bh, max(bw, 1.0), bh),
+                           QColor(120, 230, 160))
+        # stop ticks: full scale, 1/2, 1/4, ... down to 1/128
+        p.setPen(QColor(120, 120, 120))
+        for s in range(0, 8):
+            x = pad_l + plot_w * (SENSOR_FULL_SCALE / 2 ** s) / SENSOR_FULL_SCALE
+            p.drawLine(int(x), pad_t + plot_h, int(x), pad_t + plot_h + 3)
+        # percentile markers
+        for key, col in (("p01", QColor(170, 170, 170)), ("p50", QColor(255, 200, 80)),
+                         ("p999", QColor(255, 170, 60))):
+            x = pad_l + plot_w * min(st[key], SENSOR_FULL_SCALE) / SENSOR_FULL_SCALE
+            p.setPen(QPen(col, 1, Qt.PenStyle.DashLine))
+            p.drawLine(int(x), pad_t, int(x), pad_t + plot_h)
+        p.setPen(QColor(255, 80, 80) if st["clip"] > 0.001 else QColor(200, 200, 200))
+        p.drawText(5, h - 15, f"p50 {st['p50']} ({100.0 * st['p50'] / SENSOR_FULL_SCALE:.1f}%)"
+                              f"  p99.9 {st['p999']}")
+        p.drawText(5, h - 3, f"clip {100.0 * st['clip']:.2f}%  head {st['headroom']:.1f}st"
+                             f"  used {st['used']:.1f}st")
         p.end()
 
 
@@ -494,6 +587,7 @@ class _PreviewStack(QStackedWidget):
         self.overlay: Optional[QWidget] = None          # bottom-right AF telemetry
         self.scatter_overlay: Optional[QWidget] = None  # top-right score-vs-enc scatter
         self.profile_overlay: Optional[QWidget] = None  # AF3 field profile, under it
+        self.hist_overlay: Optional[QWidget] = None     # top-left exposure histogram
 
     def resizeEvent(self, ev):  # noqa: N802 -- Qt naming
         super().resizeEvent(ev)
@@ -501,6 +595,10 @@ class _PreviewStack(QStackedWidget):
 
     def reposition_overlays(self) -> None:
         m = 6
+        hs = self.hist_overlay
+        if hs is not None:
+            hs.move(m, m)
+            hs.raise_()
         ov = self.overlay
         if ov is not None:
             ov.move(max(0, self.width() - ov.width() - m),
@@ -599,7 +697,7 @@ class FocusPanel(QWidget):
     field_map_requested = Signal()       # one sweep, fixed tiles, a vertex per tile
     align_toggled = Signal(bool)         # live camera-vs-screen tilt readout, shown ON the screen
     observe_requested = Signal()         # fixed focus, N tracked patches, CSV per frame
-    autofocus_algorithm_changed = Signal(str)  # "legacy" | "sweep_and_hold"
+    autofocus_algorithm_changed = Signal(str)  # "w10" | "sweep_and_hold" | "legacy"
     fine_lock_changed = Signal(bool)     # freeze the tracked Fine tile (no re-pick)
     csv_log_toggled = Signal(bool)       # start/stop focus-telemetry CSV logging
     preview_toggled = Signal(bool)       # split-screen two-object preview on/off
@@ -632,6 +730,9 @@ class FocusPanel(QWidget):
         # scores. The Zoom-tile view renders its green plane so the operator sees
         # the same resolution AF optimises, not the 4x preview decimated again.
         self._af_fullres_crop: Optional[np.ndarray] = None
+        # The main window's "Display gain" (preview-only brightness), applied to the
+        # views this panel renders itself: Coarse preview and the AF tile zoom.
+        self._display_gain = 1.0
         self._cam_device_ids: dict[int, str] = {}
         self._cam_available: dict[int, bool] = {}
         self._controls_locked = False
@@ -856,6 +957,11 @@ class FocusPanel(QWidget):
         # look exactly as they did.
         self._profile_graph = _FieldProfileGraph(self._preview_stack)
         self._preview_stack.profile_overlay = self._profile_graph
+        # Exposure histogram of the raw coarse frame, top-left; `Hist` checkbox.
+        self._hist_graph = _ExposureHistGraph(self._preview_stack)
+        self._preview_stack.hist_overlay = self._hist_graph
+        self._hist_graph.show()
+        self._last_exposure: Optional[dict] = None
         self._preview_stack.reposition_overlays()
         outer.addWidget(self._preview_stack, 1)
 
@@ -1310,19 +1416,44 @@ class FocusPanel(QWidget):
         row.addWidget(QLabel("AF:"))
         self._af_algo_combo = QComboBox()
         # userData is what AutoFocusController.set_algorithm consumes.
+        # First entry must match the controller's default (app.py: IRON661_AF default).
         for label, data in (
+            ("w10 (PSF)", "w10"),
             ("Sweep-and-hold", "sweep_and_hold"),
             ("Legacy dither", "legacy"),
         ):
             self._af_algo_combo.addItem(label, data)
         self._af_algo_combo.setToolTip(
             "Autofocus algorithm (A/B test).\n"
+            "w10 (PSF): score every frame's natural step edges (PSF width, content-"
+            "independent), sweep through focus, fit the V, park on its vertex.\n"
             "Legacy dither: the continuous +-d wobble servo.\n"
             "Sweep-and-hold: sweep the lens while tracking objects, stitch a global "
             "focus curve, drive to the peak and hold (in-flight one-shot acquisition)."
         )
         self._af_algo_combo.currentIndexChanged.connect(self._on_af_algo_changed)
         row.addWidget(self._af_algo_combo)
+
+        self._roi_graph_chk = QCheckBox("ROIs")
+        self._roi_graph_chk.setToolTip(
+            "Score-vs-encoder graph: plot the w10 AF's five ROIs separately (TL red, TR "
+            "yellow, C green, BL blue, BR purple) instead of the pooled frame w10. Five "
+            "bowls at one position = one target plane; a ROI with its own bottom is at "
+            "another distance (jig structure, field tilt). Toggle any time, also mid-run."
+        )
+        self._roi_graph_chk.toggled.connect(self._scatter_graph.set_per_roi)
+        row.addWidget(self._roi_graph_chk)
+
+        self._hist_chk = QCheckBox("Hist")
+        self._hist_chk.setChecked(True)
+        self._hist_chk.setToolTip(
+            "Top-left histogram of the coarse frame's RAW 14-bit counts (green phase): "
+            "how much of the sensor range the recording uses. Display gain has no effect "
+            "on it. Dashed lines p0.1 / p50 / p99.9; red bar = clipped pixels; 'head' = "
+            "stops between p99.9 and full scale, 'used' = stops between p0.1 and p99.9."
+        )
+        self._hist_chk.toggled.connect(self._hist_graph.setVisible)
+        row.addWidget(self._hist_chk)
 
         row.addWidget(QLabel("Lead:"))
         self._af_lead_combo = QComboBox()
@@ -1615,10 +1746,11 @@ class FocusPanel(QWidget):
         """Reset the AF telemetry graph (called when a new run starts)."""
         self._af_graph.clear()
 
-    def focus_scatter_add_point(self, encoder: float, score: float) -> None:
+    def focus_scatter_add_point(self, encoder: float, score: float, roi: Optional[int] = None) -> None:
         """Append one (encoder, score) dot to the score-vs-encoder scatter
-        (top-right, always on -- fed by both the manual creep and AF runs)."""
-        self._scatter_graph.add_point(encoder, score)
+        (top-right, always on -- fed by both the manual creep and AF runs).
+        ``roi`` 0..4 tags a w10 AF per-ROI width (drawn when 'ROIs' is ticked)."""
+        self._scatter_graph.add_point(encoder, score, roi)
 
     def focus_scatter_clear(self) -> None:
         """Reset the manual-backlash scatter."""
@@ -1648,7 +1780,7 @@ class FocusPanel(QWidget):
         if self._af_zoom and self._af_roi is not None:
             self._show_af_tile_zoom(raw_u16)
             return
-        gray8 = _downsample_bayer_to_gray8(raw_u16, max(dw, dh))
+        gray8 = _downsample_bayer_to_gray8(raw_u16, max(dw, dh), self._display_gain)
         gray8 = np.ascontiguousarray(gray8)
         gh, gw = gray8.shape
         qimg = QImage(
@@ -1711,7 +1843,7 @@ class FocusPanel(QWidget):
             # The old path cropped the already-4x-decimated preview and then
             # decimated by a further 2x -- ~8x subsampled, hence "too pixelated".
             green = crop[0::2, 1::2]
-            gray8 = np.ascontiguousarray(np.clip(green >> 6, 0, 255).astype(np.uint8))
+            gray8 = np.ascontiguousarray(_u16_to_gray8(green, self._display_gain))
         else:
             # No full-res crop yet (first frames): fall back to the decimated
             # preview so the view isn't blank.
@@ -1724,7 +1856,7 @@ class FocusPanel(QWidget):
             x1 = max(x0 + 2, min(int(x1), rw))
             y1 = max(y0 + 2, min(int(y1), rh))
             gray8 = np.ascontiguousarray(
-                _downsample_bayer_to_gray8(raw_u16[y0:y1, x0:x1], 4096)
+                _downsample_bayer_to_gray8(raw_u16[y0:y1, x0:x1], 4096, self._display_gain)
             )
         gh, gw = gray8.shape
         qimg = QImage(
@@ -1744,10 +1876,26 @@ class FocusPanel(QWidget):
             return
         self._show_coarse_preview(raw)
 
+    def exposure_summary(self) -> str:
+        """Latest coarse-frame exposure numbers as one log line ('' before any frame)."""
+        return exposure_line(self._last_exposure) if self._last_exposure else ""
+
+    def set_display_gain(self, gain: float) -> None:
+        """Preview-only brightness multiplier (shared with the main preview's spinbox);
+        repaints the current Coarse view so the change shows before the next frame."""
+        self._display_gain = float(gain)
+        if not self._fine_toggle.isChecked():
+            self._refresh_coarse_preview()
+
     def receive_raw_frame(self, raw_u16: np.ndarray, ts_iso: str) -> None:
         """Slot for ``AcquisitionThread.raw_focus_frame`` (M4 Coarse preview)."""
         self._last_coarse_raw = raw_u16
         self._show_coarse_preview(raw_u16)
+        # ~3 ms on the 4x tap (a further 2x inside); kept current even with the
+        # overlay hidden so the AF-DONE / Record-arm log line is never stale.
+        self._last_exposure = exposure_stats(raw_u16)
+        if self._hist_graph.isVisible():
+            self._hist_graph.set_stats(self._last_exposure)
         self._tile_info_label.setText(
             "coarse: AF tile (zoomed)"
             if self._af_zoom and self._af_roi is not None

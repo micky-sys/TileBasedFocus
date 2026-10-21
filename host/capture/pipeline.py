@@ -315,7 +315,60 @@ class FocusJob:
 # ---------------------------------------------------------------------------
 
 
-def _downsample_bayer_to_gray8(raw_u16: np.ndarray, max_edge: int) -> np.ndarray:
+PREVIEW_DISPLAY_GAIN_MIN = 1.0
+PREVIEW_DISPLAY_GAIN_MAX = 64.0
+
+
+def _u16_to_gray8(a_u16: np.ndarray, gain: float = 1.0) -> np.ndarray:
+    """14-bit sensor data -> uint8 for display, times a software ``gain``.
+
+    ``gain=1`` is the historical ``>> 6`` mapping (14-bit full scale -> 255).
+    Larger values brighten the PREVIEW ONLY -- nothing written to disk is
+    touched -- so the operator can run the sensor at minimum analog gain for
+    the recording and still see the ground in flight. Saturates at 255.
+    """
+    if gain == 1.0:
+        return np.clip(a_u16 >> 6, 0, 255).astype(np.uint8)
+    return cv2.convertScaleAbs(a_u16, alpha=float(gain) / 64.0)
+
+
+SENSOR_FULL_SCALE = 16383  # BayerRG14
+
+
+def exposure_stats(raw_u16: np.ndarray, sub: int = 2) -> dict:
+    """How much of the 14-bit range a frame uses, from its RAW counts (display gain
+    plays no part -- this is what goes to disk).
+
+    Returns ``hist`` (256 bins of DN>>6, i.e. 64 DN per bin), ``p01``/``p50``/``p999``
+    (0.1 / 50 / 99.9 percentiles in DN, bin-upper-edge resolution), ``clip`` (fraction
+    of pixels in the top bin, DN >= 16320), ``headroom`` (stops between p99.9 and full
+    scale) and ``used`` (stops between p0.1 and p99.9). ``sub`` further decimates the
+    already-coarse frame: ~2 Mpx is plenty for 0.1 % quantiles and keeps it ~ms."""
+    a = raw_u16[::sub, ::sub]
+    hist = np.bincount((a >> 6).ravel(), minlength=256)[:256]
+    n = int(hist.sum())
+    if n == 0:
+        return dict(hist=hist, p01=0, p50=0, p999=0, clip=0.0, headroom=0.0, used=0.0, n=0)
+    cdf = np.cumsum(hist)
+    def pct(q: float) -> int:  # upper DN edge of the bin where the CDF crosses q
+        return int(np.searchsorted(cdf, q * n, side="left")) * 64 + 63
+    p01, p50, p999 = pct(0.001), pct(0.5), pct(0.999)
+    return dict(hist=hist, p01=p01, p50=p50, p999=p999, n=n,
+                clip=float(hist[-1]) / n,
+                headroom=math.log2(SENSOR_FULL_SCALE / max(p999, 1)),
+                used=math.log2(max(p999, 1) / max(p01, 1)))
+
+
+def exposure_line(st: dict) -> str:
+    """One-line form for the log / overlay readout."""
+    return (f"p50 {st['p50']} ({100.0 * st['p50'] / SENSOR_FULL_SCALE:.1f}%)  "
+            f"p99.9 {st['p999']}  clip {100.0 * st['clip']:.2f}%  "
+            f"head {st['headroom']:.1f}st  used {st['used']:.1f}st")
+
+
+def _downsample_bayer_to_gray8(
+    raw_u16: np.ndarray, max_edge: int, gain: float = 1.0
+) -> np.ndarray:
     """Decimate a Bayer uint16 frame to a small uint8 grayscale preview.
 
     No debayer, no color: the operator only needs to see what the sensor
@@ -327,17 +380,17 @@ def _downsample_bayer_to_gray8(raw_u16: np.ndarray, max_edge: int) -> np.ndarray
     step_w = max(1, w // max_edge)
     step = max(step_h, step_w, 2) & ~1  # even, Bayer-aligned, at least 2
     small = raw_u16[::step, ::step]
-    return np.clip(small >> 6, 0, 255).astype(np.uint8)
+    return _u16_to_gray8(small, gain)
 
 
 def _full_res_center_crop_gray8(
-    full_u16: np.ndarray, crop_w: int, crop_h: int
+    full_u16: np.ndarray, crop_w: int, crop_h: int, gain: float = 1.0
 ) -> np.ndarray:
     """Centre crop of a full-res Bayer uint16 frame as uint8 gray (100% zoom).
 
     No decimation: 1 sensor pixel -> 1 output pixel. The crop is clamped
     to the frame and aligned to even (Bayer-quad) boundaries. Uses the
-    same ``>> 6`` intensity scaling as :func:`_downsample_bayer_to_gray8`
+    same intensity scaling as :func:`_downsample_bayer_to_gray8`
     so brightness is unchanged when the operator toggles zoom on/off.
     """
     h, w = full_u16.shape
@@ -346,7 +399,7 @@ def _full_res_center_crop_gray8(
     x0 = ((w - cw) // 2) & ~1
     y0 = ((h - ch) // 2) & ~1
     crop = full_u16[y0:y0 + ch, x0:x0 + cw]
-    return np.clip(crop >> 6, 0, 255).astype(np.uint8)
+    return _u16_to_gray8(crop, gain)
 
 
 def _iso_now() -> str:
@@ -359,10 +412,11 @@ def _m4_focus_overview_rgb(
     best_index: int,
     *,
     decim: int = M4_FOCUS_OVERVIEW_DECIM,
+    gain: float = 1.0,
 ) -> np.ndarray:
     """Full-frame overview for the Fine inset: circle, candidates, winner (RGB uint8)."""
     step = max(2, int(decim)) & ~1  # even, Bayer-aligned
-    overview_u8 = np.clip(full_u16[::step, ::step] >> 6, 0, 255).astype(np.uint8)
+    overview_u8 = _u16_to_gray8(full_u16[::step, ::step], gain)
     ov_bgr = cv2.cvtColor(overview_u8, cv2.COLOR_GRAY2BGR)
     oh, ow = ov_bgr.shape[:2]
     scale = 1.0 / float(step)
@@ -409,6 +463,7 @@ def _m4_roi_overview_rgb(
     roi: tuple[int, int, int, int],
     *,
     decim: int = M4_FOCUS_OVERVIEW_DECIM,
+    gain: float = 1.0,
 ) -> Optional[np.ndarray]:
     """Whole frame with the TRACKED ROI boxed, for the Fine inset (RGB uint8).
 
@@ -430,10 +485,7 @@ def _m4_roi_overview_rgb(
     if frame_u16 is None or getattr(frame_u16, "ndim", 0) < 2:
         return None
     step = max(2, int(decim)) & ~1          # even: keeps the decimation Bayer-aligned
-    ov = cv2.cvtColor(
-        np.clip(frame_u16[::step, ::step] >> 6, 0, 255).astype(np.uint8),
-        cv2.COLOR_GRAY2BGR,
-    )
+    ov = cv2.cvtColor(_u16_to_gray8(frame_u16[::step, ::step], gain), cv2.COLOR_GRAY2BGR)
     oh, ow = ov.shape[:2]
     s = 1.0 / float(step)
     x0 = max(0, min(ow - 1, int(roi[0] * s)))
@@ -453,11 +505,14 @@ def m4_fine_tile_rgb_from_frame(
     display_h: int = M4_FINE_DISPLAY_H,
     zoom: float = M4_FINE_ZOOM,
     demosaic: bool = True,
+    gain: float = 1.0,
 ) -> tuple[np.ndarray, Any, np.ndarray, np.ndarray, tuple[int, int, int, int]]:
     """Best tile in the centre circle (1/5 area); optional Bayer demosaic.
 
     When ``demosaic`` is False, the returned "RGB" image duplicates an 8-bit
-    grayscale view of the raw Bayer crop (no colour reconstruction).
+    grayscale view of the raw Bayer crop (no colour reconstruction). ``gain`` is
+    the preview-only display gain (see :func:`_u16_to_gray8`); the uint16 crop and
+    the sharpness score are untouched by it.
 
     Returns ``(rgb_u8_hw3, sharpness_result, uint16_tile_crop, overview_rgb_u8_hw3,
     tile_bbox)`` where ``tile_bbox`` is the auto-picked tile's ``(x0,y0,x1,y1)`` in
@@ -477,7 +532,7 @@ def m4_fine_tile_rgb_from_frame(
     result = find_best_tile(full_u16, grid)
     best = grid[result.best_index]
     crop_u16 = full_u16[best.y0:best.y1, best.x0:best.x1].copy()
-    crop_u8 = (crop_u16 >> 6).astype(np.uint8)
+    crop_u8 = _u16_to_gray8(crop_u16, gain)
     if demosaic:
         rgb = cv2.cvtColor(
             crop_u8,
@@ -487,7 +542,7 @@ def m4_fine_tile_rgb_from_frame(
         )
     else:
         rgb = cv2.cvtColor(crop_u8, cv2.COLOR_GRAY2RGB)
-    overview_rgb = _m4_focus_overview_rgb(full_u16, grid, result.best_index)
+    overview_rgb = _m4_focus_overview_rgb(full_u16, grid, result.best_index, gain=gain)
     return rgb, result, crop_u16, overview_rgb, (best.x0, best.y0, best.x1, best.y1)
 
 
@@ -496,6 +551,7 @@ def m4_roi_tile_rgb_from_frame(
     roi: tuple[int, int, int, int],
     *,
     demosaic: bool = True,
+    gain: float = 1.0,
 ) -> tuple[np.ndarray, float, np.ndarray]:
     """Crop a FIXED ROI (autofocus tracked patch), score it, and build RGB.
 
@@ -515,7 +571,7 @@ def m4_roi_tile_rgb_from_frame(
 
     score = float(score_tile_subsampled(full_u16, Tile(x0, y0, x1, y1)))
     crop_u16 = full_u16[y0:y1, x0:x1].copy()
-    crop_u8 = (crop_u16 >> 6).astype(np.uint8)
+    crop_u8 = _u16_to_gray8(crop_u16, gain)
     if demosaic:
         rgb = cv2.cvtColor(
             crop_u8,
@@ -607,6 +663,9 @@ class AcquisitionThread(QThread):
         # not allocate full-res copies because the GUI keeps
         # set_full_res_emission off.
         self._pool: Optional[FrameBufferPool] = pool
+        # Optional live w10 scorer (w10_live.W10LiveScorer): offered one frame per sweep from
+        # _submit_slot while the slot is still ours. None = feature off.
+        self._w10_live = None
         self._gps_provider = gps_provider
         self._heading_provider = heading_provider
         self._focus_provider = focus_provider
@@ -631,6 +690,9 @@ class AcquisitionThread(QThread):
         self._preview_zoom = False
         self._preview_zoom_w = 1280
         self._preview_zoom_h = 720
+        # Software brightness multiplier for the preview image only (see
+        # ``_u16_to_gray8``). Recorded data is never scaled.
+        self._preview_gain = 1.0
         self._focus_tap_enabled = False
         # ``_armed`` reflects whether the backend camera is currently
         # producing frames into ``_frame_queue``. When False we just
@@ -721,6 +783,16 @@ class AcquisitionThread(QThread):
         """Short identifier for log lines, e.g. ``cam1[2439007]``."""
         return f"cam{self._camera_number}[{self._camera_serial}]"
 
+    def set_w10_live(self, scorer) -> None:
+        """Attach (or detach with None) the shared live w10 scorer; read on the acquisition thread."""
+        self._w10_live = scorer
+
+    def w10_note_drop(self) -> None:
+        """A recording frame was lost to backpressure: tell the live scorer to stand down (sec.54.12)."""
+        scorer = self._w10_live
+        if scorer is not None:
+            scorer.note_drop(self.label, int(self._context.line))
+
     @property
     def camera_number(self) -> int:
         return self._camera_number
@@ -749,6 +821,12 @@ class AcquisitionThread(QThread):
         h = max(2, int(height)) & ~1
         self._preview_zoom_w = w
         self._preview_zoom_h = h
+
+    def set_preview_gain(self, gain: float) -> None:
+        """Set the display-only brightness multiplier for preview frames."""
+        self._preview_gain = float(
+            min(PREVIEW_DISPLAY_GAIN_MAX, max(PREVIEW_DISPLAY_GAIN_MIN, float(gain)))
+        )
 
     def set_focus_tap_enabled(self, enabled: bool) -> None:
         """Opt in to ``raw_focus_frame`` emission while in M4."""
@@ -1197,12 +1275,14 @@ class AcquisitionThread(QThread):
                                 self._pool.slot_view(int(full_u16)),
                                 self._preview_zoom_w,
                                 self._preview_zoom_h,
+                                self._preview_gain,
                             )
                         elif is_legacy_ndarray:
                             zoom_preview_gray = _full_res_center_crop_gray8(
                                 full_u16,
                                 self._preview_zoom_w,
                                 self._preview_zoom_h,
+                                self._preview_gain,
                             )
                     except Exception as exc:
                         log.warning(
@@ -1259,6 +1339,7 @@ class AcquisitionThread(QThread):
                     # writer is genuinely behind.
                     if in_recording_mode:
                         self._dropped_writer_not_ready += 1
+                        self.w10_note_drop()
                         # Log the first ~8 drops individually so the
                         # operator sees the onset, then drop to one
                         # per 8 thereafter so a long-running stall
@@ -1320,6 +1401,7 @@ class AcquisitionThread(QThread):
                                     full_view,
                                     roi,
                                     demosaic=self._fine_demosaic,
+                                    gain=self._preview_gain,
                                 )
                                 meta = {
                                     "best_index": -1,
@@ -1340,6 +1422,7 @@ class AcquisitionThread(QThread):
                                             int(v) // KyfgCamera.SUBSAMPLE_FACTOR
                                             for v in roi
                                         ),
+                                        gain=self._preview_gain,
                                     ),
                                     "fine_demosaic": self._fine_demosaic,
                                     "roi": roi,
@@ -1350,6 +1433,7 @@ class AcquisitionThread(QThread):
                                     m4_fine_tile_rgb_from_frame(
                                         full_view,
                                         demosaic=self._fine_demosaic,
+                                        gain=self._preview_gain,
                                     )
                                 )
                                 meta = {
@@ -1523,7 +1607,8 @@ class AcquisitionThread(QThread):
                             # payload was available for this frame).
                             gray8 = np.ascontiguousarray(
                                 _downsample_bayer_to_gray8(
-                                    small_u16, self._preview_max_edge
+                                    small_u16, self._preview_max_edge,
+                                    self._preview_gain,
                                 )
                             )
                         gh, gw = gray8.shape
@@ -1701,9 +1786,21 @@ class AcquisitionThread(QThread):
             attitude=attitude_dict,
             focus=focus_dict,
         )
+        # Live w10 (sec.54.12): one frame per sweep, offered while the slot is still ours. The
+        # scorer copies ~10 MB of ROIs and returns; it drops when busy or when the pool is short.
+        scorer = self._w10_live
+        if scorer is not None and int(frame_index) == scorer.frame_in_sweep:
+            try:
+                scorer.offer(pool, slot_idx, dict(
+                    cam=self.label, camera=int(self._camera_number), serial=self._camera_serial,
+                    line=int(self._context.line), sweep=int(sweep_num), frame=int(frame_index),
+                    ts=acquire_ts_iso, focus=focus_dict))
+            except Exception:  # noqa: BLE001 -- the recording path must not notice
+                log.debug("%s w10 live offer raised", self.label, exc_info=True)
         if not pool.submit(job):
             self._dropped_due_to_queue_full += 1
             pool.release_slot(slot_idx)
+            self.w10_note_drop()
             self._note_block(
                 "work_q_full",
                 "writer subprocess is behind (work queue full); "
@@ -2695,6 +2792,9 @@ class CameraPipeline:
             # the GUI fell behind.
             if isinstance(full_payload, (int, np.integer)) and self.pool is not None:
                 self.pool.release_slot(int(full_payload))
+                # A full-res slot was in hand, so this was a recording frame. The acquisition
+                # thread being behind is the one failure the live w10 scorer could cause (GIL).
+                self.acq.w10_note_drop()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -2996,6 +3096,10 @@ class CameraPipeline:
     def set_preview_zoom_size(self, width: int, height: int) -> None:
         """Set the zoom-preview crop size in sensor pixels (≈ preview window)."""
         self.acq.set_preview_zoom_size(width, height)
+
+    def set_preview_gain(self, gain: float) -> None:
+        """Display-only brightness multiplier for the preview (never recorded)."""
+        self.acq.set_preview_gain(gain)
 
     def set_focus_tap(self, enabled: bool) -> None:
         """Enable/disable raw-frame emission for in-app tile sharpness analysis."""
