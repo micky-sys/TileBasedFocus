@@ -24,7 +24,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from .psf_w10 import crop_rois, frame_ok, score_rois
+from .psf_w10 import crop_rois, frame_ok, score_rois_raw14
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class W10LiveScorer(QObject):
     def _run(self, rois, meta: dict) -> None:
         try:
             t0 = time.perf_counter()
-            stats = score_rois(rois, meta.get("focus"))
+            stats = score_rois_raw14(rois, meta.get("focus"))
             stats["ok"] = frame_ok(stats)
             stats.update(meta)
             stats["score_ms"] = (time.perf_counter() - t0) * 1e3

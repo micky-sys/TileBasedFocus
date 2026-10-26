@@ -42,8 +42,10 @@ class FakePool:
 
 def main():
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
-    frame = synthetic_frame()
-    ref = array_edges(frame, {"encoder_count": 1234})
+    # The slot the scorer is offered holds raw right-justified BayerRG14, so the reference has
+    # to be scored at the 16-bit scale psf_w10 is calibrated for -- as the scorer now does.
+    frame = (synthetic_frame() >> 2).astype(np.uint16)
+    ref = array_edges(frame, {"encoder_count": 1234}, scale=4)
     assert np.isfinite(ref["w10"]), ref
 
     got = []

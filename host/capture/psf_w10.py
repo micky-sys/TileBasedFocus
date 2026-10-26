@@ -187,6 +187,23 @@ def crop_rois(mm, flip_lr=False, scale=1, copy=False) -> list:
     return rois
 
 
+def score_rois_raw14(rois, enc=None, pct=(), ksharp=()) -> dict:
+    """``score_rois`` for ROIs taken straight from a capture slot.
+
+    The slots hold raw right-justified ``BayerRG14`` (0..16383, ``pipeline.SENSOR_FULL_SCALE``),
+    but the gates here are absolute at the 16-bit scale -- saturation at 65000 and ``CLOUD_MEAN``
+    -- so scoring a slot unshifted leaves both unreachable and a cloud or clipped frame is
+    reported as a good one. ``w10`` itself is unaffected: the ESF is normalised by its own
+    contrast. This is the ``<< 2`` the offline readers apply as ``shift_14_to_16``.
+
+    Shifted per ROI rather than with ``crop_rois(scale=4)`` so the acquisition thread's copy
+    stays a copy (``scale`` multiplies the whole full-width band before cropping). Clipped like
+    that ``scale`` path, so data already at 16-bit scale saturates visibly instead of wrapping.
+    """
+    return score_rois([(r.astype(np.uint32) << 2).clip(0, 65535).astype(np.uint16) for r in rois],
+                      enc, pct, ksharp)
+
+
 def score_rois(rois, enc=None, pct=(), ksharp=()) -> dict:
     """``array_edges`` from the five ROIs of ``crop_rois``."""
     enc = enc or {}

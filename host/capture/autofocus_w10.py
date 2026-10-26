@@ -38,7 +38,7 @@ from PySide6.QtCore import QObject, Signal
 
 from .af_w10 import W10Config, W10Focus
 from .focus_csv_log import FocusCsvLogger
-from .psf_w10 import frame_ok, roi_boxes, score_rois
+from .psf_w10 import frame_ok, roi_boxes, score_rois_raw14
 
 log = logging.getLogger(__name__)
 
@@ -305,7 +305,7 @@ class AutoFocusEngineW10(QObject):
         stats = None
         try:
             t0 = time.perf_counter()
-            stats = score_rois(rois)
+            stats = score_rois_raw14(rois)   # crops are sensor-native 14-bit; see the helper
             stats["score_ms"] = (time.perf_counter() - t0) * 1e3
         except Exception:  # noqa: BLE001 -- an unscored frame is a gated frame, not a crash
             log.exception("w10 AF: scoring failed")
