@@ -8,11 +8,33 @@
 > - **M5 is a BENCH simulation of flight** — it moves the mirrors to fake the scene
 >   changing, so the flight tracking behaviour can be validated on the bench without
 >   flying. M5 is a proxy for M4-in-flight.
-> - **Consequence:** both M4 and M5 run the SAME flight AF algorithm (continuous
->   tracking servo). The fast/slow servo profile must follow **detected scene motion**,
->   never the mode label — keying "M4 = static" is WRONG (M4 in flight is moving).
+> - **Consequence:** both M4 and M5 run the SAME flight AF algorithm (since 2026-10 the
+>   `w10` PSF-width engine, §54–55; the tracking servos it replaced are gone, §55.1).
+>   Anything keyed on the mode label rather than on what the scene does is WRONG (M4 in
+>   flight is moving).
 
-_Last updated: 2026-08-09 — **OrthoSim GT: the altitude readout was never a measurement**
+_Last updated: 2026-11-04 — **w10 is the only AF; preflight check; demo mode** (§55):
+the legacy AF1–3 engines, Fine/dual-object trackers, field-map and OrthoSim are **deleted**
+(`7d68360`, 43 files / 19.7k lines; §20–29 and §45–50 now describe history). New **Preflight
+check** button (`host/capture/preflight.py`): `$M4*` gated on the `Mode 4:` banner (the
+firmware prints it only after `EnableAndHome()` returns, so banner = homed), then per focus
+motor ±10,000 c at S3 with every pulse checked (≥20 c moved, ≤1800 c per pulse, consistent
+sign, opposite directions, back within 3000 c), then **counts/pulse calibration at S3/S2/S1/S0**
+(median of 6 alternating bursts), SDK-callback liveness, `$M0*` + one real `$Click*` sweep
+verified for equal counts / no drops / all written / GPS-matched, then the preflight
+containers are rotated out and **deleted** once the writers release them. GPS absence is a
+non-fatal FAIL reported up front. The AF reuses the measured **polarity + c/pulse** and skips
+its probe (`_known_cpp`); with no preflight it probes as before. **Live w10** is shown in the
+focus view while hand-focusing. **`--demo`** runs the GUI with simulated, trigger-driven
+cameras and a fake ClearCore. Per-camera **drive fill bars** (green, red <10 % free). Two
+traps found in demo and recorded in §55.7: the GUI `acq` counter is idle-gated and is NOT a
+liveness signal (`frames_delivered` is), and a free-running simulator filled `F:` with 253 GB
+in one preflight. **Not yet run on the rig** — eyeball the first PASS report; S2's 300 c/pulse
+nominal is a guess. Checks: `tools/test_preflight.py`, `tools/test_af_w10_flight.py`.
+Between this and the previous banner, §30–54 (2026-08 .. 2026-10: NMEA/GPS tagging, raw
+`.bay14line` containers, Export Studio, the `w10` metric and its autofocus, exposure
+histogram) were appended without refreshing this paragraph — read them from §54 backwards.
+Previous: 2026-08-09 — **OrthoSim GT: the altitude readout was never a measurement**
 (§29): the bench had been reporting **10,000 ft while actually simulating ~2,985 ft**, and
 nothing in the decode could have noticed — speed/distance/GSD are *authored by the display*
 and read back out of the optical bar, and the magnification `M` (camera-px per display-px)
