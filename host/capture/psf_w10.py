@@ -242,15 +242,28 @@ def score_rois(rois, enc=None, pct=(), ksharp=()) -> dict:
     return out
 
 
-def frame_ok(stats: dict, *, min_edges: int = MIN_EDGES_FRAME, min_roi: int = 1,
-             cloud_mean: float = CLOUD_MEAN) -> bool:
-    """The sec.52.4 frame-level reliability gate on an ``array_edges`` result."""
+def gate_reason(stats: dict, *, min_edges: int = MIN_EDGES_FRAME, min_roi: int = 1,
+                cloud_mean: float = CLOUD_MEAN) -> str:
+    """Why the sec.52.4 frame-level gate rejects an ``array_edges`` result; ``""`` when it passes.
+
+    The image gates come first (``"no w10"``, ``"few edges"``, ``"cloud"``) so a caller that
+    only cares about the picture can ignore the last one, ``"enc stale"``: the w10 is fine, but
+    the encoder count next to it is the last value from a camera the PCB no longer selects.
+    """
     w = stats.get("w10", np.nan)
     if not (isinstance(w, (int, float)) and np.isfinite(w)):
-        return False
+        return "no w10"
     if stats.get("n_edges", 0) < min_edges or stats.get("n_roi", 0) < min_roi:
-        return False
-    if stats.get("enc_stale") == 1:
-        return False
+        return "few edges"
     rm = stats.get("med_mean", np.nan)
-    return not (isinstance(rm, float) and np.isfinite(rm) and rm > cloud_mean)
+    if isinstance(rm, float) and np.isfinite(rm) and rm > cloud_mean:
+        return "cloud"
+    if stats.get("enc_stale") == 1:
+        return "enc stale"
+    return ""
+
+
+def frame_ok(stats: dict, *, min_edges: int = MIN_EDGES_FRAME, min_roi: int = 1,
+             cloud_mean: float = CLOUD_MEAN) -> bool:
+    """The sec.52.4 frame-level reliability gate on an ``array_edges`` result (all four tests)."""
+    return gate_reason(stats, min_edges=min_edges, min_roi=min_roi, cloud_mean=cloud_mean) == ""

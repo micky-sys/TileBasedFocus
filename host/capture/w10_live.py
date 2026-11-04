@@ -24,7 +24,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from .psf_w10 import crop_rois, frame_ok, score_rois_raw14
+from .psf_w10 import crop_rois, gate_reason, score_rois_raw14
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +108,11 @@ class W10LiveScorer(QObject):
         try:
             t0 = time.perf_counter()
             stats = score_rois_raw14(rois, meta.get("focus"))
-            stats["ok"] = frame_ok(stats)
+            # The live readout is about the picture: a stale encoder (camera not selected on
+            # the PCB, so its count is the last one seen) does not gate the w10 here. The
+            # count still carries its stale mark in the line for anyone differencing frames.
+            stats["gate"] = gate_reason(stats)
+            stats["ok"] = stats["gate"] in ("", "enc stale")
             stats.update(meta)
             stats["score_ms"] = (time.perf_counter() - t0) * 1e3
             self.scored_count += 1
@@ -128,9 +132,11 @@ def format_score(s: dict) -> str:
     ``cam2[2439008] L1 S51 F7  w10 5.31 px  (1832 edges, 5 ROI, enc 128612)  copy 3 ms, score 142 ms``."""
     enc = s.get("encoder")
     enc_s = f", enc {enc:.0f}" if isinstance(enc, (int, float)) and enc == enc else ""
+    if enc_s and s.get("enc_stale") == 1:
+        enc_s += " (stale)"
     w = s.get("w10")
     w_s = f"w10 {w:.2f} px" if isinstance(w, (int, float)) and w == w else "w10 --"
-    flag = "" if s.get("ok") else "  [gated: " + ("cloud" if (s.get("med_mean") or 0) > 22000 else "few edges") + "]"
+    flag = "" if s.get("ok") else f"  [gated: {s.get('gate') or 'image'}]"
     t_s = ""
     if "copy_ms" in s and "score_ms" in s:
         t_s = f"  copy {s['copy_ms']:.0f} ms, score {s['score_ms']:.0f} ms"

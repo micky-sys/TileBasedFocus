@@ -13,7 +13,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication  # noqa: E402
-from capture.psf_w10 import array_edges  # noqa: E402
+from capture.psf_w10 import CLOUD_MEAN, array_edges, frame_ok, gate_reason  # noqa: E402
 from capture.w10_live import W10LiveScorer, format_score  # noqa: E402
 
 H, W = 9528, 13400
@@ -40,7 +40,29 @@ class FakePool:
         return self.frame
 
 
+def check_gate_labels():
+    """The gate names the test that failed; a stale encoder does not gate the live readout
+    (flight 2026-11-02: two of three cameras were logged '[gated: few edges]' with 3000-6000
+    edges because the label had no word for 'enc stale')."""
+    good = dict(w10=4.5, n_edges=3500, n_roi=5, med_mean=9000.0, enc_stale=0)
+    assert gate_reason(good) == "" and frame_ok(good)
+    assert gate_reason(dict(good, w10=float("nan"))) == "no w10"
+    assert gate_reason(dict(good, n_edges=120)) == "few edges"
+    assert gate_reason(dict(good, med_mean=CLOUD_MEAN + 1)) == "cloud"
+    stale = dict(good, enc_stale=1)
+    assert gate_reason(stale) == "enc stale" and not frame_ok(stale)
+    assert gate_reason(dict(stale, med_mean=CLOUD_MEAN + 1)) == "cloud"   # image gates win
+    # what the live scorer does with it
+    s = dict(stale, gate=gate_reason(stale), ok=gate_reason(stale) in ("", "enc stale"),
+             cam="cam3[2439007]", line=8, sweep=1, frame=7, encoder=11744)
+    line = format_score(s)
+    assert s["ok"] and "gated" not in line and "enc 11744 (stale)" in line, line
+    few = dict(good, n_edges=120, gate="few edges", ok=False, cam="c", encoder=5)
+    assert "[gated: few edges]" in format_score(few) and "(stale)" not in format_score(few)
+
+
 def main():
+    check_gate_labels()
     app = QCoreApplication.instance() or QCoreApplication(sys.argv)
     # The slot the scorer is offered holds raw right-justified BayerRG14, so the reference has
     # to be scored at the 16-bit scale psf_w10 is calibrated for -- as the scorer now does.

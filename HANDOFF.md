@@ -6849,6 +6849,16 @@ volumes only -- `drive_picker` already filters the cloud mounts that stall).
   only there (`.cursor/rules/app-launch-kill-safety.mdc` still stands for the rig). The
   demo files on F: still need deleting by hand. Follow-up worth doing: route `--demo` writers
   to a scratch dir or cap them.
+- **`[gated: few edges]` on the un-selected cameras was the stale-encoder gate mislabelled**
+  (flight 2026-11-02, found 11-04). `frame_ok` fails a frame whose camera is not the one
+  selected on the PCB (`enc_stale`: its count is the last value seen, sec.52.4), and
+  `format_score` only knew "cloud" / "few edges", so every cam2/cam3 score on a line flown
+  with cam1 selected read `[gated: few edges]` at 3000-6000 edges -- and the 11-03 line-8
+  analysis wrongly called their encoders faulty. Now `psf_w10.gate_reason` names the test
+  (`no w10` / `few edges` / `cloud` / `enc stale`, image gates first), `frame_ok` is
+  `gate_reason == ""` (AF / analysis unchanged), and the live readout no longer gates on a
+  stale encoder: the w10 shows, the count reads `enc 11744 (stale)`. Line 8 F7 at face
+  value: cam1 4.7, cam3 6.3, cam2 8.3 px median. `tools/test_w10_live.py`.
 
 ### 55.8 Reproduce / check
 
