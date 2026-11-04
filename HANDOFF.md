@@ -6699,3 +6699,141 @@ Aperture decision for the 300 mm (cam 2439008): click 3 (f/4 + 3 clicks), from t
 test in 54.13 and the recorded best frames (`D:\Project\aperture\day3_*`, centre w10 4.39 ->
 4.05 -> 3.73 -> 3.57 px over f/4 .. click 3; no diffraction turn-over seen yet).
 
+## 55. w10 is the only AF; preflight check; demo mode (2026-11-03 .. 11-04)
+
+Commits `7d68360` (removal) and `36fdcc1` (everything below). `main` at `7d68360` alone does
+not import -- the follow-up edits to `pipeline.py` / `mode_controller.py` / `focus_axis.py` /
+the PyInstaller spec are in `36fdcc1`.
+
+### 55.1 What was removed (`7d68360`)
+
+AF1-3 (`autofocus.py`, v2/v3, sweep-and-hold), the Fine / dual-object trackers and their
+panes, the field-map, OrthoSim (bench ground simulator, sec.29) and every tool that only
+served them: 43 files, 19,675 lines. Gone from the GUI as well: the AF algorithm combo, the
+lockstep checkbox, 2-obj track, Fine tile + insets, the field-map tab. `FocusAxis` /
+`OpenLoopAxis` went with them; `focus_axis.py` keeps only the AMT203S stream tracking
+(`EncoderAxis`), positions in COUNTS, and the w10 glue converts to pulses itself (54.13).
+`IRON661_AF` is no longer read. Sections 20-29 and 45-50 describe code that no longer exists;
+they stay as the record of why.
+
+### 55.2 Preflight check (`host/capture/preflight.py`, button next to Reset cameras)
+
+One button before a flight exercises the whole chain the way the flight will use it. A
+generator state machine (`PreflightRunner._run`) ticked at 10 Hz by a QTimer; every rig
+access goes through `PreflightHooks` callables wired in `MainWindow._build_preflight_runner`
+to the SAME paths the operator's buttons use (mode click, deep recovery, line rotation), so
+nothing is special-cased for the check. While it runs, the mode / reset / AF controls are
+locked and the button reads "Abort preflight". Report in a dialog and in the session log
+(`[PREFLIGHT]`), first failing item on top:
+
+1. Prerequisites: ClearCore connected, cameras online + armed, project + drives set. GPS
+   absent is reported HERE as a non-fatal `FAIL GPS tagging -- ... (rest of the check
+   continues)` so it is never hidden behind a later failure.
+2. `$M4*`: `ack:` within 3 s (dead UART), `Mode 4:` banner within 45 s. The firmware prints
+   the banner only after `stop()` + `EnableAndHome()` return, so "banner seen" IS "mirrors
+   homed"; the runner never sends the next command before it (`_enter_mode`). Same wait on
+   every mode change, including the `$M0*` the deep recovery re-sends.
+3. Per camera: `$C<slot>*`, wait for a FRESH `$ENC` (<= 0.5 s old), then at S3 drive '+'
+   until the encoder has moved 10,000 c, then '-' the same; one pulse per line (850 c keeps
+   each move under the 12-bit unwrap half-turn of 2048). Every pulse must move >= 20 c
+   (obstruction / end stop / relay not reaching the motor), no pulse may read > 1800 c
+   (folded unwrap), all moves in one direction must agree in sign (slipping encoder), the
+   two directions must be opposite, and the lens must end within 3000 c of where it started
+   (lash + slip). Each direction has a 90 s budget. Then **counts/pulse calibration**: at
+   S3, S2, S1, S0 in turn, 3 bursts each way (alternating, so the lens stays put), sized
+   from a nominal table (850/300/80/24) to ~400 c, the median of the six kept. Report line:
+   `PASS Focus calibration cam2 -- S3 850 c/pulse (850-850), S2 300 ..., S1 80 ..., S0 30
+   ...; median of 6 bursts each, noted for AF`.
+4. Cameras alive: SDK callback counters (`KyfgCamera.frames_delivered` = `_cb_count`) must
+   advance during step 3 (M4 triggers at max fps). NOT the GUI `acq` counter -- see trap.
+   A dead camera gets the DEEP recovery once, then the check continues.
+5. `$M0*` (homes again; the host opens line containers) then `$Click*`: exactly one sweep
+   through the nav-point trigger path. Wait for `Swp#` (90 s), let the writers catch up (20
+   s), then every camera got the same non-zero frame count, nothing dropped, everything
+   written, and (GPS present) every frame matched a GPS event. A camera with zero frames:
+   deep recovery (if not already) and one more sweep.
+6. `rotate_lines`: the preflight containers are closed, fresh ones opened for the flight, and
+   **the preflight containers are deleted** once the io_writers release them
+   (`_delete_preflight_lines`, `PermissionError` retried 1/s for 30 s -- `close_line` is
+   asynchronous and Windows will not unlink an open file). Only containers the check itself
+   rotated out are touched: a FAIL before that point leaves its files as evidence; a line the
+   operator had open before pressing Preflight is closed cleanly by the `$M4*` transition and
+   never in the list (new containers get a new `HHMMSS`, never the same path). It IS split
+   across two files with the same `L<n>`; bump the line number after a preflight for a clean
+   boundary.
+
+Any ClearCore fault line (`alert detected`, `homing FAILED`, `SAFE ABORT`, ...) at any point
+aborts the run with that line. On finish the panel's strength is re-sent (the motor test ran
+at S3). Fake rig + fake clock: `py -3 tools/test_preflight.py` (healthy, obstructed motor,
+motor dead at a fine strength, dead camera + recovery, no sweep, GPS absent up front, abort).
+
+**Rig status: not yet run on hardware.** First PASS report is the thing to eyeball; S2's 300
+c/pulse nominal is a guess (never measured), so if its measured value is far off, the burst
+sizing in `CAL_NOMINAL_CPP` wants the real number.
+
+### 55.3 AF uses the preflight's numbers
+
+`AutoFocusController.motor_polarity` / `motor_cpp` (per app camera) are filled from the
+runner in `_on_preflight_finished` -- for every motor whose direction test PASSED, even if
+the run failed later. `_known_cpp(cam)` returns `copysign(cpp[cam][strength] or config
+magnitude, polarity)`; `AutoFocusEngineW10.start(counts_per_pulse)` with a value skips the
+8-pulse probe (`from preflight: '+' = -850 c/pulse at S3 (no probe)`), with `None` probes
+exactly as 54.13. No preflight -> probe; a motor that failed its test -> probe for that
+camera only. `tools/test_af_w10_flight.py::test_known_polarity_skips_the_probe`.
+
+### 55.4 Live w10 while focusing by hand
+
+The focus view shows `live w10=5.12@+123c (N edges)` whenever the previewed camera is in M4
+and no AF run owns the batch: `AutoFocusController.feed_crops` hands the five pinned ROI
+crops to `engine.score_live`, which scores on the engine's worker (one in flight, extra
+batches skipped) and emits `live_scored(enc, stats)`; the scatter gets the pooled and
+per-ROI points too. Full-res emission + ROI pins are now switched by `_set_focus_tap` at
+camera switch / mode change / split preview -- the same cost as during an AF run, only for
+the previewed camera.
+
+### 55.5 Demo mode (`py -3 host/main_capture.py --demo`)
+
+For working on the GUI off the rig. `demo_backend.DemoCameraManager` / `DemoCamera` stand in
+for the KAYA backend (synthetic BayerRG14 at 4 fps, 24-px block texture; the five ROIs are
+box-blurred by |lens - best| / 300 px so the live w10 and the AF see a real V), and
+`DemoClearCore(FocusController)` is a text-interpreting fake PCB behind `SerialClient`
+(`ack:` after 50 ms, `Mode n:` banner after 2 s, `Swp#` 4 s after `$Click*`, 10 Hz
+`$ENC=<slot>,<raw>*`, pulse lines move `DEMO_LENS_POS[slot]` at 30/80/300/850 c per pulse
+with per-slot polarity +/-/+). The demo cameras are **trigger-driven like the rig**: frames
+flow continuously in M1/M4/M5/M6, exactly 13 per camera per `$Click*` in M0/M3, otherwise
+nothing (`DEMO_TRIGGER`, `DEMO_SWEEP_BUDGET`). No GPS. Writers are real and write to the
+selected drive.
+
+### 55.6 Drive fill bars
+
+Each camera row has a bar after the drive dropdown: % used of the selected drive, green,
+red under 10 % free, `--` with no drive, `?` if the volume vanished; tooltip has the GB.
+`CameraRow.refresh_fill` = one `shutil.disk_usage`, on a 2 s QTimer (local recordable
+volumes only -- `drive_picker` already filters the cloud mounts that stall).
+
+### 55.7 Traps (both found in demo mode, both real)
+
+- **The GUI `acq` counter is not a liveness signal.** `AcquisitionThread.needs_buffers`
+  idle-gates cameras that are armed but neither recording, previewed nor focus-tapped; in M4
+  the two un-previewed cameras' frames are drained uncounted, so `acq` sits still while the
+  SDK delivers at full rate. The first preflight read `acq` and declared cams 2 and 3 dead
+  every run (and ran a pointless deep recovery). `frames_delivered` is the right counter;
+  the fake rig in `test_preflight.py` models the gating so the test fails the old way.
+- **A free-running simulator fills a drive in minutes.** Before 55.5's trigger gating the
+  demo cameras streamed 3 x 213 MB x 4 fps into whatever line was open: one preflight's M0
+  wrote 253 GB to `F:\Project\*20261103*` and filled it (`Errno 112`), the writers failed
+  every write, and the running app could not be closed gracefully because `closeEvent` drains
+  behind the failing writers. `--demo` holds no grabber, so a force-kill is safe THERE and
+  only there (`.cursor/rules/app-launch-kill-safety.mdc` still stands for the rig). The
+  demo files on F: still need deleting by hand. Follow-up worth doing: route `--demo` writers
+  to a scratch dir or cap them.
+
+### 55.8 Reproduce / check
+
+```
+py -3 tools/test_preflight.py
+py -3 tools/test_af_w10_flight.py
+py -3 tools/test_encoder_axis.py
+$env:QT_QPA_PLATFORM="windows"; py -3 host/main_capture.py --demo
+```
+
