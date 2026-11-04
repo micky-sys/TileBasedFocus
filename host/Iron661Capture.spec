@@ -23,15 +23,11 @@ main_script = HOST_DIR / "main_capture.py"
 
 datas = [
     (str(REPO_ROOT / "serial_comm.py"), "."),
-    (str(REPO_ROOT / "tile_geometry.py"), "."),
-    (str(REPO_ROOT / "sharpness.py"), "."),
 ]
 
 binaries = []
 hiddenimports = [
     "serial_comm",
-    "tile_geometry",
-    "sharpness",
     "blosc2",
     "imagecodecs",
     "numba",

@@ -33,8 +33,8 @@ import sys
 
 
 def _bootstrap_paths() -> None:
-    # PyInstaller frozen build: ``serial_comm`` / ``tile_geometry`` / ``sharpness``
-    # are bundled at the root of ``sys._MEIPASS`` via the spec ``datas`` list.
+    # PyInstaller frozen build: ``serial_comm`` is bundled at the root of
+    # ``sys._MEIPASS`` via the spec ``datas`` list.
     if getattr(sys, "frozen", False):
         base = getattr(sys, "_MEIPASS", None) or os.path.dirname(
             os.path.abspath(sys.executable)
@@ -45,7 +45,7 @@ def _bootstrap_paths() -> None:
 
     here = os.path.dirname(os.path.abspath(__file__))   # .../host
     repo_root = os.path.dirname(here)                   # repo root (one above host/)
-    # Repo root holds serial_comm.py, tile_geometry.py, sharpness.py.
+    # Repo root holds serial_comm.py.
     # host/ holds gentl_acq_helpers.py, kaya_harvesters_patch.py.
     for p in (repo_root, here):
         if p and p not in sys.path:

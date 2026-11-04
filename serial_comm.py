@@ -245,6 +245,12 @@ class FocusController:
         """
         self._send("$T*\n")
 
+    def start_sweep(self) -> None:
+        """``$Click*``: run ONE sweep in M0 (or M3) -- the same ``SweepNeedsToStart``
+        path as the nav system's DI-6 pulse, so it exercises exactly what a flight
+        trigger does. Ignored by the PCB in the other modes."""
+        self._send("$Click*\n")
+
     def fire_event(self) -> None:
         """Fire one ``$E*``: a single GNSS EXT_EVENT pulse, no camera, no motors.
 

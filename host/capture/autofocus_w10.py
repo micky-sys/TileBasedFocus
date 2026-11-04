@@ -1,7 +1,9 @@
-"""Live w10 autofocus engine: the glue between ``af_w10.W10Focus`` and the app (HANDOFF sec.54.8).
+"""Live w10 autofocus: the glue between ``af_w10.W10Focus`` and the app (HANDOFF sec.54.8).
 
-Same duck-typed surface as the v2/v3 engines (``start`` / ``stop`` / ``feed_frame`` / ``running`` /
-``cfg`` / ``current_roi``), so ``AutoFocusController`` drives it unchanged. What is different:
+:class:`AutoFocusEngineW10` is the engine (``start`` / ``stop`` / ``feed_crops`` / ``running`` /
+``cfg``); :class:`AutoFocusController` is the thin Qt wrapper the app talks to (signals, the M4/M5
++ PCB guards, and the "Auto-focus all" camera sequence). The earlier dither / sweep-and-hold /
+field-profile engines were removed on 2026-11-02 after the flight showed only w10 works.
 
 * It does not score the coarse tap. At ``start`` it asks the app (``pin_rois_cb``) to pin the five
   sec.52.2 ROIs on the active pipeline; the acquisition thread cuts them from the held full-res slot
@@ -9,22 +11,26 @@ Same duck-typed surface as the v2/v3 engines (``start`` / ``stop`` / ``feed_fram
   worker thread, sec.54.2); a batch arriving while one is in flight is skipped, not queued.
 * Positions are RAW encoder counts (the frame metadata's ``encoder_count``), the frame the recorded
   V-curves and ``W10Focus`` live in -- not the per-run axis position of the other engines.
-* Polarity is MEASURED, every run. The focus motors are brushed DC motors and each lens may have
+* Polarity is MEASURED, never assumed -- by the preflight motor test when the operator ran one
+  this session (``start(polarity=...)``), else by a probe at the start of the run. The focus motors are brushed DC motors and each lens may have
   its leads the other way round, so which of '+'/'-' raises the count is a property of the camera,
   not of the rig (2026-10-18: cam 2439007 ran its back-off the wrong way on the sec.23.6 sign). A
   ``probe_pulses`` burst of '+' goes out first; once the encoder has settled, the sign of its move
   fixes the counts/pulse sign for the run. The encoder sits on the motor side of the lash, so the
   probe reads cleanly whatever the gear state; it costs a few frames and ~200 counts of travel
-  that the 3500-count back-off swallows anyway.
+  that the 3500-count back-off swallows anyway. The preflight hands over sign AND magnitude at
+  this strength (``start(counts_per_pulse=...)``); ``_learn_cpp`` refines it from the drive bursts.
 * Drive. ``W10Focus`` assumes a commanded move has LANDED by the next frame it is fed (that is how
   the replay harness serves it), so the glue owns the transit: a ``move`` becomes a burst of str0
   pulses toward the target, and frames that arrive while the encoder is still far from it are
   neither scored nor fed. The next burst goes out only once the encoder has read flat for
   ``settle_ticks`` frames (motor stopped, 10 Hz encoder caught up), so nothing is re-commanded on
-  stale feedback (sec.23.7). Bursts are capped (``max_pulses_per_burst``) and, beyond a few pulses,
-  aim ``approach_frac`` of the way, so an uncalibrated long-burst counts/pulse cannot overshoot the
-  final approach onto the vertex -- the one place an overshoot costs focus. A burst that moves the
-  encoder not at all is handed to the engine unscored, so its own stall detector sees the limit.
+  stale feedback (sec.23.7). Bursts are capped (``max_pulses_per_burst``, and the binding
+  ``max_counts_per_burst``: under half a motor turn, or the 12-bit encoder unwrap loses a
+  revolution -- the 2026-11-02 flight) and, beyond a few pulses, aim ``approach_frac`` of the way,
+  so an uncalibrated long-burst counts/pulse cannot overshoot the final approach onto the vertex --
+  the one place an overshoot costs focus. A burst that moves the encoder not at all is handed to
+  the engine unscored, so its own stall detector sees the limit.
 """
 from __future__ import annotations
 
@@ -79,6 +85,7 @@ def burst_pulses(target: float, encoder: float, counts_per_pulse: float, max_pul
 
 class AutoFocusEngineW10(QObject):
     _scored = Signal(float, object)   # (encoder at capture, array_edges stats or None): worker -> GUI thread
+    live_scored = Signal(float, object)   # same, for a frame scored OUTSIDE a run (operator focusing by hand)
 
     def __init__(
         self,
@@ -96,13 +103,13 @@ class AutoFocusEngineW10(QObject):
         config: Optional[W10Config] = None,
         strength: int = 0,
         max_pulses_per_burst: int = 50,
+        max_counts_per_burst: float = 700.0,
         approach_frac: float = 0.75,
         settle_ticks: int = 2,
         no_motion_frames: int = 6,
         probe_pulses: int = 8,
         csv_dir: Optional[str] = None,
         parent: Optional[QObject] = None,
-        **_unused,   # the controller's common kwargs the other engines take (full_res_score, adjust_cadence)
     ) -> None:
         super().__init__(parent)
         self.cfg = config or W10Config()
@@ -126,6 +133,15 @@ class AutoFocusEngineW10(QObject):
         # calibrated for single pulses (sec.23.6). Upgrade path: calibrate a long str0 burst (or str3)
         # against the encoder and raise the cap / drop approach_frac to 1.
         self._max_pulses = int(max_pulses_per_burst)
+        # The binding cap is in COUNTS. The AMT203S is a 12-bit single-turn angle and the host
+        # unwraps it by shortest path, so a burst that carries the shaft more than half a turn
+        # (2048 c) between two $ENC reports the host actually receives is folded the wrong way
+        # and the count silently loses a whole revolution. Reports fail during fast motion (the
+        # firmware's double-read agreement), so "between reports" can be the whole burst: the
+        # 2026-11-02 flight lost 4096 c on cam3 in five of eight back-offs with 50-pulse lines
+        # (~1150-1500 c each), drove the lens into its end stop, and the stall points all agree
+        # modulo 4096. 700 c leaves ~3x margin even if the train coasts past the probe's c/pulse.
+        self._max_counts = abs(float(max_counts_per_burst))
         self._approach_frac = float(approach_frac)
         self._settle_ticks = int(settle_ticks)
         # Command -> `$S0*` ack -> pulse line -> 10 Hz `$ENC` report is ~0.5 s on the bench (10:27
@@ -136,6 +152,7 @@ class AutoFocusEngineW10(QObject):
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="w10-af")
         self._focus: Optional[W10Focus] = None
         self._inflight = False
+        self._live = False                        # the in-flight score is a live (no-run) one
         self._last_enc: Optional[float] = None    # encoder at the previous frame (flat detection)
         self._burst_enc: Optional[float] = None   # encoder when the last burst went out
         self._burst_n = 0                         # signed pulses of the last burst ('+' positive)
@@ -147,18 +164,28 @@ class AutoFocusEngineW10(QObject):
         self._csv: Optional[FocusCsvLogger] = None   # one file per run, opened once the probe has passed
         self._last_stats: Optional[dict] = None      # stats of the last scored frame (per-ROI on the DONE line)
         self._scored.connect(self._on_scored)
-        self.adaptive_profile = False   # interface parity; nothing to adapt
-        self.current_roi = None         # no single winning tile: the five fixed ROIs are the target
 
     # -- controller surface ------------------------------------------------------------------------
     @property
     def running(self) -> bool:
         return self._focus is not None or self._probe is not None
 
-    def start(self, **_ignored) -> None:
-        """Begin a run on the selected camera: polarity probe first, then the sweep.
-        ``lead_edge_hint`` / ``continuous`` / ``seed_roi`` are accepted for parity and ignored: w10
-        needs no target and always parks (one-shot)."""
+    @property
+    def strength(self) -> int:
+        return self._strength
+
+    @property
+    def config_cpp_mag(self) -> float:
+        return self._cpp_mag
+
+    def start(self, counts_per_pulse: Optional[float] = None) -> None:
+        """Begin a run on the selected camera: polarity probe first, then the sweep. One-shot: w10
+        needs no target and always parks.
+
+        ``counts_per_pulse`` (SIGNED: counts the raw encoder moves per '+' pulse at this run's
+        strength) skips the probe -- it is what the probe would have measured, taken from the
+        preflight's motor test and calibration bursts on this very motor. ``_learn_cpp`` still
+        refines the magnitude from the drive bursts."""
         if self._encoder_present is not None and not self._encoder_present():
             self._status("w10 AF: encoder reads absent ($ENC=-1) -- cannot run")
             self._finished(False, {"reason": "no encoder"})
@@ -176,7 +203,12 @@ class AutoFocusEngineW10(QObject):
             except Exception:  # pragma: no cover - actuator guard
                 log.exception("set_strength failed")
         self._pin(roi_boxes())
-        self._send_probe("+", tries=0)
+        if counts_per_pulse:
+            self._cpp = float(counts_per_pulse)
+            self._begin_sweep(float(self._encoder_read()),
+                              f"from preflight: '+' = {self._cpp:+.0f} c/pulse at S{self._strength} (no probe)")
+        else:
+            self._send_probe("+", tries=0)
 
     def _send_probe(self, sym: str, tries: int) -> None:
         enc = float(self._encoder_read())
@@ -245,15 +277,18 @@ class AutoFocusEngineW10(QObject):
         # window on every burst and hunted around the park target indefinitely.
         plus_delta = delta if p["sym"] == "+" else -delta
         self._cpp = math.copysign(max(abs(delta) / self._probe_pulses, 1.0), plus_delta)
+        self._begin_sweep(enc, f"polarity: '{p['sym']}' x{self._probe_pulses} moved the encoder {delta:+.0f} c "
+                               f"({delta / self._probe_pulses:+.1f} c/pulse) -> '+' = {self._cpp:+.0f} c/pulse")
+
+    def _begin_sweep(self, enc: float, how: str) -> None:
+        """Polarity settled (probed or given): open the run's CSV and hand over to :class:`W10Focus`."""
         self._focus = W10Focus(cfg=self.cfg)
         self._log_seen = 0
         self._burst_enc = None
         self._last_stats = None
         self._csv = FocusCsvLogger(self._csv_dir, header=CSV_HEADER, prefix="Iron661_w10af")
         d = "down" if self.cfg.direction < 0 else "up"
-        self._status(f"w10 AF: polarity: '{p['sym']}' x{self._probe_pulses} moved the encoder {delta:+.0f} c "
-                     f"({delta / self._probe_pulses:+.1f} c/pulse) -> '+' = {self._cpp:+.0f} c/pulse; "
-                     f"start at enc {enc:.0f}, sweeping {d}"
+        self._status(f"w10 AF: {how}; start at enc {enc:.0f}, sweeping {d}"
                      + (f"; CSV {self._csv.path}" if self._csv.path else ""))
 
     def stop(self, reason: str = "stopped by operator") -> None:
@@ -261,9 +296,6 @@ class AutoFocusEngineW10(QObject):
         if self.running:
             self._probe = None
             self._finish(False, reason)
-
-    def feed_frame(self, frame) -> None:
-        """The coarse tap carries nothing w10 needs; the crops come through :meth:`feed_crops`."""
 
     def feed_crops(self, crops) -> bool:
         """One batch of the five pinned ROIs (sensor-native uint16, ``roi_boxes`` order) from the held
@@ -282,6 +314,16 @@ class AutoFocusEngineW10(QObject):
             self._pool.submit(self._score, list(crops), enc)
         self._last_enc = enc
         return True
+
+    def score_live(self, crops) -> None:
+        """Score one pinned-ROI batch outside a run, so the operator sees the same w10 the AF
+        would while focusing by hand. Same scorer, same single-worker pool; the result comes
+        back on ``live_scored``. Dropped when a run owns the engine or a score is in flight."""
+        if self.running or self._inflight or not crops or len(crops) != 5 or any(c is None for c in crops):
+            return
+        self._inflight = True
+        self._live = True
+        self._pool.submit(self._score, list(crops), float(self._encoder_read()))
 
     def _transit_tick(self, f: W10Focus, enc: float) -> None:
         settled = self._settled(enc)
@@ -333,6 +375,11 @@ class AutoFocusEngineW10(QObject):
 
     def _on_scored(self, enc: float, stats) -> None:
         self._inflight = False
+        if self._live:
+            # Never fed to a run, even one that started while this score was out.
+            self._live = False
+            self.live_scored.emit(enc, stats)
+            return
         f = self._focus
         if f is None:
             return
@@ -362,7 +409,7 @@ class AutoFocusEngineW10(QObject):
     def _burst(self, target: Optional[float], enc: float, fresh: bool = True) -> None:
         if target is None:
             return
-        n = burst_pulses(target, enc, self._cpp, self._max_pulses, self._approach_frac)
+        n = burst_pulses(target, enc, self._cpp, self._burst_cap(), self._approach_frac)
         if n == 0:
             return
         sym = "+" if n > 0 else "-"
@@ -373,6 +420,11 @@ class AutoFocusEngineW10(QObject):
                 self._pulse(sym, abs(n))
             except Exception:  # pragma: no cover - actuator guard
                 log.exception("w10 AF: pulse failed")
+
+    def _burst_cap(self) -> int:
+        """Pulses per line: the pulse cap, or fewer when that many pulses would carry the shaft
+        more than ``max_counts_per_burst`` at the current (probed, then learned) counts/pulse."""
+        return max(1, min(self._max_pulses, int(self._max_counts / abs(self._cpp))))
 
     def _progress(self, enc: float, stats, act) -> str:
         f = self._focus
@@ -408,3 +460,134 @@ class AutoFocusEngineW10(QObject):
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
+
+
+class AutoFocusController(QObject):
+    """Qt wrapper: binds :class:`AutoFocusEngineW10` to the app's serial / mode plumbing and
+    sequences cameras for "Auto-focus all". The app routes every pinned-ROI crop batch for the
+    active camera into :meth:`feed_crops`."""
+
+    status = Signal(str)
+    finished = Signal(bool, dict)        # one camera completed
+    run_state_changed = Signal(bool)     # True = a run (single or all) is active
+    sample = Signal(int, float, bool)    # (raw encoder, pooled w10, True) per gated frame
+    roi_sample = Signal(int, object)     # (raw encoder, [w10 of the five ROIs, NaN = none])
+    live_scored = Signal(float, object)  # (raw encoder, stats or None): a frame scored with no run active
+
+    def __init__(
+        self,
+        serial,
+        modes,
+        *,
+        counts_per_pulse: float,
+        pin_rois_cb: Callable[[Optional[list]], None],
+        select_camera_cb: Optional[Callable[[int], None]] = None,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._serial = serial
+        self._modes = modes
+        self._select_camera_cb = select_camera_cb
+        self._engine = AutoFocusEngineW10(
+            pulse=serial.focus_step,
+            encoder_read=lambda: serial.encoder_position,
+            encoder_present=lambda: serial.encoder_present,
+            counts_per_pulse=counts_per_pulse,
+            pin_rois_cb=pin_rois_cb,
+            set_strength=serial.set_strength,
+            status=self.status.emit,
+            finished=self._on_engine_finished,
+            sample=self.sample.emit,
+            roi_sample=self.roi_sample.emit,
+            parent=self,
+        )
+        self._engine.live_scored.connect(self.live_scored)
+        self._sequence: list[int] = []
+        self._seq_index = 0
+        # From the preflight (app camera numbers): cam -> +1/-1 sign per '+' pulse, and
+        # cam -> {strength: |c/pulse|}. No polarity for a camera = probe as before; a polarity
+        # without a magnitude at the AF strength falls back to the config magnitude.
+        self.motor_polarity: dict[int, float] = {}
+        self.motor_cpp: dict[int, dict[int, float]] = {}
+
+    def _known_cpp(self, camera: Optional[int]) -> Optional[float]:
+        pol = self.motor_polarity.get(camera)
+        if not pol:
+            return None
+        mag = self.motor_cpp.get(camera, {}).get(self._engine.strength) or self._engine.config_cpp_mag
+        return math.copysign(mag, pol)
+
+    @property
+    def config(self) -> W10Config:
+        return self._engine.cfg
+
+    def is_running(self) -> bool:
+        return self._engine.running
+
+    def start_single(self, camera: Optional[int] = None) -> bool:
+        """One w10 run on the active camera (``camera`` looks up its preflight polarity)."""
+        if not self._guard():
+            return False
+        self._sequence = []
+        self.run_state_changed.emit(True)
+        self._engine.start(self._known_cpp(camera))
+        return True
+
+    def start_all(self, cameras: list[int]) -> bool:
+        """Focus each camera in ``cameras`` once, in order (relay-selected via ``select_camera_cb``)."""
+        if not self._guard():
+            return False
+        if not cameras:
+            self.status.emit("autofocus: no cameras available")
+            return False
+        self._sequence = list(cameras)
+        self._seq_index = 0
+        self.run_state_changed.emit(True)
+        self._select_for_sequence()
+        self._engine.start(self._known_cpp(cameras[0]))
+        return True
+
+    def stop(self, reason: str = "stopped by operator") -> None:
+        self._sequence = []
+        self._engine.stop(reason)
+
+    def feed_crops(self, crops) -> bool:
+        """A full-res ROI batch from the pipeline. True when a run owns the batch; otherwise
+        it is scored live (``live_scored``) for the operator's manual focusing."""
+        if self._engine.feed_crops(crops):
+            return True
+        self._engine.score_live(crops)
+        return False
+
+    def shutdown(self) -> None:
+        """Join the engine's scorer thread (non-daemon) before the grabber teardown."""
+        self._engine.shutdown()
+
+    def _guard(self) -> bool:
+        if self._engine.running:
+            self.status.emit("autofocus: already running")
+            return False
+        if self._modes is not None and not self._modes.is_af_mode():
+            self.status.emit("autofocus: only available in M4 (Focus) or M5 (Ground Test) mode")
+            return False
+        if not getattr(self._serial, "connected", False):
+            self.status.emit("autofocus: PCB not connected")
+            return False
+        return True
+
+    def _select_for_sequence(self) -> None:
+        if 0 <= self._seq_index < len(self._sequence) and self._select_camera_cb:
+            try:
+                self._select_camera_cb(self._sequence[self._seq_index])
+            except Exception:
+                log.exception("select_camera_cb failed")
+
+    def _on_engine_finished(self, ok: bool, report: dict) -> None:
+        self.finished.emit(ok, report)
+        if self._sequence and self._seq_index + 1 < len(self._sequence):
+            self._seq_index += 1
+            self._select_for_sequence()
+            self._engine.start(self._known_cpp(self._sequence[self._seq_index]))
+        else:
+            self._sequence = []
+            self.run_state_changed.emit(False)

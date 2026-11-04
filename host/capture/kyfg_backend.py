@@ -558,6 +558,13 @@ class KyfgCamera:
     def is_armed(self) -> bool:
         return self._armed
 
+    @property
+    def frames_delivered(self) -> int:
+        """Buffers the SDK has handed to our callback since arm -- counts whether or not
+        the host consumed them (the AcquisitionThread idle-gates un-previewed cameras in
+        M4), so this is the liveness signal, not the GUI's ``acq``."""
+        return self._cb_count
+
     # ── full-res emission control ───────────────────────────────────────
 
     def set_full_res_emission(self, enabled: bool) -> None:

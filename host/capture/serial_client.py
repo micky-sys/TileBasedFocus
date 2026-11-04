@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -62,9 +63,10 @@ class SerialClient(QObject):
     line_received = Signal(str)
     connection_changed = Signal(bool)
 
-    def __init__(self, mode_controller: ModeController) -> None:
+    def __init__(self, mode_controller: ModeController,
+                 controller: Optional[FocusController] = None) -> None:
         super().__init__()
-        self._ctrl = FocusController()
+        self._ctrl = controller if controller is not None else FocusController()   # --demo injects a fake PCB
         self._modes = mode_controller
         # Accumulates the AMT203S ``$ENC=`` stream into an unwrapped motor count,
         # one accumulator per camera. Fed on the reader thread (see _on_line) so
@@ -272,19 +274,16 @@ class SerialClient(QObject):
         """
         self._ctrl.test_trigger()
 
+    def start_sweep(self) -> None:
+        """``$Click*``: one sweep in M0, via the nav-point trigger path (preflight check)."""
+        self._ctrl.start_sweep()
+
     def fire_event(self) -> None:
         """``$E*``: one GNSS EXT_EVENT pulse, no camera, no motors.
 
         The probe used to decide whether the NMEA bridge on COM3 is really there
         -- see :meth:`FocusController.fire_event`."""
         self._ctrl.fire_event()
-
-    def set_external_trigger(self, on: bool) -> None:
-        """``$X1*``/``$X0*``: M4 fires only on host ``$T*``, or on its own timer.
-
-        Bench only -- see :meth:`FocusController.set_external_trigger`.
-        """
-        self._ctrl.set_external_trigger(on)
 
     # ── internal ────────────────────────────────────────────────────────
 

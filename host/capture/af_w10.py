@@ -199,6 +199,12 @@ class W10Config:
     step_counts: float = 100.0   # creep per gated frame during SWEEP (one frame per station: sec.54 study)
     refine_step: float = 50.0    # creep per gated frame during REFINE
     span_counts: float = 7000.0  # sweep budget in counts from the start point; FAIL if never bracketed
+    span_extend: float = 1.0     # ... extended ONCE by this fraction when w10 is still falling at the budget's
+                                 # end: the lens is still approaching focus, so stopping there is the one wrong
+                                 # move (2026-11-02: four sweeps failed at 7000 c with w10 falling 12 -> 5 px)
+    backoff_stall_counts: float = 1500.0  # a back-off that stalls after moving MORE than this is not a travel
+                                 # limit at the start point (take-up ~1200 c is the most the motor turns before
+                                 # a lens at its stop holds it): FAIL rather than sweep from the stop
     max_backoffs: int = 3        # back-offs allowed (the first one included) before giving up on the near flank
     fit_window_depths: float = 2.5   # refit on samples within this many depths of the vertex (0 = use all)
     rise_px: float = 0.3         # flank rise that defines "bracketed" and the depth of focus
@@ -238,6 +244,8 @@ class W10Focus:
     landed: bool = True          # False from a back-off command until the encoder reaches (or passes) its start
     backoffs: int = 0
     n_at_backoff: int = 0        # samples held when the latest back-off was commanded
+    backoff_from: Optional[float] = None   # encoder when the latest back-off was commanded
+    span_extended: bool = False  # the one-time span extension has been spent
     far_target: Optional[float] = None
     enc_hist: list = field(default_factory=list)   # every encoder reading seen (the stall detector's input)
     log: list = field(default_factory=list)
@@ -297,14 +305,36 @@ class W10Focus:
     def _bracketed(self) -> bool:
         return bracketed(self.enc, self.w10, self.fit, self.cfg.rise_px)
 
-    def _back_off(self, from_enc: float) -> Action:
+    def _span_budget(self) -> float:
+        return self.cfg.span_counts * (1.0 + self.cfg.span_extend if self.span_extended else 1.0)
+
+    def _still_falling(self) -> bool:
+        """Is w10 still dropping along the sweep? The median over the last 10 steps of travel sits a full
+        ``rise_px`` below the median over the 10 steps before. ponytail: medians of two travel blocks, not a
+        slope fit -- frames carry 0.5 px of noise and content bias that shifts a whole run of frames, so a
+        block has to be long enough (~1000 c) to outweigh it; by sample count it is not, once a fit has shrunk
+        the step to 50 c."""
+        e = np.asarray(self.enc, float); w = np.asarray(self.w10, float)
+        if len(e) < 6:
+            return False
+        t = self.cfg.direction * (e - self.start_enc)
+        win = 10 * self.cfg.step_counts
+        end = t.max()
+        last = w[t > end - win]
+        prev = w[(t <= end - win) & (t > end - 2 * win)]
+        return (len(last) >= 3 and len(prev) >= 3
+                and float(np.median(last)) <= float(np.median(prev)) - self.cfg.rise_px)
+
+    def _back_off(self, from_enc: float, encoder: Optional[float] = None) -> Action:
         """Command the start point ``start_offset`` against the sweep direction from ``from_enc``; samples taken
-        so far stay (they were approached in the sweep direction too), the take-up after the reversal is skipped."""
+        so far stay (they were approached in the sweep direction too), the take-up after the reversal is skipped.
+        ``encoder`` is where the lens actually is now (defaults to ``from_enc``): the stall rule measures from it."""
         self.backoffs += 1
         self.start_enc = float(from_enc) - self.cfg.direction * self.cfg.start_offset
         self.taking_up = True
         self.landed = False
         self.n_at_backoff = len(self.enc)
+        self.backoff_from = float(from_enc if encoder is None else encoder)
         self._say(f"backing off to {self.start_enc:.0f}")
         return self._move(self.start_enc)
 
@@ -371,6 +401,16 @@ class W10Focus:
                 # tracked rather than inferred: without it the take-up began from a position that
                 # was never reached, and a limit there failed the run instead of re-basing.
                 if stalled:
+                    moved = abs(encoder - self.backoff_from) if self.backoff_from is not None else 0.0
+                    if moved > cfg.backoff_stall_counts:
+                        # The motor turned well past the take-up and THEN stopped: the lens was driven
+                        # into a stop far from where it started, which a 3500 c back-off from near
+                        # focus cannot do on its own -- the encoder count has lost revolutions (the
+                        # 2026-11-02 flight: five stalls on cam3, all at the same raw angle). The
+                        # sweep from a stop ran along the 12 px ceiling and failed every time; the
+                        # position frame is wrong, so there is nothing to sweep from.
+                        return self._fail(f"back-off stalled at {encoder:.0f} after moving {moved:.0f} c "
+                                          f"(lens at a limit, or the encoder count lost revolutions)")
                     self.start_enc = float(encoder)
                     self.landed = True
                     self._say(f"back-off stopped short at {encoder:.0f} (limit?): sweeping from here")
@@ -406,8 +446,16 @@ class W10Focus:
                     return self._fail(f"start-side flank still missing after {self.backoffs} back-offs")
                 self._say(f"start-side flank missing (vertex {self.fit.e0 if self.fit else float('nan'):.0f} vs "
                           f"start {self.start_enc:.0f}): backing off again")
-                return self._back_off(self.start_enc)
-            elif travelled > cfg.span_counts:
+                return self._back_off(self.start_enc, encoder)
+            elif travelled > self._span_budget():
+                if not self.span_extended and self._still_falling():
+                    # Out of budget while w10 is still dropping: the lens is on its way DOWN the far
+                    # flank and the vertex is ahead. Stopping here is the one wrong move -- it is how
+                    # a back-off that ran a revolution long (encoder alias) lost four runs on 2026-11-02
+                    # with the lens 600-1500 c from focus and sharpening on every frame.
+                    self.span_extended = True
+                    self._say(f"budget spent at {travelled:.0f} c but w10 still falling: extending the sweep once")
+                    return self._step(encoder, cfg.step_counts)
                 return self._fail(f"swept {travelled:.0f} counts without bracketing the vertex")
             else:
                 return self._step(encoder, cfg.step_counts)
@@ -420,7 +468,7 @@ class W10Focus:
                     self.state = AFW10State.SWEEP; self.refine_frames = 0
                     self._say("bracket lost on refit; back to SWEEP")
                 return self._step(encoder, cfg.step_counts)
-            if self.ci_half <= self.tol or self.refine_frames > cfg.max_refine_frames or travelled > cfg.span_counts:
+            if self.ci_half <= self.tol or self.refine_frames > cfg.max_refine_frames or travelled > self._span_budget():
                 return self._begin_park()
             # keep collecting: fine steps through the bowl, then normal steps out along the far flank (more
             # lever arm on the curvature); standing still would only re-sample one patch of ground

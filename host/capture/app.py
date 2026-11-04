@@ -4,9 +4,8 @@ Combines:
 
 * live preview (any one camera at a time, rate-capped),
 * M0 / M1 sweep capture to per-camera U.2 drives,
-* M4 focus mode (the tile-based focus panel is wired in by
-  :mod:`capture.focus_panel`; this file just provides the placeholder until
-  that port lands),
+* M4 focus mode (:mod:`capture.focus_panel` + the w10 autofocus in
+  :mod:`capture.autofocus_w10`),
 * ClearCore PCB serial control (mode, camera select, focus strength,
   focus step, trigger period).
 
@@ -27,13 +26,13 @@ import argparse
 import datetime as _dt
 import logging
 import os
-import socket
+import shutil
 import sys
 import time
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -48,6 +47,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QSizePolicy,
@@ -59,27 +59,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .autofocus import AutoFocusController, FineFocusTracker, PatchTracker
-from .autofocus import focus_measure_full_res as af_full_res_measure
-from .dual_tracker import DualObjectTracker
-from .autofocus_v3 import AutoFocusConfigV3
-from .orthosim_decode import ScreenLayout, SpeedDistanceTracker, decode_frame
-from .kyfg_backend import KyfgCamera
+from .autofocus_w10 import AutoFocusController, ROI_NAMES
+from .psf_w10 import frame_ok, roi_boxes
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
 from .drive_picker import DriveInfo, list_drives
 from .file_naming import sanitize_project_name
-from .field_map import TILE_NAMES as FIELD_MAP_TILE_NAMES
-from .field_map import FieldMapConfig, FieldMapSweep, five_tile_rois
-from .field_map import inset_box as field_map_inset_box
-from .observe_log import ObserveLog
-from .focus_axis import EncoderAxis
-from .focus_csv_log import FocusCsvLogger
 from .focus_panel import FocusPanel, _crop_pixmap_center
 from .gps_correlator import GpsCorrelator
 from .gps_receiver import GpsReceiver
 from .kyfg_backend import DEFAULT_CAMERA_CONFIG
 from .mode_controller import (
-    FocusSubMode,
     Mode,
     ModeController,
     MODE_BUTTON_LABELS,
@@ -87,30 +76,27 @@ from .mode_controller import (
     MODE_BUTTON_WIDTH_FULL,
     mode_display_label,
 )
+from .preflight import PreflightHooks, PreflightRunner, format_report
 from .pipeline import (
     AcquisitionThread,
     CameraPipeline,
     CaptureContext,
-    M4_FINE_PICK_TILE_H,
-    M4_FINE_PICK_TILE_W,
     PREVIEW_DISPLAY_GAIN_MAX,
     PREVIEW_DISPLAY_GAIN_MIN,
     PREVIEW_MAX_EDGE,
-    _u16_to_gray8,
 )
 from .serial_client import SerialClient
-from .session_log import SessionLogger, build_date, default_log_dir
+from .session_log import SessionLogger, build_date
 from .w10_live import W10LiveScorer, format_score
 
 log = logging.getLogger(__name__)
 
 PREVIEW_PLACEHOLDER_LABEL = "Pick a camera's preview radio to display its feed"
 
-# Alignment readout cadence. ChArUco detection on the coarse frame measures ~130 ms,
-# so 2 Hz leaves the GUI thread ~74% idle while still feeling live to someone
-# tweaking a screw. Slow it down before shrinking the frame: coverage buys more
-# precision than corner count does.
-_ALIGN_PERIOD_S = 0.5
+# Calibrated on-rig (HANDOFF 23.6): str0 moves ~24 encoder counts per 3 ms pulse. The
+# SIGN is only a starting guess -- the w10 engine probes the real polarity (and
+# magnitude) at the start of every run, since each lens motor may be wired either way.
+AF_COUNTS_PER_PULSE = -24.0
 
 _COM_PANEL_STYLE_CONNECTED = (
     "QGroupBox { border: 1px solid #4a4a4a; border-radius: 4px; margin-top: 8px; "
@@ -261,6 +247,16 @@ class CameraRow(QWidget):
         )
         self._drive_combo.currentIndexChanged.connect(self._on_drive_combo_changed)
 
+        # How full the selected drive is (% used). Refreshed by MainWindow's
+        # 2 s tick so the operator sees it filling during a recording.
+        self._fill_bar = QProgressBar()
+        self._fill_bar.setRange(0, 100)
+        self._fill_bar.setFixedWidth(64)
+        self._fill_bar.setFormat("%p%")
+        self._fill_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._set_fill_colour("#1aaa1a")
+        self.refresh_fill()
+
         self._frames_acq_label = QLabel("acq:0  hz:0.0")
         self._frames_acq_label.setFixedWidth(150)
         self._frames_written_label = QLabel("written:0")
@@ -297,6 +293,7 @@ class CameraRow(QWidget):
         layout.addWidget(self._serial_label)
         layout.addWidget(QLabel("Drive:"))
         layout.addWidget(self._drive_combo, 1)
+        layout.addWidget(self._fill_bar)
         layout.addWidget(self._frames_acq_label)
         layout.addWidget(self._frames_written_label)
         layout.addWidget(self._frames_dropped_label)
@@ -347,10 +344,49 @@ class CameraRow(QWidget):
         self._drive_combo.setCurrentIndex(target_index)
         self._drive_combo.blockSignals(False)
         self._drive = self._drive_combo.itemData(target_index)
+        self.refresh_fill()
         self.drive_changed.emit(self._camera_number, self._drive)
 
     def current_drive_root(self) -> Optional[str]:
         return self._drive.root if self._drive else None
+
+    def refresh_fill(self) -> None:
+        """Re-read the selected drive's usage into the fill bar.
+
+        Green while there is room; red once free space drops under 10 % so a
+        drive filling mid-line is visible at a glance. ``disk_usage`` here is one
+        cheap Win32 call: the dropdown only ever offers local NTFS/exFAT/ReFS
+        volumes (``drive_picker`` filters out the cloud mounts that stall).
+        """
+        root = self.current_drive_root()
+        if root is None:
+            self._fill_bar.setValue(0)
+            self._fill_bar.setFormat("--")
+            self._fill_bar.setToolTip("no drive selected")
+            return
+        try:
+            usage = shutil.disk_usage(root)
+        except OSError as exc:
+            self._fill_bar.setValue(100)
+            self._fill_bar.setFormat("?")
+            self._fill_bar.setToolTip(f"{root}: {exc}")
+            self._set_fill_colour("#c62828")
+            return
+        pct_used = round(100.0 * (usage.total - usage.free) / max(usage.total, 1))
+        self._fill_bar.setValue(int(pct_used))
+        self._fill_bar.setFormat("%p%")
+        gib = 1_073_741_824
+        self._fill_bar.setToolTip(
+            f"{root}  {usage.free / gib:.1f} GB free of {usage.total / gib:.1f} GB"
+        )
+        self._set_fill_colour("#c62828" if pct_used >= 90 else "#1aaa1a")
+
+    def _set_fill_colour(self, colour: str) -> None:
+        self._fill_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #888; background: #eee; "
+            "font-family: Consolas, monospace; font-size: 10px; }"
+            f"QProgressBar::chunk {{ background: {colour}; }}"
+        )
 
     @Slot(int, float)
     def update_acq(self, count: int, hz: float) -> None:
@@ -380,6 +416,7 @@ class CameraRow(QWidget):
     def _on_drive_combo_changed(self, idx: int) -> None:
         data = self._drive_combo.itemData(idx)
         self._drive = data if isinstance(data, DriveInfo) else None
+        self.refresh_fill()
         self.drive_changed.emit(self._camera_number, self._drive)
 
     def _on_preview_toggled(self, on: bool) -> None:
@@ -669,29 +706,29 @@ def _is_pcb_pulse_noise(line: str) -> bool:
     return False
 
 
-def _af_score_crop(crop) -> Optional[float]:
-    """One AF patch's full-res score, or None for an empty pane.
-
-    Module level so the scoring pool has a plain function to map over. Pure -- it reads
-    the crop it is given and returns a float -- which is what makes running several at
-    once safe.
-    """
-    if crop is None or getattr(crop, "size", 0) == 0:
-        return None
-    return af_full_res_measure(crop)
-
-
 class MainWindow(QMainWindow):
     """Top-level window: mode bar, project header, camera rows, preview, log."""
+
+    camera_recovery_finished = Signal(int)   # cameras recovered; after re-arm + counter zero
 
     def __init__(
         self,
         cti_path: str,
         clearcore_port: Optional[str] = None,
         gps_port: Optional[str] = None,
+        demo: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        self._demo = bool(demo)
+        if self._demo:
+            # Simulated cameras + PCB (no GPS); see demo_backend. Imported here so a
+            # flight launch never loads it.
+            from .demo_backend import DemoCameraManager, DemoClearCore
+            demo_ctrl = DemoClearCore()
+            clearcore_port = "DEMO"
+        else:
+            demo_ctrl = None
         # Build date shown in the title bar + status bar, exactly like
         # the Bay14Reader GUI does (date-only).
         self._build_date = build_date("%Y-%m-%d") or "unknown"
@@ -717,7 +754,7 @@ class MainWindow(QMainWindow):
         # ── Core state ──────────────────────────────────────────────────
         self._modes = ModeController()
         self._context = CaptureContext(project="Project", line=1)
-        self._serial = SerialClient(self._modes)
+        self._serial = SerialClient(self._modes, controller=demo_ctrl)
         self._serial.line_received.connect(self._on_serial_line)
         self._serial.connection_changed.connect(self._on_serial_connection_changed)
 
@@ -743,10 +780,12 @@ class MainWindow(QMainWindow):
         self._gps_link_verified = False
         self._gps_probe_attempts = 0
 
-        self._manager = CameraManager(cti_path)
+        self._manager = DemoCameraManager() if self._demo else CameraManager(cti_path)
         self._pipelines: list[CameraPipeline] = []
         self._rows: list[CameraRow] = []
         self._drive_roots: dict[int, Optional[str]] = {1: None, 2: None, 3: None}
+        # Sweep containers the last preflight wrote, deleted once the writers close them.
+        self._preflight_line_paths: list[str] = []
         self._clearcore_port_arg = clearcore_port
 
         # Diagnostic counters for the M4 focus-tap chain. Logged at low
@@ -756,28 +795,6 @@ class MainWindow(QMainWindow):
         self._raw_focus_drops_not_in_m4 = 0
         self._raw_focus_drops_wrong_cam = 0
         self._raw_focus_forwarded = 0
-        # Candidates sized to the Fine pane, so the pick is decided by the pixels
-        # the operator is actually looking at (see M4_FINE_PICK_TILE_W).
-        self._fine_tracker = FineFocusTracker(
-            tile_wh=(M4_FINE_PICK_TILE_W, M4_FINE_PICK_TILE_H))
-        # Diagnostic, off unless IRON661_FINE_FLOW=1. Measures whether static
-        # content in the FOV is biasing the Fine tracker's motion estimate; see
-        # _probe_fine_flow. Costs a second phase correlation per coarse frame,
-        # so it stays opt-in rather than always-on.
-        self._fine_flow_probe = (
-            PatchTracker() if os.environ.get("IRON661_FINE_FLOW") == "1" else None
-        )
-        self._fine_flow_samples: list[tuple[float, float, float, float]] = []
-        # Independent two-object tracker for the optional split-screen preview
-        # (relays a leading-edge patch onto each pane; runs with or without AF).
-        self._dual_tracker = DualObjectTracker()
-        self._dual_track_frames = 0
-        self._dual_track_last_live = -1
-        # Latest Fine tile bbox the acquisition auto-picked (updated per frame), and
-        # the ROI pinned by "Lock tile" (freezes that tile; the focus-telemetry
-        # scatter/CSV score that tile as the operator creeps focus).
-        self._last_fine_tile_roi: Optional[tuple[int, int, int, int]] = None
-        self._locked_fine_roi: Optional[tuple[int, int, int, int]] = None
 
         self._pending_mode_apply: Optional[Mode] = None
         self._pending_mode_timer: Optional[QTimer] = None
@@ -811,6 +828,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._install_button_press_logging()
         self._sync_preview_sensor_fields()
+        self._preflight = self._build_preflight_runner()
 
         # Permanent build-date readout in the status bar (matches Bay14Reader).
         _build_lab = QLabel(f"Build: {self._build_date}")
@@ -830,6 +848,15 @@ class MainWindow(QMainWindow):
         self._sweep_tick = QTimer(self)
         self._sweep_tick.setInterval(200)
         self._sweep_tick.timeout.connect(self._refresh_sweep_labels)
+
+        # Per-camera drive fill bars: 2 s is plenty to watch a line eat a drive
+        # (~2.5 GB/s worst case is ~0.1 %/s on a 4 TB U.2) without hammering Win32.
+        self._drive_fill_tick = QTimer(self)
+        self._drive_fill_tick.setInterval(2000)
+        self._drive_fill_tick.timeout.connect(
+            lambda: [row.refresh_fill() for row in self._rows]
+        )
+        self._drive_fill_tick.start()
 
         # ── Hardware bring-up runs on a worker QThread (KAYA's ia.start()
         # blocks for 10-30 s per camera and re-entering the GUI event loop
@@ -1017,7 +1044,6 @@ class MainWindow(QMainWindow):
             self._focus_panel.set_camera_available(cam_no, True)
         except Exception:
             pass
-        self._sync_fine_demosaic_to_pipelines()
         self._sync_preview_sensor_fields()
         self._log(f"cam{cam_no}: pipeline started")
 
@@ -1104,6 +1130,7 @@ class MainWindow(QMainWindow):
             btn.setEnabled(True)
         self._reset_cameras_btn.setEnabled(True)
         self._reset_cameras_deep_btn.setEnabled(True)
+        self._preflight_btn.setEnabled(True)
         self._mode_ui_ready = True
         self._refresh_line_buttons_enabled()
 
@@ -1203,7 +1230,18 @@ class MainWindow(QMainWindow):
             pass
         if not confirmed:
             return
+        self._run_camera_recovery(do_device_reset=do_device_reset, label=label, window_s=window_s)
 
+    def _run_camera_recovery(
+        self, *, do_device_reset: bool, label: str, window_s: int,
+    ) -> None:
+        """Steps 2-5 of :meth:`_start_camera_recovery`, no dialog. Also the preflight
+        check's non-interactive entry point; completion is announced on
+        :attr:`camera_recovery_finished`."""
+        if self._reset_worker is not None and self._reset_worker.isRunning():
+            return
+        if not self._pipelines:
+            return
         # Make sure the PCB isn't pumping triggers into cameras that
         # are about to vanish off the CXP link. M3 (idle) would be the
         # cleaner target if the firmware has it, but $M0* (which sends
@@ -1290,6 +1328,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Cameras reset ({succeeded}/{len(self._pipelines)}); ready."
         )
+        self.camera_recovery_finished.emit(int(succeeded))
 
     def _auto_connect_clearcore(self) -> None:
         port = self._clearcore_port_arg or SerialClient.auto_detect()
@@ -1845,6 +1884,8 @@ class MainWindow(QMainWindow):
 
         We keep visible:
           * compact M0/M1/M4 controls (re-homed into the focus panel top row),
+          * the exposure / analog gain / display gain bar (re-homed likewise, so
+            the operator can expose for the focus scene without leaving M4),
           * the preview / focus-panel stack (which IS the focus view).
 
         We hide:
@@ -1927,6 +1968,9 @@ class MainWindow(QMainWindow):
         host.addWidget(self._mode_buttons_strip, 0)
         host.addStretch(1)
         host.addWidget(self._mode_status_label)
+        # Same trick for the sensor bar: one widget, one home at a time.
+        self._preview_hdr_layout.removeWidget(self._preview_sensor_bar)
+        self._focus_panel.sensor_bar_layout().addWidget(self._preview_sensor_bar, 0)
 
     def _restore_mode_strip_to_mode_bar(self) -> None:
         self._drain_layout(self._focus_panel.mode_strip_layout())
@@ -1936,6 +1980,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._mode_buttons_strip, 0)
         lay.addStretch(1)
         lay.addWidget(self._mode_status_label)
+        self._focus_panel.sensor_bar_layout().removeWidget(self._preview_sensor_bar)
+        self._preview_hdr_layout.addWidget(self._preview_sensor_bar, 0)
 
     def _set_mode_buttons_compact(self, compact: bool) -> None:
         """Small fixed-size mode buttons in M4; stable fixed-size row in M0/M1.
@@ -2087,6 +2133,27 @@ class MainWindow(QMainWindow):
         )
         self._reset_counters_btn.clicked.connect(self._on_reset_counters_clicked)
         layout.addWidget(self._reset_counters_btn)
+
+        # ── Preflight check ──────────────────────────────────────────
+        # Focus motors (M4, +/-10k counts each, encoder watched), then one
+        # real $Click* sweep in M0 (frames acquired, written, GPS-tagged),
+        # with a deep camera recovery + retry if a camera acquires nothing.
+        # See capture/preflight.py. Enabled with the reset buttons.
+        layout.addSpacing(12)
+        self._preflight_btn = QPushButton("Preflight check")
+        self._preflight_btn.setToolTip(
+            "Run the pre-flight sequence (~1.5-3 min):\n"
+            "  1. M4: drive each focus motor +10k then -10k encoder counts\n"
+            "     (motion on every pulse, consistent encoder, lens back at start).\n"
+            "  2. M0: one $Click* sweep -- every camera gets the same frame\n"
+            "     count, nothing dropped, all written, every frame GPS-tagged.\n"
+            "  3. Watches the ClearCore for motor alerts / homing failures.\n"
+            "A camera that acquires nothing gets a DEEP reset and one retry.\n"
+            "Ends in M0 with fresh line containers. Click again to abort."
+        )
+        self._preflight_btn.setEnabled(False)
+        self._preflight_btn.clicked.connect(self._on_preflight_clicked)
+        layout.addWidget(self._preflight_btn)
 
         # GNSS placeholder (deferred until antenna)
         layout.addSpacing(20)
@@ -2362,6 +2429,8 @@ class MainWindow(QMainWindow):
         preview_hdr = QHBoxLayout()
         preview_hdr.setSpacing(8)
         preview_hdr.setContentsMargins(0, 0, 0, 0)
+        # Kept: the sensor bar below moves into the focus panel for M4 and back here.
+        self._preview_hdr_layout = preview_hdr
 
         self._preview_title_lbl = QLabel(
             f"Preview ({MODE_BUTTON_LABELS[Mode.M0]} / {MODE_BUTTON_LABELS[Mode.M1]})"
@@ -2382,7 +2451,7 @@ class MainWindow(QMainWindow):
         self._preview_exposure_edit.setMaximumWidth(110)
         self._preview_exposure_edit.setToolTip(
             "Exposure time in microseconds. Apply writes this value to "
-            "the currently previewed camera only."
+            "the currently previewed (M0/M1) or focused (M4/M5) camera only."
         )
         sensor_layout.addWidget(self._preview_exposure_edit)
 
@@ -2393,7 +2462,7 @@ class MainWindow(QMainWindow):
         self._preview_gain_edit.setToolTip(
             "GenICam Gain after selecting an analog GainSelector when the "
             "camera supports it (AnalogAll / AnalogWhite / Analog). Applies "
-            "to the currently previewed camera only."
+            "to the currently previewed (M0/M1) or focused (M4/M5) camera only."
         )
         sensor_layout.addWidget(self._preview_gain_edit)
 
@@ -2420,8 +2489,8 @@ class MainWindow(QMainWindow):
 
         self._preview_sensor_apply = QPushButton("Apply")
         self._preview_sensor_apply.setToolTip(
-            "Write exposure and/or gain to the currently previewed camera. "
-            "Leave a field empty to skip changing that feature."
+            "Write exposure and/or gain to the currently previewed / focused "
+            "camera. Leave a field empty to skip changing that feature."
         )
         self._preview_sensor_apply.clicked.connect(self._on_preview_sensor_apply)
         sensor_layout.addWidget(self._preview_sensor_apply)
@@ -2469,244 +2538,33 @@ class MainWindow(QMainWindow):
         # PCB ``$Cn*`` all stay in sync no matter which control flipped
         # which.
         self._focus_panel.camera_chosen.connect(self._on_focus_panel_camera_chosen)
-        self._focus_panel.focus_submode_changed.connect(
-            self._on_focus_submode_changed
-        )
-        self._focus_panel.fine_lock_changed.connect(self._on_fine_lock_changed)
-        self._focus_panel.csv_log_toggled.connect(self._on_csv_log_toggled)
-        self._focus_panel.preview_toggled.connect(self._on_preview_toggled)
-        self._focus_panel.dual_track_toggled.connect(self._on_dual_track_toggled)
-        self._focus_panel.orthosim_toggled.connect(self._on_orthosim_toggled)
-        self._focus_panel.lockstep_toggled.connect(self._on_lockstep_toggled)
         self._focus_panel.m4_record_toggled.connect(self._on_m4_record_toggled)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
         self._focus_panel.diag_log.connect(self._log)
-        self._focus_panel.fine_demosaic_changed.connect(
-            self._on_fine_demosaic_changed
-        )
-        # Autofocus controller (M4). Drives the relay-selected focus motor via
-        # the serial client; gated to M4 + connected PCB. ``AutoFocusController``
-        # is None only if PySide6 is unavailable (never in the GUI).
-        # Latest full-res crop of the AF winning tile (pushed by the active
-        # pipeline during a run) so autofocus can score focus at full resolution.
-        self._af_fullres_crop = None
-        self._af_fullres_seq = 0    # bumped on every fresh full-res crop
-        self._af_scored_seq = -1    # seq of the crop last handed to the engine
-        self._af_fresh_ct = 0       # diag: scores that used a fresh full-res crop
-        self._af_stale_ct = 0       # diag: scores that fell back (no fresh crop)
+        # w10 autofocus controller (M4/M5). Drives the relay-selected focus motor via
+        # the serial client; gated to M4/M5 + connected PCB. The cameras whose full-res
+        # emission it switched on are tracked so "Auto-focus all" cleans up after itself.
         self._af_full_res_cams: set[int] = set()
-        # Cross-object handover calibration: both patches' full-res scores taken from
-        # ONE preview-crop batch, so the A/B ratio is same-frame by construction.
-        self._af_crop_scores = None
-        self._af_crop_seq = 0
-        self._af_crop_scored_seq = -1
-        self._af_crops_active = False  # AF owns the preview ROI slots
-        self._af_pair_fresh = 0     # diag: cross-cal pairs actually delivered
-        self._af_pair_stale = 0     # diag: pairs asked for with no fresh batch
-        # Manual-backlash focus telemetry: per-frame (encoder, locked-tile score)
-        # feeding the bottom-left scatter and, while toggled on, a CSV log.
-        self._focus_frame_ct = 0
-        self._focus_csv = None       # FocusCsvLogger while "Log CSV" is ticked
-        # Calibrated on-rig (HANDOFF 23.6): str0 moves ~24 encoder counts per 3 ms
-        # pulse and the motor->lens gear lash is ~1290 counts. Feed both to the v2
-        # sweep-and-hold engine so the EncoderAxis lands in real motor units instead
-        # of the 1.0 counts/pulse + 3-pulse placeholders it defaults to. Positions and
-        # tolerances below are ENCODER COUNTS; only *_pulses are drive amounts, which
-        # have to stay in pulses because that is the hardware quantum. The SIGN encodes
-        # polarity. Measured clean on-rig (discrete-pulse firmware, non-aliased
-        # $ENC): a run commanded DOWN to the sweep floor (target=-120) drove the
-        # encoder UP (+37..+1128) into the end stop -- i.e. a '-' pulse raises the
-        # count, so a '+' pulse LOWERS it, so counts_per_pulse is NEGATIVE. With
-        # -24, ``position = (raw-origin)*sign(cpp)`` increases on a '+' drive as
-        # move_to / park_upward assume; the earlier +24 inverted that and made every
-        # "move down" run away upward into the stop ("how is this in focus?").
-        # reverify=0 => land and hold (atmospheric lens is static for hours); the
-        # trigger runs it one-shot (see _on_autofocus_requested).
-        af_counts_per_pulse = -24.0
-        af_lash_counts = 1290.0
-        # Dive-then-climb search: the operator hand-focuses to NEAR focus, then AF
-        # dives a fixed amount BELOW it fast (str3, 4 bursts), climbs back up in fine
-        # str0 steps sampling (encoder, score) once a frame, stops when the score has
-        # peaked-and-fallen, and parks UPWARD onto the peak (lash seated from below).
-        # No absolute-position servo -- fixed open-loop steps that just read the
-        # encoder -- so the ~10 Hz encoder lag can't make it oscillate (HANDOFF 23.7).
-        # A V3 config, which IS a V2 config (subclass), so v2 accepts it unchanged and
-        # the station knobs simply go unread unless IRON661_AF selects AF3.
-        af_cfg = AutoFocusConfigV3(
-            strength=0,             # str0: the finest calibrated climb step (3 ms pulse)
-            dive_strength=3,        # str3: fast dive below focus
-            dive_bursts=4,          # 4 individual str3 pulses down (encoder re-checked between)
-            dive_burst_pulses=1,    # ONE str3 pulse per burst -> the dive is 4 str3 pulses total
-            # Just confirm the 4-pulse str3 dive actually moved down. Deliberately
-            # loose: a str3 pulse is ~850 counts, so a working dive drops ~2500, and
-            # this only has to clear encoder noise.
-            dive_min_drop_counts=3 * abs(af_counts_per_pulse),
-            # Park distances, in COUNTS. The config defaults are sized for the
-            # encoderless axis (1 count == 1 pulse), so scale them by the measured
-            # counts/pulse to keep the physical distances the rig was tuned with.
-            park_stable_counts=2 * abs(af_counts_per_pulse),
-            park_slow_band_counts=12 * abs(af_counts_per_pulse),
-            park_climb_band_counts=36 * abs(af_counts_per_pulse),
-            park_descend_margin_counts=20 * abs(af_counts_per_pulse),
-            climb_step_pulses=2,    # str0 pulses/frame on the way up (fine)
-            climb_settle_frames=1,  # (superseded by climb_lucky_frames; kept for config parity)
-            # Dwell 3 frames per encoder position and keep the SHARPEST. The noise this
-            # fights is one-sided -- motion blur, tracking drift and a patch clipped by
-            # something crossing the FOV can only make a frame WORSE, never sharper --
-            # so a max is the right estimator for it and an average would just fold the
-            # damage in. Costs 3x the climb time (~42 s), which the operator explicitly
-            # does not care about.
-            #
-            # This was briefly 1 on 2026-08-13, on the grounds that a 3x longer climb
-            # spans 3x more cross-object seams and each seam multiplied the curve by a
-            # biased ratio (median 0.625). That argument died with enable_handover: with
-            # the stitch off the scale is pinned at 1.0 and a seam multiplies nothing.
-            # If the stitch is ever re-enabled, the seam-count cost comes back and this
-            # has to be re-argued rather than left at 3 by inertia.
-            #
-            # Residual cost, unfixed by lucky-imaging: the stitch being off means the
-            # curve mixes patches, and 3x the duration is 3x the patch changes, each a
-            # step in the curve's level. A max WITHIN a position cannot help with a step
-            # BETWEEN positions -- peak_fit_window (20) is what absorbs that.
-            climb_lucky_frames=3,
-            # Observe (diagnostic). The offset is an env var rather than a widget: the
-            # protocol takes the same observation at focus and +/-1500c and the operator
-            # already sets IRON661_LOG_DIR before launching, so this rides along with it
-            # and gets recorded in the CSV header where the analysis can read it back.
-            observe_offset_counts=float(os.environ.get("IRON661_OBSERVE_OFFSET", "0")),
-            observe_objects=int(os.environ.get("IRON661_OBSERVE_OBJECTS", "3")),
-            observe_seconds=float(os.environ.get("IRON661_OBSERVE_SECONDS", "90")),
-            peak_curve_fit=True,
-            encoder_counts_per_pulse=af_counts_per_pulse,
-            # 1.7x margin over the measured ~1290-count lash: park_upward only lands the
-            # lens on focus when its down-then-up excursion EXCEEDS the true dead-band.
-            # Overshooting the lash is free (costs a little park time); undershooting
-            # leaves the lens stuck where the climb overshot -> parks soft (ratio 0.28).
-            backlash_pulses=int(round(1.7 * af_lash_counts / abs(af_counts_per_pulse))),
-            reverify_interval_s=0.0,
-            # Do NOT slam the trigger cadence to minimum: that legacy dither-servo
-            # trick starves the AMT203S SPI read (encoder returned $ENC=-1 / froze at
-            # 0 through the whole dive on-rig), and this engine paces itself + relies
-            # on the encoder every frame anyway.
-            drive_cadence_to_min=False,
-            # DEBUG: pause at every phase boundary and wait for SPACE. Lets us confirm
-            # where the motor actually lands between phases (e.g. does the post-climb
-            # descend fling it to end-of-travel?). Set False for normal one-shot AF.
-            step_gate=False,
-            # %% AF3 station walk (only read when IRON661_AF selects field_profile) %%
-            # Stations are N x str0 because str1 has never been calibrated -- only str0
-            # (~24c) and str3 (~850c) are measured -- and the axis moves closed-loop
-            # anyway, so 6 pulses is a known ~144c with no new calibration run.
-            station_step_pulses=6,
-            station_objects=5,
-            station_min_traverses=4,
-            # A traverse is ~19 frames at ~3 fps and objects are born 8 frames apart,
-            # so 4 completions is ~15-20 s. 45 s is a stall guard, not a target.
-            station_max_seconds=45.0,
-            # Backstop only -- the walk normally ends 3 stations past D's peak. 4200
-            # was NOT enough: run B (2026-09-09) ended one station before D turned
-            # over, so its vertex was extrapolated off the end of its own data.
-            sweep_counts=5600.0,
-            station_arm_rise=0.35,
-            station_fall_margin=0.08,
-            station_descend_stop=3,
-            # 0 = report where D actually peaks. D peaks ABOVE true best focus (field
-            # map: centre vertex +1082 vs D peak +1290), so this gets set from the
-            # rig's own measured gap once AF3 and a field map have run in one session.
-            park_bias_counts=0.0,
+        self._autofocus = AutoFocusController(
+            self._serial,
+            self._modes,
+            counts_per_pulse=AF_COUNTS_PER_PULSE,
+            pin_rois_cb=self._af_pin_rois,
+            select_camera_cb=self._on_focus_panel_camera_chosen,
+            parent=self,
         )
-        # IRON661_AF_SYNTH=<coarse px/s>: traverse patches off the clock rather than off
-        # the image, for measuring D on a scene with NO content (see synth_travel_px_s).
-        # It sets both knobs because they are not independently useful -- a blank frame
-        # trips both texture gates, which share min_texture_score, so synthetic motion
-        # without that zeroed just fails the run at acquisition. 540 matches the rig.
-        _synth = os.environ.get("IRON661_AF_SYNTH")
-        if _synth:
-            af_cfg.synth_travel_px_s = float(_synth)
-            af_cfg.min_texture_score = 0.0
-            # Module logger, not self._log: this runs from _build_ui, before the log
-            # widget exists. The session log is the destination that matters anyway --
-            # it is what a later reader has to see this warning in.
-            log.warning("SYNTH SCENE: patches traverse at %.0f coarse px/s, texture "
-                        "gates OFF -- measurements are NOT a normal run",
-                        af_cfg.synth_travel_px_s)
-        # Keep a handle so the OrthoSim toggle can flip AF interior/edge masking on
-        # this shared dataclass (the engine re-reads it every frame). OrthoSim decode
-        # state is lazily armed by _on_orthosim_toggled.
-        self._af_cfg = af_cfg
-        # Share that same dataclass with BOTH scene trackers (built earlier in
-        # __init__, before af_cfg exists), so their boxes honour the OrthoSim interior
-        # masking too -- otherwise they track the bezel/office while AF ignores it.
-        # The Fine tracker needs it just as much as the dual one: it is what picks the
-        # tile the operator hand-focuses on, and on its own default AutoFocusConfig it
-        # also missed any tuned min_texture_score / ROI size.
-        self._dual_tracker.cfg = af_cfg
-        self._fine_tracker.cfg = af_cfg
-        self._ortho_layout: Optional[ScreenLayout] = None
-        self._ortho_tracker: Optional[SpeedDistanceTracker] = None
-        self._ortho_last_t = 0.0
-        self._ortho_fail = 0
-        self._autofocus = (
-            AutoFocusController(
-                self._serial,
-                self._modes,
-                select_camera_cb=self._on_focus_panel_camera_chosen,
-                set_roi_cb=self._set_active_focus_roi,
-                full_res_score_cb=self._af_full_res_score,
-                full_res_pair_cb=self._af_full_res_pair,
-                full_res_multi_cb=self._af_full_res_multi,
-                observe_row_cb=self._on_observe_row,
-                profile_cb=self._on_af_profile,
-                pin_rois_cb=self._af_pin_rois,
-                config=af_cfg,
-                # w10 (sec.54) is the default; IRON661_AF=sweep_and_hold / af3 selects the
-                # older engines. Must agree with the focus panel's first "AF:" combo entry.
-                algorithm=os.environ.get("IRON661_AF", "w10"),
-                encoder_read=lambda: self._serial.encoder_position,
-                encoder_present=lambda: self._serial.encoder_present,
-            )
-            if AutoFocusController is not None
-            else None
-        )
-        if self._autofocus is not None:
-            self._focus_panel.autofocus_requested.connect(
-                self._on_autofocus_requested
-            )
-            self._focus_panel.autofocus_all_requested.connect(
-                self._on_autofocus_all_requested
-            )
-            self._focus_panel.autofocus_stop_requested.connect(self._on_af_stop_requested)
-            self._focus_panel.autofocus_algorithm_changed.connect(
-                self._autofocus.set_algorithm
-            )
-            self._autofocus.status.connect(self._on_autofocus_status)
-            self._autofocus.finished.connect(self._on_autofocus_finished)
-            self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
-            self._autofocus.sample.connect(self._on_af_sample)
-            self._autofocus.roi_sample.connect(self._on_af_roi_sample)
-            # DEBUG step-gate: SPACE releases the AF engine's per-phase pause so the
-            # operator can inspect encoder/image between phases (app-wide so it fires
-            # regardless of which widget has focus).
-            self._af_step_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
-            self._af_step_shortcut.setContext(Qt.ApplicationShortcut)
-            self._af_step_shortcut.activated.connect(self._autofocus.step)
-        # Field map: an optical diagnostic, not an AF algorithm. It drives the same
-        # motor and reuses the same EncoderAxis + config, but needs no AF controller,
-        # so it's wired outside the block above.
-        self._field_map: Optional[FieldMapSweep] = None
-        self._observe_log: Optional[ObserveLog] = None
-        self._field_map_cfg = FieldMapConfig()
-        # Latest coarse focus frame, kept by reference so the field map can locate
-        # the screen's fiducials at the moment it is started.
-        self._last_coarse_raw = None
-        # Last successfully measured fiducial box, with the frame shape it came from,
-        # so a momentary marker dropout does not block a repeat sweep.
-        self._last_fiducial_box = None
-        self._focus_panel.field_map_requested.connect(self._on_field_map_requested)
-        self._focus_panel.align_toggled.connect(self._on_align_toggled)
-        self._focus_panel.observe_requested.connect(self._on_observe_requested)
+        self._focus_panel.autofocus_requested.connect(self._on_autofocus_requested)
+        self._focus_panel.autofocus_all_requested.connect(self._on_autofocus_all_requested)
+        self._focus_panel.autofocus_stop_requested.connect(self._on_af_stop_requested)
+        self._autofocus.status.connect(self._on_autofocus_status)
+        self._autofocus.finished.connect(self._on_autofocus_finished)
+        self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
+        self._autofocus.sample.connect(self._on_af_sample)
+        self._autofocus.roi_sample.connect(self._on_af_roi_sample)
+        self._autofocus.live_scored.connect(self._on_af_live_scored)
+
         focus_host = QWidget()
         focus_layout = QVBoxLayout(focus_host)
         focus_layout.setContentsMargins(0, 0, 0, 0)
@@ -2841,8 +2699,6 @@ class MainWindow(QMainWindow):
         # automatically, the same way ``preview_ready`` already works.
         pipeline.acq.raw_focus_frame.connect(self._on_raw_focus_frame_slot)
         pipeline.acq.set_w10_live(self._w10_live if self._w10_live_enabled else None)
-        pipeline.acq.raw_focus_tile_rgb.connect(self._on_raw_focus_tile_rgb_slot)
-        pipeline.acq.raw_focus_roi_u16.connect(self._on_raw_focus_roi_u16_slot)
         pipeline.acq.raw_focus_preview_crops.connect(self._on_raw_focus_preview_crops)
         pipeline.acq.failed.connect(self._on_pipeline_failed_slot)
         pipeline.acq.log_line.connect(self._log)
@@ -2868,14 +2724,6 @@ class MainWindow(QMainWindow):
             # Now that we're on the GUI thread and the QObject lives
             # here too, kick off the telemetry timer.
             pipeline.writer.start_telemetry()
-
-        pipeline.focus_writer.focus_written.connect(
-            lambda n, name: self._log(
-                f"cam{pipeline.camera_number} focus #{n}: {name}"
-            )
-        )
-        pipeline.focus_writer.write_error.connect(lambda msg: self._log(msg))
-        pipeline.focus_writer.log_line.connect(self._log)
 
     # ── Drive list ──────────────────────────────────────────────────────
 
@@ -3314,21 +3162,6 @@ class MainWindow(QMainWindow):
                 )
         self._modes.set_m4_recording(on)
         if on:
-            # A bracket is only worth recording if the small focus crops land
-            # next to the full frames: Coarse never emits a tile, and with
-            # "Save focus view" off the crops are computed and thrown away.
-            # Force both rather than let the operator discover it afterwards.
-            if self._modes.focus_submode() != FocusSubMode.FINE:
-                # Silent toggle sync first, then the handler by hand -- it is
-                # what turns the full-res Fine tap on in the pipelines, and
-                # sync_focus_submode_toggle blocks the signal that would
-                # normally call it.
-                self._focus_panel.sync_focus_submode_toggle(FocusSubMode.FINE)
-                self._on_focus_submode_changed(FocusSubMode.FINE)
-                self._log("Record: switched to Fine view (needed for focus crops).")
-            if not self._focus_panel.is_save_focus_enabled():
-                self._focus_panel.set_save_focus_enabled(True)
-                self._log("Record: ticked 'Save focus view'.")
             self._gps_correlator.reset_stats()
             self._open_lines_for_active_pipelines(only=cam)
             self._log(
@@ -3391,6 +3224,173 @@ class MainWindow(QMainWindow):
                     f"cam{p.camera_number}: counter reset FAILED: {exc}"
                 )
         self._log(f"Reset counters: zeroed acq/written/dropped on {n} camera(s).")
+
+    # ── Preflight check ─────────────────────────────────────────────────
+
+    def _build_preflight_runner(self) -> PreflightRunner:
+        """Wire :class:`PreflightRunner` to this window. Every hook speaks app camera
+        numbers and reuses the exact code paths the operator's buttons use (mode click,
+        deep recovery, line rotation), so the check exercises the real flight path."""
+        mode_by_n = {0: Mode.M0, 1: Mode.M1, 3: Mode.M3, 4: Mode.M4, 5: Mode.M5, 6: Mode.M6}
+
+        def send_mode(n: int) -> bool:
+            mode = mode_by_n[n]
+            self._on_mode_clicked(mode)
+            self._sync_mode_buttons_ui(mode)
+            return self._modes.mode == mode
+
+        def frame_counts(cam: int) -> tuple[int, int, int]:
+            row = next((r for r in self._rows if r.camera_number == cam), None)
+            return row.frame_counts() if row is not None else (0, 0, 0)
+
+        def armed(cam: int) -> bool:
+            return any(p.camera_number == cam and p.is_armed for p in self._pipelines)
+
+        def frames_delivered(cam: int) -> int:
+            p = next((p for p in self._pipelines if p.camera_number == cam), None)
+            return p.backend.frames_delivered if p is not None else 0
+
+        def rotate_lines() -> None:
+            # The preflight sweep gets its own closed container; the flight starts on a
+            # fresh one. Host-only, no PCB traffic. The sweep images have done their job
+            # once the counters were read, so remember them for deletion at the end
+            # (``_delete_preflight_lines``) -- ~2.8 GB/camera that would otherwise
+            # accumulate on the U.2 drives, one line number ahead of every flight.
+            self._preflight_line_paths = [
+                path for p in self._pipelines if p.line_open
+                for path in p.writer.current_line_paths
+            ]
+            self._close_all_lines()
+            self._open_lines_for_active_pipelines()
+
+        hooks = PreflightHooks(
+            serial_connected=lambda: self._serial.connected,
+            send_mode=send_mode,
+            start_sweep=self._serial.start_sweep,
+            select_camera=self._serial.select_camera,
+            set_strength=self._serial.set_strength,
+            pulse=self._serial.focus_step,
+            encoder_position=self._serial.encoder_position_for,
+            encoder_present=self._serial.encoder_present_for,
+            encoder_age=self._serial.encoder_age_for,
+            cameras=lambda: [p.camera_number for p in self._pipelines],
+            armed=armed,
+            frame_counts=frame_counts,
+            frames_delivered=frames_delivered,
+            gps_connected=lambda: self._gps_receiver.connected,
+            gps_stats=self._gps_correlator.stats,
+            recording_prerequisites_missing=self._recording_prerequisites_missing,
+            recover_cameras=lambda: self._run_camera_recovery(
+                do_device_reset=True, label="deep/preflight", window_s=25),
+            rotate_lines=rotate_lines,
+            log=self._log,
+        )
+        runner = PreflightRunner(hooks, parent=self)
+        self._serial.line_received.connect(runner.on_serial_line)
+        self.camera_recovery_finished.connect(runner.on_recovery_done)
+        runner.status.connect(lambda m: self.statusBar().showMessage(f"Preflight: {m}"))
+        runner.finished.connect(self._on_preflight_finished)
+        return runner
+
+    @Slot()
+    def _on_preflight_clicked(self) -> None:
+        if self._preflight.is_running():
+            self._preflight.abort()
+            self._log("Preflight: abort requested")
+            return
+        busy = []
+        if self._reset_worker is not None and self._reset_worker.isRunning():
+            busy.append("camera recovery running")
+        if self._autofocus is not None and self._autofocus.is_running():
+            busy.append("autofocus running")
+        if self._pending_mode_apply is not None or self._pending_end_line:
+            busy.append("mode change / line end still pending")
+        if self._modes.m3_collecting():
+            busy.append("M3 line open")
+        if busy:
+            self._log("Preflight: not started -- " + "; ".join(busy))
+            self.statusBar().showMessage("Preflight: not started -- " + "; ".join(busy), 8000)
+            return
+        self._session_log.write("preflight: START", category="PREFLIGHT")
+        # Lock first: a prerequisite failure finishes (and unlocks) inside start().
+        self._set_preflight_lockout(True)
+        self._preflight.start()
+
+    def _set_preflight_lockout(self, on: bool) -> None:
+        """While the runner owns the PCB, the operator's own mode / reset / AF clicks
+        would race it. The preflight button itself stays live as the abort."""
+        for btn in self._mode_buttons.values():
+            btn.setEnabled(not on)
+        self._reset_cameras_btn.setEnabled(not on)
+        self._reset_cameras_deep_btn.setEnabled(not on)
+        self._focus_panel.set_controls_locked(on)
+        self._preflight_btn.setText("Abort preflight" if on else "Preflight check")
+
+    @Slot(bool, object)
+    def _on_preflight_finished(self, ok: bool, results) -> None:
+        self._set_preflight_lockout(False)
+        # Motors that passed had their '+' direction measured over 10k counts and their c/pulse
+        # at every strength: the AF skips its polarity probe for them from now on (also on a
+        # FAIL further down the sequence).
+        self._autofocus.motor_polarity.update(self._preflight.motor_polarity)
+        self._autofocus.motor_cpp.update(self._preflight.motor_cpp)
+        if self._serial.connected:
+            try:
+                self._focus_panel.resend_strength()   # the motor test ran at S3
+            except Exception as exc:
+                self._log(f"Preflight: strength restore failed: {exc}")
+        report = format_report(list(results))
+        for line in report.splitlines():
+            self._session_log.write(f"preflight: {line}", category="PREFLIGHT")
+        self._log("Preflight " + ("PASSED" if ok else "FAILED") + ":\n" + report)
+        self.statusBar().showMessage("Preflight " + ("PASSED" if ok else "FAILED -- see dialog"), 15000)
+        if self._preflight_line_paths:
+            self._delete_preflight_lines()
+        if ok:
+            QMessageBox.information(self, "Preflight check: PASSED", report)
+        else:
+            QMessageBox.critical(
+                self, "Preflight check: FAILED",
+                "Fix the first item below before flying.\n\n" + report,
+            )
+
+    _PREFLIGHT_DELETE_RETRIES = 30
+
+    def _delete_preflight_lines(self, attempt: int = 0) -> None:
+        """Remove the preflight sweep containers recorded by ``rotate_lines``.
+
+        Only containers the check actually rotated out are touched (a FAIL before
+        the sweep passed leaves its files on disk as evidence). ``close_line`` is
+        asynchronous -- the io_writer still has to flush the index, fsync and close --
+        and Windows refuses to unlink a file another process holds open, so a
+        ``PermissionError`` is retried once a second for up to 30 s.
+        """
+        left: list[str] = []
+        for path in self._preflight_line_paths:
+            if not path.endswith(".bay14line"):   # only ever our own containers
+                self._log(f"preflight: refusing to delete non-container {path}")
+                continue
+            try:
+                os.remove(path)
+                self._log(f"preflight: deleted sweep container {os.path.basename(path)}")
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                left.append(path)
+            except OSError as exc:
+                self._log(f"preflight: could not delete {path}: {exc}")
+        self._preflight_line_paths = left
+        if not left:
+            return
+        if attempt < self._PREFLIGHT_DELETE_RETRIES:
+            QTimer.singleShot(1000, lambda: self._delete_preflight_lines(attempt + 1))
+        else:
+            self._preflight_line_paths = []
+            self._log(
+                f"preflight: {len(left)} sweep container(s) still held open by the "
+                "writers after 30 s; left on disk: "
+                + ", ".join(os.path.basename(p) for p in left)
+            )
 
     def _toggle_clearcore(self) -> None:
         if self._serial.connected:
@@ -3645,7 +3645,7 @@ class MainWindow(QMainWindow):
         for p in self._pipelines:
             is_active = (p.camera_number == camera_number)
             p.set_preview(is_active)
-            p.set_focus_tap(in_focus and is_active)
+            self._set_focus_tap(p, in_focus and is_active)
             # Keep the zoom flag + crop size + display gain current on
             # whichever camera is now emitting preview frames.
             try:
@@ -3661,7 +3661,6 @@ class MainWindow(QMainWindow):
         self._preview_label.setText(
             f"cam{camera_number}: waiting for next frame..."
         )
-        self._update_focus_panel_target()
         self._focus_panel.set_active_camera(camera_number)
         # Re-route ``$Cn*`` so the focus +/- buttons act on the camera
         # the user just promoted to active preview.
@@ -3674,8 +3673,6 @@ class MainWindow(QMainWindow):
                 )
             except Exception as exc:
                 self._log(f"select_camera failed: {exc}")
-        self._fine_tracker.reset()
-        self._sync_fine_focus_to_pipelines()
         self._sync_preview_sensor_fields()
 
     def _sync_preview_sensor_fields(self) -> None:
@@ -3683,10 +3680,11 @@ class MainWindow(QMainWindow):
 
         Falls back to the lowest-numbered online camera when no preview
         radio is selected, so the fields still show a sensible value.
-        The Exposure/Gain controls act on this same (previewed) camera.
+        The Exposure/Gain controls act on this same (previewed) camera --
+        in M4/M5 that is the camera the focus panel's radio selected.
         """
         in_m4 = self._modes.is_focus_mode()
-        self._preview_sensor_bar.setEnabled(not in_m4 and bool(self._pipelines))
+        self._preview_sensor_bar.setEnabled(bool(self._pipelines))
         if hasattr(self, "_preview_zoom_btn"):
             zoom_ok = (
                 not in_m4 and not self._split_preview_on and bool(self._pipelines)
@@ -3709,10 +3707,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_preview_sensor_apply(self) -> None:
-        """Write exposure and/or gain to the currently previewed camera only."""
-        if self._modes.is_focus_mode():
-            self._log("Exposure/Gain: use M0/M1 preview — controls are disabled in M4.")
-            return
+        """Write exposure and/or gain to the currently previewed / focused camera only."""
         if not self._pipelines:
             self._log("Exposure/Gain: no cameras online.")
             return
@@ -3758,1546 +3753,72 @@ class MainWindow(QMainWindow):
             )
         self._sync_preview_sensor_fields()
 
-    def _sync_fine_focus_to_pipelines(self) -> None:
-        """Enable full-res Fine tap on the active preview camera in M4/M5."""
-        sub = self._modes.focus_submode()
-        active = self._active_pipeline()
-        an = active.camera_number if active is not None else None
-        want = (
-            self._modes.is_af_mode()
-            and sub == FocusSubMode.FINE
-            and an is not None
-        )
-        for p in self._pipelines:
-            p.set_fine_focus(want and p.camera_number == an)
 
-    def _reset_fine_tracker(self) -> None:
-        self._fine_tracker.reset()
-        p = self._active_pipeline()
-        if p is not None:
-            try:
-                p.set_focus_roi(None)
-            except Exception as exc:
-                self._log(f"set_focus_roi(clear) failed: {exc}")
+    # ── autofocus (M4 / M5, w10) ─────────────────────────────────────────
 
-    def _probe_fine_flow(self, coarse_raw) -> None:
-        """Report how much a whole-frame motion estimate under-reads the scroll.
-
-        The Fine tracker dead-reckons on a ``PatchTracker`` restricted to the
-        centre of the frame, because the whole-frame estimate is biased on the
-        bench: a slice of the FOV never moves (screen bezel, fiducials, the room
-        around the screen), and static content drags a global translation
-        estimate toward zero. A tile under-shifted every frame slides backwards
-        against the flow at a steady rate, which is what constant drift looks
-        like. Measured here at ~6%, stable across 11 batches.
-
-        So this keeps the whole frame as the *reference* and compares the
-        tracker's centre estimate against it: ``tracker/whole`` above 1.00 means
-        static content is still biasing a whole-frame estimate, and by how much.
-        It stays a differential measurement rather than a comparison against
-        OrthoSim's commanded scroll, which would need screen geometry, GSD and a
-        unit conversion chain, any link of which could explain a discrepancy on
-        its own.
-        """
-        probe = self._fine_flow_probe
-        if probe is None or coarse_raw is None or coarse_raw.ndim < 2:
-            return
-        wdx, wdy, _wresp = probe.update(coarse_raw)
-        self._fine_flow_samples.append(
-            (self._fine_tracker.motion_dx, self._fine_tracker.motion_dy, wdx, wdy)
-        )
-        if len(self._fine_flow_samples) < 16:
-            return
-        # Drop a sample if EITHER estimate is zero, not just if both are. A
-        # one-sided zero is a frame where one estimator had no predecessor, and
-        # averaging it in dilutes that estimator's mean while leaving the other
-        # intact -- which reads as a clean, stable bias. That is precisely how
-        # the reset in _reacquire disguised itself as a 6% static-content bias
-        # (one zero per 16-sample batch, 15/16 = 0.9375).
-        rows = [
-            s
-            for s in self._fine_flow_samples
-            if abs(s[0]) + abs(s[1]) > 1e-6 and abs(s[2]) + abs(s[3]) > 1e-6
-        ]
-        self._fine_flow_samples = []
-        if not rows:
-            return
-        n = float(len(rows))
-        tdx, tdy, wdx, wdy = (sum(r[i] for r in rows) / n for i in range(4))
-        # Ratio of travelled distance, which is what accumulates as drift.
-        tracked = (tdx * tdx + tdy * tdy) ** 0.5
-        whole = (wdx * wdx + wdy * wdy) ** 0.5
-        ratio = (tracked / whole) if whole > 1e-6 else float("nan")
-        self._log(
-            f"fine-flow n={len(rows)}: tracker dx{tdx:+.2f} dy{tdy:+.2f} "
-            f"(|{tracked:.2f}|)  whole-frame dx{wdx:+.2f} dy{wdy:+.2f} "
-            f"(|{whole:.2f}|)  tracker/whole={ratio:.3f}"
-        )
-
-    def _update_fine_leading_edge(self, pipeline: CameraPipeline, coarse_raw) -> None:
-        """Track a leading-edge tile on coarse frames; pin Fine tap to full-res ROI."""
-        # Size the candidates to what the pane can show AT THIS ZOOM, before update()
-        # can re-pick. Set every frame because both inputs are the operator's: the
-        # pane expands with the window and the zoom is a combo box, so any constant
-        # fits one layout and letterboxes the rest. It takes effect at the next
-        # hand-over rather than mid-object -- _pick only runs from _reacquire, and a
-        # live resize of the current tile would look like the focus jumped.
-        vw, vh = self._focus_panel.fine_view_sensor_wh()
-        sub = KyfgCamera.SUBSAMPLE_FACTOR
-        fh_c, fw_c = coarse_raw.shape[:2]
-        # Even (Bayer), and never larger than the frame: an oversized tile yields an
-        # EMPTY grid, and select_leading_edge_roi then falls back to a centred ROI,
-        # silently dropping the leading-edge behaviour this whole path exists for.
-        self._fine_tracker.tile_wh = (
-            min(fw_c, max(2, -(-vw // sub))) & ~1,
-            min(fh_c, max(2, -(-vh // sub))) & ~1,
-        )
-        roi_coarse = self._fine_tracker.update(coarse_raw)
-        # A diagnostic must never break the thing it observes. This one threw a
-        # NameError and took the whole method down with it, so set_focus_roi was
-        # never reached -- Fine mode silently fell back to the centre-circle
-        # auto-pick and looked exactly like "tracking is broken again".
-        try:
-            self._probe_fine_flow(coarse_raw)
-        except Exception as exc:
-            self._fine_flow_probe = None
-            self._log(f"fine-flow probe disabled after error: {exc}")
-        held = self._fine_tracker.frames_on_object
-        left = self._fine_tracker.frames_left()
-        if self._locked_fine_roi is not None:
-            # Lock tile pins a FIXED sensor ROI, and the tracker wants a MOVING
-            # one; both wrote set_focus_roi, so the tracker silently overwrote the
-            # lock on the very next coarse frame and the lock never held. Keep
-            # tracking (the motion estimate and dwell readout stay live) but let
-            # the lock own the pipeline ROI.
-            self._focus_panel.set_dwell_info("LOCKED to sensor patch")
-            return
-        scale = KyfgCamera.SUBSAMPLE_FACTOR
-        try:
-            if roi_coarse is None:
-                pipeline.set_focus_roi(None)
-                self._focus_panel.set_dwell_info("no object yet (too bland)")
-            else:
-                # follow=True: this pin is TRACKED, and it can only ever reach a
-                # later frame than the coarse one it was derived from, so the acq
-                # thread shifts it by the travel it measures on the frame it
-                # actually crops. Without it the tile lagged the object by a
-                # varying sub-frame delay -- 42 sensor px of jitter at the flown
-                # 648 px/frame -- which is what "the image looks jittery" was.
-                # src_ts names that coarse frame, so the shift covers however many
-                # frames we took to answer (the GUI conflates under load).
-                pipeline.set_focus_roi(
-                    tuple(int(v * scale) for v in roi_coarse),
-                    follow=True,
-                    src_ts=getattr(self, "_focus_frame_ts", None),
-                )
-                tr = self._fine_tracker
-                edge = tr.lead_edge or "static"
-                # Texture no longer blocks the pick, so show how strong the target
-                # actually is -- a bland tile is a legitimate thing to hand-focus on,
-                # but the operator should know the judgement will be harder.
-                weak = "  WEAK" if tr.pick_score < tr.cfg.min_texture_score else ""
-                self._focus_panel.set_dwell_info(
-                    f"obj #{tr.object_id} from {edge}  "
-                    f"held {held}f  "
-                    + (f"~{left}f left" if left is not None else "no flow")
-                    + f"  dx{tr.motion_dx:+.1f} dy{tr.motion_dy:+.1f}"
-                    + f"  tex {tr.pick_score:.1f}{weak}"
-                )
-        except Exception as exc:
-            self._log(f"set_focus_roi failed: {exc}")
-
-    @Slot(bool)
-    def _on_preview_toggled(self, on: bool) -> None:
-        """Start the two-object preview fresh each time it's toggled (or restarted)
-        and switch full-res emission on/off so the panes can show sensor-native crops."""
-        self._dual_tracker.reset()
-        self._set_preview_full_res(bool(on))
-
-    def _set_preview_full_res(self, enable: bool) -> None:
-        """Turn full-res emission on (active camera) / off for the two-object preview,
-        and clear the pinned preview ROIs. Leaves emission ON if autofocus is still
-        using it on that camera, so we never yank the full-res feed out from under AF.
-
-        Recording owns that feed just as much as AF does, and it is easy to miss
-        because M0/M1/M6 are entered THROUGH here: the mode apply switches emission
-        on, then calls this to drop the preview's ROIs. Disabling unguarded made
-        every recorded line come out empty while the preview stayed perfect --
-        frames still arrived, they just carried no full-res payload, so there was
-        nothing to write and (by the ``None`` sentinel) nothing counted as dropped
-        either. Mirrors the same guard in ``CameraPipeline.set_fine_focus``."""
-        p = self._active_pipeline()
-        if p is None:
-            return
-        try:
-            if enable:
-                p.set_full_res_emission(True)
-            else:
-                p.set_preview_rois([])
-                if (p.camera_number not in self._af_full_res_cams
-                        and not self._modes.is_recording_mode()):
-                    p.set_full_res_emission(False)
-        except Exception as exc:
-            self._log(f"preview full-res {'on' if enable else 'off'} failed: {exc}")
-
-    def _on_dual_track_toggled(self, on: bool) -> None:
-        """Start the two-object tracking overlay fresh each time it's toggled. Pure
-        coarse-frame tracking (no full-res, no AF); clears the boxes when turned off."""
-        self._dual_tracker.reset()
-        if not on:
-            self._focus_panel.set_track_rois([])
-
-    def _on_orthosim_toggled(self, on: bool) -> None:
-        """Arm/disarm OrthoSim bench mode: (1) flip AF interior/edge masking on the
-        shared AF config so focus tiles stay off the bezel/fiducials/optical bar, and
-        (2) build the decoder ScreenLayout + a fresh SpeedDistanceTracker for the live
-        ground-truth readout. Log-only -- nothing here drives AF."""
-        if on:
-            w, h = self._focus_panel.ortho_screen_wh()
-            edge = self._focus_panel.ortho_bar_edge()
-            self._ortho_layout = ScreenLayout(screen_w=w, screen_h=h, bar_edge=edge)
-            self._ortho_tracker = SpeedDistanceTracker()
-            self._ortho_last_t = 0.0
-            self._ortho_fail = 0
-            self._af_cfg.restrict_interior = True
-            self._af_cfg.exclude_edge = edge
-            self._log(
-                f"OrthoSim GT: ON (screen {w}x{h}, bar={edge}); AF tiles restricted "
-                "to screen interior (off bezel/fiducials/optical strip)."
-            )
-        else:
-            self._ortho_layout = None
-            self._ortho_tracker = None
-            self._af_cfg.restrict_interior = False
-            self._af_cfg.exclude_edge = None
-            self._log("OrthoSim GT: OFF; AF interior restriction cleared.")
-
-    def _orthosim_step(self) -> None:
-        """Tell the OrthoSim display to advance the scene by one captured frame.
-
-        The display holds a fixed scene position between nudges, so the panel is
-        settled for the whole 250 us exposure. That is what removes the ghost we
-        traced on moving-scene crops: one refresh (~21 ms of scene motion) of
-        overdrive undershoot trailing every bright feature, which never appeared on
-        frozen scenes because both copies coincide.
-
-        Sends the MEASURED interval rather than the configured trigger rate -- when
-        a frame is conflated or late the simulated aircraft should cover that ground,
-        or the scene silently drifts away from the ground truth it is logging.
-
-        Steps on EVERY frame and scores every frame. This used to step on alternate
-        frames and mark the one in between unsettled, because an uncontrolled panel
-        transition can land inside an exposure: the 250 us shutter then records the LCD
-        physically partway between two scene positions (not two refreshes integrated,
-        which 250 us cannot do), and live on 2026-08-19 that made 6% of scored frames a
-        50/50 blend of two scene positions -- a crosswalk laid over a building, score
-        halved exactly as a blend of two independent textures predicts. Settle *time*
-        was never the problem (~188 ms spare in a 238 ms period); the phase was.
-
-        Lockstep (below) superseded that mitigation by making the panel provably static
-        before the shutter opens, which is a fix rather than a dodge. The alternation
-        stayed on anyway and cost half of every open-loop run's AF samples -- including
-        IN FLIGHT, where this function still runs (it is deliberately ungated), there is
-        no panel within a thousand miles, and there was never anything to settle. An
-        open-loop BENCH run can therefore catch a transition again; use lockstep when
-        the measurement has to be clean, which is what it is for.
-
-        Fire-and-forget by design: no listener, no error, no wait. This runs in the
-        per-frame path of a rig where a stall is expensive, so nothing here may block
-        or raise, and a lost datagram costs one step rather than a desync.
-        """
-        import orthosim_codec as codec
-
-        if getattr(self, "_ls_on", False):
-            if self._ls_triggered_at is None:
-                # A frame we did not ask for: a leftover from before lockstep engaged,
-                # or the late twin of a re-triggered one. Its scene position is unknown
-                # -- the display may already have moved on -- so it must not become a
-                # measurement. This is what keeps a stray frame from being logged at a
-                # stale y and from driving an extra step.
-                self._af_frame_unsettled = True
-                return
-            # Closed loop: this frame is the "done acquiring" half of the handshake, so
-            # ask for the next picture instead of alternating. Nothing is unsettled in
-            # lockstep -- the panel was provably static when the shutter opened -- so
-            # every frame is a measurement rather than every other one.
-            self._af_frame_unsettled = False
-            self._ls_frame_arrived()
-            return
-
-        self._af_frame_unsettled = False
-
-        now = time.monotonic()
-        last, self._orthosim_step_t = getattr(self, "_orthosim_step_t", None), now
-        if last is None:
-            return  # first frame only starts the clock; there is no interval yet
-        try:
-            self._orthosim_sock().sendto(
-                b"%.6f" % (now - last), (codec.STEP_HOST, codec.STEP_PORT))
-        except OSError:
-            return  # display app down or buffer full: nothing moved, next frame is safe
-
-    # ── lockstep: display and camera as a closed loop ────────────────────
-    # STEP -> (display paints, settles) -> READY -> $T* -> frame -> STEP -> ...
-    #
-    # Replaces the open-loop nudge, which could only ever guard against a badly
-    # timed panel transition, never prevent one. The app is master: it owns the
-    # sequence number and the timeouts, so a lost datagram degrades the rig instead
-    # of hanging it. See orthosim_codec's lockstep section and HANDOFF 36.17.
-
-    LS_READY_TIMEOUT_S = 0.6     # paint + settle is ~60-80 ms; this is a wide margin
-    LS_FRAME_TIMEOUT_S = 2.0     # trigger -> exposure -> readout -> Python
-    LS_MAX_RETRIES = 3
-
-    def _on_lockstep_toggled(self, on: bool) -> None:
-        if on:
-            self._ls_start()
-        else:
-            self._ls_stop("operator turned it off")
-
-    def _ls_start(self) -> None:
-        import queue as _queue
-        import threading
-
-        if getattr(self, "_ls_on", False):
-            return
-        self._ls_ready_q = getattr(self, "_ls_ready_q", None) or _queue.SimpleQueue()
-        if getattr(self, "_ls_thread", None) is None:
-            # Daemon receive thread rather than QUdpSocket, matching the display's own
-            # listener: no QtNetwork dependency for the frozen build, same eight lines.
-            t = threading.Thread(target=self._ls_recv_loop, name="lockstep-ready",
-                                 daemon=True)
-            self._ls_thread = t
-            t.start()
-        if getattr(self, "_ls_timer", None) is None:
-            # The handshake advances on datagrams and timeouts, neither of which is a
-            # frame, so it needs a wakeup of its own. Polling a queue from the GUI
-            # thread rather than signalling from the receive thread keeps every serial
-            # write on one thread.
-            self._ls_timer = QTimer(self)
-            self._ls_timer.timeout.connect(self._ls_poll)
-        self._ls_on = True
-        self._ls_seq = 0
-        self._ls_awaiting = None
-        self._ls_triggered_at = None
-        self._ls_retries = 0
-        self._ls_frames = 0
-        self._ls_timeouts = 0
-        try:
-            self._serial.set_external_trigger(True)
-        except Exception:
-            log.exception("lockstep: could not hand the trigger to the host")
-            self._ls_on = False
-            return
-        self._ls_timer.start(4)
-        log.info("lockstep ON: M4 trigger is host-driven ($X1*), display must answer READY")
-        self._ls_send_step()
-
-    def _ls_stop(self, reason: str) -> None:
-        if not getattr(self, "_ls_on", False):
-            return
-        self._ls_on = False
-        if getattr(self, "_ls_timer", None) is not None:
-            self._ls_timer.stop()
-        try:
-            self._serial.set_external_trigger(False)
-        except Exception:
-            log.exception("lockstep: could not give the trigger back to the PCB")
-        # The box must never stay ticked over a loop that has stopped running, or the
-        # next run is recorded open loop by an operator who thinks otherwise.
-        try:
-            self._focus_panel.reset_lockstep()
-        except Exception:
-            pass
-        msg = (f"lockstep OFF ({reason}): {getattr(self, '_ls_frames', 0)} frames, "
-               f"{getattr(self, '_ls_timeouts', 0)} timeouts -- PCB self-triggering again")
-        log.info("%s", msg)
-        # Also to the GUI log: a rig that silently changes what it is measuring needs to
-        # say so somewhere the operator is actually looking.
-        try:
-            self._log(msg)
-        except Exception:
-            pass
-
-    def _ls_recv_loop(self) -> None:
-        """Receive READY datagrams from the display. Runs forever on a daemon thread."""
-        import orthosim_codec as codec
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            sock.bind((codec.STEP_HOST, codec.READY_PORT))
-        except OSError as exc:
-            log.error("lockstep: READY port %d unavailable (%s) -- another instance?",
-                      codec.READY_PORT, exc)
-            sock.close()
-            return
-        while True:
-            try:
-                data, _ = sock.recvfrom(64)
-            except OSError:
-                return
-            seq = codec.decode_ready(data)
-            if seq is not None:
-                self._ls_ready_q.put(seq)
-
-    def _ls_send_step(self) -> None:
-        """Ask the display for the next picture. Fixed step, so travel is uniform."""
-        import orthosim_codec as codec
-
-        self._ls_seq += 1
-        self._ls_awaiting = self._ls_seq
-        self._ls_sent_at = time.monotonic()
-        # A FIXED interval, unlike the open-loop channel's measured one. In lockstep the
-        # cadence is set by the handshake itself, so wall-clock elapsed time is not a
-        # property of the scene any more -- and a constant step makes every frame's
-        # travel identical, which is what removes the variable-jump family of artefacts
-        # rather than merely rejecting them.
-        dt = 1.0 / max(1e-6, float(getattr(self, "_ls_rate_hz", 4.0)))
-        try:
-            self._orthosim_sock().sendto(
-                codec.encode_step(self._ls_seq, dt), (codec.STEP_HOST, codec.STEP_PORT))
-        except OSError:
-            pass    # the READY timeout is the recovery path
-
-    def _ls_frame_arrived(self) -> None:
-        """The frame we triggered is in: ask for the next picture."""
-        if self._ls_awaiting is not None:
-            return      # not ours -- a stray frame while we were waiting on the display
-        self._ls_frames += 1
-        self._ls_triggered_at = None
-        self._ls_retries = 0
-        self._ls_send_step()
-
-    def _ls_poll(self) -> None:
-        """Drive the handshake: answer READY with a trigger, and time out the waits."""
-        now = time.monotonic()
-        while True:
-            try:
-                seq = self._ls_ready_q.get_nowait()
-            except Exception:
-                break
-            if seq != self._ls_awaiting:
-                continue    # stale answer to a step we already gave up on
-            self._ls_awaiting = None
-            self._ls_retries = 0
-            self._ls_triggered_at = now
-            # The panel is settled and will not move until we report this frame, so
-            # this is the one moment the shutter may open.
-            try:
-                self._serial.send_test_trigger()
-            except Exception:
-                log.exception("lockstep: trigger failed")
-                self._ls_stop("trigger failed")
-                return
-
-        if self._ls_awaiting is not None and now - self._ls_sent_at > self.LS_READY_TIMEOUT_S:
-            self._ls_timeouts += 1
-            self._ls_retries += 1
-            if self._ls_retries > self.LS_MAX_RETRIES:
-                # Degrade rather than hang. A rig that reverts to self-triggering is
-                # merely back to the old artefact; one that waits forever is dead, and
-                # the operator would be left watching a frozen preview with no reason.
-                self.statusBar().showMessage(
-                    f"Lockstep: display not answering -- reverted to PCB "
-                    f"triggering after {self._ls_retries} tries")
-                self._ls_stop("display never answered READY")
-                return
-            log.warning("lockstep: no READY for step %d, re-sending (try %d)",
-                        self._ls_awaiting, self._ls_retries)
-            self._ls_seq -= 1       # _ls_send_step re-increments; the display serves
-            self._ls_send_step()    # a repeat of the same seq without double-stepping
-        elif (self._ls_triggered_at is not None
-              and now - self._ls_triggered_at > self.LS_FRAME_TIMEOUT_S):
-            self._ls_timeouts += 1
-            self._ls_retries += 1
-            if self._ls_retries > self.LS_MAX_RETRIES:
-                self.statusBar().showMessage(
-                    "Lockstep: no frame after repeated triggers -- reverted to PCB")
-                self._ls_stop("no frame after $T*")
-                return
-            # Re-trigger rather than tear the rig down. The display is still holding the
-            # same scene position -- it does not move until we report a frame -- so a
-            # second exposure is of exactly the picture the first one was meant to
-            # catch. The 12:46 run of 2026-09-07 died on ONE missing frame in 311 (a
-            # hiccup as the operator switched to Fine), then quietly ran two whole
-            # observes open loop. Losing a frame must cost a frame, not the run.
-            log.warning("lockstep: no frame %.1f s after $T* -- re-triggering (try %d)",
-                        now - self._ls_triggered_at, self._ls_retries)
-            self._ls_triggered_at = now
-            try:
-                self._serial.send_test_trigger()
-            except Exception:
-                log.exception("lockstep: re-trigger failed")
-                self._ls_stop("re-trigger failed")
-
-    def _orthosim_sock(self):
-        """The one non-blocking datagram socket to the display app, made on demand.
-
-        Shared by the step channel and the alignment readout: same host, same port,
-        distinguished by the ``ALIGN`` prefix. Non-blocking because both callers sit
-        in the per-frame path, where a stall costs frames.
-        """
-        sock = getattr(self, "_orthosim_step_sock", None)
-        if sock is None:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
-            self._orthosim_step_sock = sock
-        return sock
-
-    def _feed_orthosim(self, raw) -> None:
-        """Throttled (~1 Hz) decode of the OrthoSim optical ground-truth bar from the
-        coarse frame; logs + overlays measured/encoded velocity, distance and
-        simulated GSD (altitude proxy). Best-effort -- silent until fiducials + CRC
-        both pass. ponytail: runs on the 4x-subsampled coarse frame; if ArUco can't
-        resolve the fiducials there, a full-res crop tap is the upgrade path."""
-        if self._ortho_layout is None or self._ortho_tracker is None:
-            return
-        # Stand down while AF is hunting. One decode (ArUco + homography over the whole
-        # coarse frame) blocks the GUI thread long enough to conflate ~2-3 focus frames,
-        # which halves the rate AF ticks at -- doubling the sweep, and with it how far
-        # the scene pans mid-sweep. The interior/edge tile masking is a separate config
-        # flip that stays armed, so we lose only the telemetry, and only for the few
-        # seconds of a run (the readout is constant at fixed scroll speed anyway).
-        af = getattr(self, "_autofocus", None)
-        if af is not None and af.is_running():
-            return
-        if self._field_map_running():
-            return
-        now = time.monotonic()
-        if now - self._ortho_last_t < 1.0:
-            return
-        self._ortho_last_t = now
-        try:
-            gt = decode_frame(raw, self._ortho_layout)
-        except Exception as exc:  # pragma: no cover - UI guard
-            self._log(f"OrthoSim decode error: {exc}")
-            return
-        if gt is None:
-            self._ortho_fail += 1
-            if self._ortho_fail % 5 == 1:
-                # Separate "fiducials not found" from "found but bar/CRC bad" and report
-                # the frame we actually decode (4x coarse), so a live "everything is
-                # visible but nothing decodes" can be triaged without a rebuild.
-                try:
-                    from .orthosim_decode import _to_gray_u8, detect_fiducials
-                    g = _to_gray_u8(raw)
-                    src = detect_fiducials(g, self._ortho_layout.aruco_dict)
-                    stage = ("no fiducials found"
-                             if src is None else "fiducials OK, bar/CRC failed")
-                    # Report the *sensor* range: ``g`` is min-max normalised, so its
-                    # own min/max is always 0/255 and says nothing about exposure.
-                    detail = (f"{stage}; frame={g.shape[1]}x{g.shape[0]} "
-                              f"raw min/max={int(raw.min())}/{int(raw.max())}")
-                    # One-shot diagnostic dump, guarded to a single write.
-                    if not getattr(self, "_ortho_dbg", False):
-                        self._ortho_dbg = True
-                        if src is None:
-                            # Nothing to rectify against, so dump the frame as the
-                            # camera sees it -- the usual causes (corner markers
-                            # outside the FOV, or too defocused to resolve) are
-                            # obvious on sight and invisible in any scalar we log.
-                            detail += self._dump_ortho_frame_debug(g)
-                        else:
-                            # Bar, not fiducials: save the rectified display-space
-                            # image + per-cell levels to separate blur from a
-                            # brightness gradient from a sampling offset.
-                            detail += self._dump_ortho_bar_debug(raw)
-                except Exception as exc:  # pragma: no cover - diag only
-                    detail = f"diag error: {exc}"
-                self._log(f"OrthoSim GT: no decode ({detail}) x{self._ortho_fail}")
-            return
-        self._ortho_fail = 0
-        if not getattr(self, "_ortho_scale_logged", False):
-            self._ortho_scale_logged = True
-            self._log(self._measure_ortho_scale(raw))
-        mm = self._ortho_tracker.update(gt)
-        if mm is None:
-            return
-        # GSD -> altitude (ft): alt = 10 * GSD_cm * f_mm / p_um * 3.28084 (HANDOFF §28).
-        # Focal length is per lens (keyed by camera serial); pitch is the shared IMX661
-        # sensor (3.45 um). Falls back to raw GSD when the lens focal length is unknown.
-        # Shared with the alignment measurement, which needs the same pinhole geometry.
-        from .align import CAM_FOCAL_MM as _CAM_FOCAL_MM, PITCH_UM as _PITCH_UM
-        alt_txt = f"GSD {mm.gsd_cm:.3f} cm/px" if mm.gsd_cm > 0 else "unset"
-        ap = self._active_pipeline()
-        if mm.gsd_cm > 0 and ap is not None:
-            f_mm = _CAM_FOCAL_MM.get(str(ap.camera_serial).strip())
-            if f_mm:
-                alt_ft = 10.0 * mm.gsd_cm * f_mm / _PITCH_UM * 3.28084
-                alt_txt = f"{alt_ft:,.0f} ft (GSD {mm.gsd_cm:.3f} cm/px)"
-        flags = " SEAM" if mm.seam else ""
-        if gt.paused:
-            flags += " PAUSED"
-        _KN = 1.943844  # m/s -> knots
-        text = (
-            f"OrthoSim GT: dist={mm.distance_m:.1f} m  "
-            f"vel meas={mm.velocity_mps * _KN:.1f} / "
-            f"enc={mm.encoded_velocity_mps * _KN:.1f} kn  "
-            f"alt={alt_txt}{flags}"
-        )
-        self._focus_panel.set_autofocus_status(text)
-        self._log(text)
-
-    def _dump_ortho_frame_debug(self, gray_u8) -> str:
-        """One-shot: save the coarse frame the decode actually runs on, for the
-        'no fiducials found' case where there is nothing to rectify against."""
-        try:
-            import cv2
-            from pathlib import Path
-            p = Path(__file__).resolve().parents[2] / "ortho_dbg_frame.png"
-            cv2.imwrite(str(p), gray_u8)
-            return f" [dbg saved: {p.name}]"
-        except Exception as exc:  # pragma: no cover - diag only
-            return f" [dbg error: {exc}]"
-
-    def _measure_ortho_scale(self, raw) -> str:
-        """Measure camera-px per display-px from the corner fiducials.
-
-        The altitude readout is derived from the bar's ``gsd_cm``, which the display
-        computed as ``ortho_gsd_cm / (Z * M)`` from a hand-set ``--M``. Nothing in
-        that chain observes the camera, so an uncalibrated M silently scales the
-        reported altitude. The markers are at known display-pixel positions, so
-        measuring their imaged separation gives M independently and makes the
-        altitude checkable. One-shot: costs a second ArUco pass, and M only changes
-        when the rig geometry does.
-        """
-        try:
-            from .orthosim_decode import (
-                _to_gray_u8, detect_fiducials, measure_scale,
-            )
-            lay = self._ortho_layout
-            src = detect_fiducials(_to_gray_u8(raw), lay.aruco_dict)
-            if src is None:
-                return "OrthoSim scale: fiducials not resolvable; M unmeasured"
-            ss = KyfgCamera.SUBSAMPLE_FACTOR  # decode runs on the decimated tap
-            mx, my = (v * ss for v in measure_scale(src, lay))
-            if mx <= 0 or my <= 0:
-                return "OrthoSim scale: degenerate marker geometry"
-            return (f"OrthoSim scale: M measured = {mx:.4f} x / {my:.4f} y "
-                    f"camera-px per display-px (anisotropy {mx / my:.3f}); "
-                    f"altitude scales as 1/M, so the readout is only right if the "
-                    f"display was launched with --M {(mx + my) / 2:.4f}")
-        except Exception as exc:  # pragma: no cover - diag only
-            return f"OrthoSim scale: measure error: {exc}"
-
-    def _dump_ortho_bar_debug(self, raw) -> str:
-        """One-shot: save the rectified screen + bar-band crop and report the per-cell
-        levels, so a 'fiducials OK / bar CRC fail' can be diagnosed (blur vs. gradient
-        vs. offset) from the actual pixels. Returns a short suffix for the log line."""
-        try:
-            import cv2
-            from pathlib import Path
-            from .orthosim_decode import rectify_screen, _sample_bits
-            import orthosim_codec as codec
-            lay = self._ortho_layout
-            rect = rectify_screen(raw, lay)
-            if rect is None:
-                return " [dbg: rectify failed]"
-            root = Path(__file__).resolve().parents[2]
-            cv2.imwrite(str(root / "ortho_dbg_rectified.png"), rect)
-            centers, cell_w = lay.bar_cell_centers()
-            cy = int(round(centers[0][1]))
-            y0 = max(0, cy - lay.bar_height_px // 2 - 8)
-            y1 = min(rect.shape[0], cy + lay.bar_height_px // 2 + 8)
-            x0 = max(0, int(centers[0][0] - cell_w))
-            x1 = min(rect.shape[1], int(centers[-1][0] + cell_w))
-            cv2.imwrite(str(root / "ortho_dbg_bar.png"), rect[y0:y1, x0:x1])
-            bits = _sample_bits(rect, lay)
-            # per-cell mean levels along the band, to expose a brightness gradient
-            win = max(1, int(cell_w * 0.3))
-            lv = []
-            for cx, ccy in centers:
-                xa, xb = int(cx) - win, int(cx) + win + 1
-                ya, yb = int(ccy) - win, int(ccy) + win + 1
-                lv.append(float(rect[max(0, ya):yb, max(0, xa):xb].mean()))
-            import numpy as _np
-            lv = _np.asarray(lv)
-            sync_ok = bits[:codec.SYNC_BITS] == list(codec.SYNC_PATTERN) \
-                if hasattr(codec, "SYNC_PATTERN") else "?"
-            head = "".join(str(b) for b in bits[:24])
-            return (f" [dbg saved: rect={rect.shape[1]}x{rect.shape[0]} "
-                    f"cell_w={cell_w:.1f} lv min/mean/max="
-                    f"{lv.min():.0f}/{lv.mean():.0f}/{lv.max():.0f} "
-                    f"lv_left/right={lv[:10].mean():.0f}/{lv[-10:].mean():.0f} "
-                    f"sync_ok={sync_ok} bits[:24]={head}]")
-        except Exception as exc:  # pragma: no cover - diag only
-            return f" [dbg error: {exc}]"
-
-    def _feed_dual_track(self, raw) -> None:
-        """Run the two-object tracker on the coarse frame and outline each pane's tile
-        (coarse-frame coords, with its object id) on the main preview. No AF, no
-        full-res -- this is the 'watch the leading-edge object flow' test tool."""
-        panes = self._dual_tracker.update(raw)
-        rois: list = []
-        for pane in panes:
-            if pane is None:
-                rois.append(None)
-                continue
-            oid, (x0, y0, x1, y1) = pane
-            rois.append((oid, (int(x0), int(y0), int(x1), int(y1))))
-        self._focus_panel.set_track_rois(rois)
-        # Diagnostic: log on every change in occupied-pane count (so a box that
-        # flickers for a single frame is still captured) plus a periodic heartbeat.
-        live = sum(1 for p in panes if p is not None)
-        self._dual_track_frames += 1
-        if live != self._dual_track_last_live or self._dual_track_frames % 16 == 1:
-            self._dual_track_last_live = live
-            self._log(f"2-obj[{live}]: {self._dual_tracker.debug_line()}")
-
-    def _feed_dual_preview(self, raw) -> None:
-        """Track up to two leading-edge patches on the coarse frame and pin each pane's
-        ROI (scaled to full-res sensor pixels, Bayer-quad aligned) so the pipeline ships
-        sensor-native crops from the held slot. Display-only, no AF coupling; painting
-        happens in :meth:`_on_raw_focus_preview_crops` when the crops arrive."""
-        panes = self._dual_tracker.update(raw)
-        p = self._active_pipeline()
-        if p is None:
-            return
-        scale = KyfgCamera.SUBSAMPLE_FACTOR
-        rois: list = []
-        for pane in panes:
-            if pane is None:
-                rois.append(None)
-                continue
-            _oid, (x0, y0, x1, y1) = pane
-            # Coarse -> full-res, then snap the origin to an even (Bayer-quad) grid so
-            # the green-plane slice in the paint slot always lands on green.
-            fx0 = (int(x0) * scale) & ~1
-            fy0 = (int(y0) * scale) & ~1
-            fx1 = int(x1) * scale
-            fy1 = int(y1) * scale
-            rois.append((fx0, fy0, fx1, fy1))
-        try:
-            p.set_preview_rois(rois)
-        except Exception as exc:
-            self._log(f"set_preview_rois failed: {exc}")
-
-    def _on_raw_focus_preview_crops(self, crops, ts_iso: str, pin_ts=None) -> None:
-        """Paint the two sensor-native object crops into the split-preview panes.
+    def _on_raw_focus_preview_crops(self, crops, ts_iso: str) -> None:
+        """A batch of the five pinned sensor-native ROI crops -> the w10 engine.
         Runs on the GUI thread; releases the pipeline's crop conflation latch first so
-        the next batch can be staged while we render this one."""
+        the next batch can be staged while the engine scores this one."""
         p = self._active_pipeline()
         if p is not None:
             try:
                 p.note_preview_crops_consumed()
             except Exception:
                 pass
-        fm = self._field_map
-        if fm is not None and fm.running:
-            # A sweep owns the ROI slots; this batch is its per-tile measurement,
-            # and it also paces the motor, so it must not also go to the panes.
-            fm.feed(crops or [])
-            return
-        af = self._autofocus
-        if af is not None and af.feed_crops(crops):
-            return   # w10 AF: the five sec.52 ROIs, scored off the GUI thread by the engine
-        if self._af_crops_active:
-            # AF owns the ROI slots: this batch is either a climb's A/B calibration pair
-            # or an observation's N patches. Either way every crop comes out of the same
-            # held full-res slot, so the scores are same-frame by construction, and they
-            # use the SAME metric as the climb curve.
-            # Scored CONCURRENTLY, one worker per patch. `pool.map` keeps the order and
-            # `list` waits for all of them, so this stays the same synchronous,
-            # same-frame, same-ordered list the rest of the handler already assumes --
-            # only the wall time changes. The patches are independent and every step of
-            # the metric releases the GIL (cv2 filters, numpy astype and reductions), so
-            # they genuinely overlap: 5 live-sized patches measured 122 ms serial against
-            # 50 ms pooled, i.e. 72 ms off a ~208 ms frame period, on the thread whose
-            # busy time IS the conflation. cv2's own thread count is irrelevant here (it
-            # measured the same at 1 and at 16) -- a 1.28 Mpx plane is too small for its
-            # internal split to pay, and the parallelism has to come from the patches.
-            self._af_crop_scores = list(
-                self._af_score_pool().map(_af_score_crop, crops or []))
-            self._af_crop_seq += 1
-            # WHICH objects these crops are of, looked up from the pin the pipeline says it
-            # cut them with. Not "whatever we pinned last": the pipeline picks a pin up
-            # whenever it next reads one, so a batch can answer the pin before last, and
-            # assuming otherwise labels every crop with its neighbour's oid. Measured on
-            # the 14:47 run: OID002_y1540 correlates 0.64 with oid 1's patches and 0.07
-            # with its own; OID003_y1039 correlates 0.93 with OID002_y1731.
-            labels, rois = getattr(self, "_af_pin_by_ts", {}).get(pin_ts, ([], []))
-            self._af_crop_answered = list(labels)
-            # Held, not written. Whether these crops become samples is decided a few lines
-            # further on in ``_af_full_res_multi``, which runs after this handler on the
-            # same frame -- so the batch is stashed with the pin it answers and saved from
-            # there, once the answer is known.
-            self._af_crop_pending = (list(crops or []), list(rois), list(labels))
-            return
-        gray = []
-        for crop in (crops or []):
-            if crop is None or getattr(crop, "size", 0) == 0:
-                gray.append(None)
-                continue
-            # Green plane (real sensor pixels, no demosaic) at full-res/2, scaled to
-            # 8-bit -- ~4x sharper than the old coarse-tap crop, cheap enough for the
-            # GUI thread.
-            g = crop[0::2, 1::2]
-            gray.append(_u16_to_gray8(g, self._preview_display_gain))
-        self._focus_panel.receive_object_crops(gray)
+        self._autofocus.feed_crops(crops)
 
-    def _on_focus_submode_changed(self, sub: FocusSubMode) -> None:
-        self._modes.set_focus_submode(sub)
-        # Coarse<->Fine is a different scene/score scale, so the old score-vs-encoder
-        # trace no longer belongs to what we're looking at: dump it and start anew.
-        self._focus_panel.focus_scatter_clear()
-        if sub == FocusSubMode.COARSE:
-            self._reset_fine_tracker()
-            # A pinned tile belongs to the Fine scene we just left; drop it so a
-            # stale ROI isn't scored against the coarse view.
-            self._locked_fine_roi = None
-            self._last_fine_tile_roi = None
-            self._focus_panel.reset_lock_tile()
-        else:
-            self._fine_tracker.reset()
-        self._sync_fine_focus_to_pipelines()
-        self._sync_fine_demosaic_to_pipelines()
-
-    @Slot(bool)
-    def _on_fine_lock_changed(self, locked: bool) -> None:
-        """Freeze/unfreeze the Fine tile (Lock tile checkbox).
-
-        In Fine view the acquisition auto-picks a new best tile every frame, which
-        hops on sensor noise. Locking pins the current tile's ROI on the pipeline so
-        the acquisition crops that exact patch (``m4_roi_tile_rgb_from_frame``); the
-        focus-telemetry scatter/CSV then score that patch as the operator creeps
-        focus. Unlocking returns to auto-pick."""
-        active = self._active_pipeline()
-        if active is None:
-            self._log("Lock tile: no active camera.")
-            return
-        if locked:
-            roi = self._last_fine_tile_roi
-            if roi is None:
-                self._log("Lock tile: no Fine tile yet -- switch to Fine view first.")
-                return
-            self._locked_fine_roi = roi
-            try:
-                active.set_focus_roi(roi)
-            except Exception as exc:
-                self._log(f"Lock tile: set_focus_roi failed: {exc}")
-                return
-            self._log(f"Lock tile: ON (pinned {roi}).")
-        else:
-            self._locked_fine_roi = None
-            try:
-                active.set_focus_roi(None)
-            except Exception as exc:
-                self._log(f"Lock tile: clear failed: {exc}")
-            self._log("Lock tile: OFF (auto-pick).")
-
-    def _sync_fine_demosaic_to_pipelines(self) -> None:
-        """Apply focus-panel Debayer checkbox to every acquisition thread."""
-        enabled = self._focus_panel.fine_demosaic_enabled()
-        for p in self._pipelines:
-            try:
-                p.set_fine_demosaic(enabled)
-            except Exception as exc:
-                self._log(f"cam{p.camera_number}: set_fine_demosaic failed: {exc}")
-
-    @Slot(bool)
-    def _on_fine_demosaic_changed(self, _enabled: bool) -> None:
-        self._sync_fine_demosaic_to_pipelines()
-
-    # ── autofocus (M4) ───────────────────────────────────────────────────
-
-    def _set_active_focus_roi(self, roi) -> None:
-        """Show the autofocus winning-tile ROI as an overlay on the coarse
-        preview (AF runs in Coarse view, so the tile isn't otherwise visible),
-        and pin it (scaled to full-res coords) on the active pipeline so it ships
-        a full-res crop of that tile for AF to score focus on."""
+    def _set_focus_tap(self, p: CameraPipeline, on: bool) -> None:
+        """The focus view's feed from one pipeline: the coarse frame for the preview AND
+        the five full-res w10 ROI crops, so the w10 number is live whenever the operator is
+        looking at a camera in M4/M5 -- focusing by hand or under AF (sec.54). The crops
+        need full-res emission, which M4 otherwise leaves off; off never takes it away
+        from a camera that is recording (M4 Record owns the feed just as much)."""
+        p.set_focus_tap(on)
         try:
-            self._focus_panel.set_af_roi_overlay(roi)
-        except Exception as exc:
-            self._log(f"set_af_roi_overlay failed: {exc}")
-        p = self._active_pipeline()
-        if p is None:
-            return
-        try:
-            if roi is None:
-                p.set_focus_roi(None)
+            if on:
+                p.set_full_res_emission(True)
+                p.set_preview_rois(roi_boxes())
             else:
-                self._af_enable_full_res(True)
-                scale = KyfgCamera.SUBSAMPLE_FACTOR
-                p.set_focus_roi(tuple(int(v * scale) for v in roi))
+                p.set_preview_rois([])
+                if not self._modes.is_recording_mode():
+                    p.set_full_res_emission(False)
         except Exception as exc:
-            self._log(f"AF set_focus_roi failed: {exc}")
+            self._log(f"cam{p.camera_number}: focus tap {'on' if on else 'off'} failed: {exc}")
 
     def _af_pin_rois(self, rois) -> None:
-        """w10 AF (sec.54): pin its five fixed full-res ROIs on the active pipeline so the
-        acquisition thread ships them from the held slot each frame (the two-object
-        preview path, ``_on_raw_focus_preview_crops``, routes the batch to the engine).
-        ``_af_crops_active`` keeps the scene trackers from re-pinning them mid-run; the
-        run-state handler's ``_af_enable_full_res(False)`` clears everything at the end."""
+        """w10 AF (sec.54): (re)assert its five full-res ROIs on the active pipeline. The
+        live focus tap already pins the same boxes; this covers a run started on a camera
+        whose tap was flipped on before the pipeline existed."""
         if not rois:
             return
         p = self._active_pipeline()
         if p is None:
             return
-        self._af_enable_full_res(True)
-        self._af_crops_active = True
+        self._af_full_res_cams.add(p.camera_number)
         try:
+            p.set_full_res_emission(True)
             p.set_preview_rois(list(rois))
         except Exception as exc:
             self._log(f"w10 AF: set_preview_rois failed: {exc}")
 
     def _af_enable_full_res(self, enable: bool) -> None:
-        """Turn full-res emission on (active camera) / off (all AF cameras).
-
-        AF runs in Coarse view, where full-res emission is normally off; it must
-        be on for the pipeline to ship the full-res winning-tile crop. Tracked
-        per camera so "Auto-focus all" cleans up whichever cameras it touched."""
+        """Off (end of a run): release the crops on every camera the run touched EXCEPT the
+        one the focus view is still showing -- its live w10 keeps the feed. "Auto-focus all"
+        leaves the last camera selected, so this is what frees the other two."""
         if enable:
-            p = self._active_pipeline()
-            if p is not None:
-                # Force emission ON every time, NOT just when the cam isn't already
-                # tracked: switching Fine->Coarse (which _force_focus_coarse does at AF
-                # start) calls set_fine_focus(False) -> set_full_res_emission(False),
-                # turning it OFF underneath us. The old `not in _af_full_res_cams` skip
-                # then left emission off for the whole run, so AF scored the weak
-                # decimated preview instead of the full-res crop and walked a good manual
-                # focus into blur (fresh=1/1004 in the log). set_full_res_emission is
-                # idempotent, so re-asserting it is cheap and correct.
-                try:
-                    p.set_full_res_emission(True)
-                    self._af_full_res_cams.add(p.camera_number)
-                except Exception as exc:
-                    self._log(f"AF full-res on failed: {exc}")
+            self._af_pin_rois(roi_boxes())
             return
+        active = self._active_pipeline()
+        keep = active.camera_number if active is not None and self._modes.is_af_mode() else None
         for p in self._pipelines:
-            if p.camera_number in self._af_full_res_cams:
-                try:
-                    p.set_full_res_emission(False)
-                    p.set_focus_roi(None)
-                    # Hand the ROI slots back, or the two-object preview stays dead
-                    # until something else claims them.
-                    p.set_preview_rois([])
-                except Exception as exc:
-                    self._log(f"AF full-res off failed: {exc}")
+            if p.camera_number in self._af_full_res_cams and p.camera_number != keep:
+                self._set_focus_tap(p, False)
         self._af_full_res_cams.clear()
-        self._af_fullres_crop = None
-        self._af_scored_seq = -1
-        self._af_crops_active = False
-        self._af_crop_scores = None
-        self._af_crop_scored_seq = -1
-
-    def _on_raw_focus_roi_u16_slot(self, crop, ts_iso: str) -> None:
-        """Buffer the latest full-res winning-tile crop for AF full-res scoring.
-        Runs on the GUI thread (queued), same thread as ``feed_frame``, so the
-        buffer needs no lock.
-
-        The crop is *usually* emitted 1:1 with the coarse focus-tap frame the
-        engine scores, but the full-res emission path can stall mid-run (seen
-        live as a frozen constant AF score while the preview kept updating, so
-        AF gave up at pos 0). We tag each crop with a sequence number so
-        :meth:`_af_full_res_score` can tell a fresh crop from a stale one."""
-        self._af_fullres_crop = crop
-        self._af_fullres_seq += 1
-        # Feed the Zoom-tile view the same full-res crop AF scores, so its green
-        # plane is shown at true resolution (not the 4x preview decimated again).
-        try:
-            self._focus_panel.set_af_fullres_crop(crop)
-        except Exception:
-            pass
-        self._maybe_save_af_crop(crop, ts_iso)
-
-    def _maybe_save_af_crop(self, crop, ts_iso: str) -> None:
-        """Debug aid: while an AF run is in progress AND 'Save focus view' is
-        checked, dump every winning-tile crop through the normal focus-capture
-        writer, so the whole hunt can be reviewed frame-by-frame afterwards (e.g.
-        'AF reached a good picture then moved away'). M4/focus-mode only, since that
-        is what ``submit_focus_capture`` gates on.
-
-        We save the GREEN sub-grid (crop[0::2, 1::2]) -- exactly the mosaic-free
-        pixels ``focus_measure_full_res`` scores -- not the raw Bayer crop. The raw
-        crop shows an RGGB 'checkerboard' in a viewer that makes focus impossible to
-        eyeball; the green sub-grid is what AF actually optimises, so the saved
-        image matches the score."""
-        if self._autofocus is None or not self._autofocus.is_running():
-            return
-        if not self._focus_panel.is_save_focus_enabled():
-            return
-        if crop is None or getattr(crop, "ndim", 0) != 2:
-            return
-        pipe = self._active_pipeline()
-        if pipe is None:
-            return
-        green = crop[0::2, 1::2].copy()  # mosaic-free green plane the metric scores
-        try:
-            when = _dt.datetime.fromisoformat(ts_iso)
-        except Exception:
-            when = None
-        pipe.submit_focus_capture(green, when=when)
-
-    def _af_score_pool(self):
-        """The pool that scores one frame's AF patches concurrently. Built on first use.
-
-        Sized to ``station_objects``, the most patches a frame can carry. A batch bigger
-        than the pool still works -- ``map`` just queues the overflow -- it only stops
-        being fully parallel. Kept alive across runs rather than built per batch: at ~4
-        frames/s the thread creation would be pure overhead on the GUI thread, which is
-        the exact thread this exists to unblock.
-        """
-        pool = getattr(self, "_af_score_pool_obj", None)
-        if pool is None:
-            import concurrent.futures as _cf
-            pool = self._af_score_pool_obj = _cf.ThreadPoolExecutor(
-                max_workers=5, thread_name_prefix="af-score")
-        return pool
-
-    def _af_full_res_score(self, _roi) -> Optional[float]:
-        """Full-res focus score for the AF winning tile: Laplacian variance of
-        the latest full-res crop pushed by the pipeline. Returns None when no
-        FRESH crop is available -- either none yet, or the emission path stalled
-        and the buffer is stale -- so the engine falls back to the always-fresh
-        decimated tap (which the sim tests prove converges) instead of scoring a
-        frozen crop and stalling at pos 0."""
-        crop = self._af_fullres_crop
-        if crop is None or self._af_fullres_seq == self._af_scored_seq:
-            self._af_stale_ct += 1
-            return None
-        self._af_scored_seq = self._af_fullres_seq
-        self._af_fresh_ct += 1
-        return af_full_res_measure(crop)
-
-    def _save_af_crops(self, keep) -> None:
-        """Dump the patches that became AF samples to the camera drive, score in the name.
-
-        ``keep`` maps each object id whose score the engine accepted to the ROI the tracker
-        holds now, or is None for the unlabelled N=2 cross-cal pair (accept all, fall back
-        to the pinned ROI). Called ONLY from the accept paths of ``_af_full_res_multi``, so
-        the folder and the observe CSV hold the same frames.
-
-        That correspondence is the whole point. Saving every cropped frame instead put
-        step-blended patches on disk carrying a score computed here and reported to nobody:
-        on 2026-09-01 six of ten OID029 crops were files the engine had refused, one of them
-        a 50/50 blend saved as OID029_y1147_s305, which read as proof the AF was scoring
-        blends when it had rejected every one.
-
-        The score alone cannot say whether a 43000 reading is a genuinely sharp patch or
-        a corrupted frame the metric was fooled by. The picture can. Sorting the folder
-        by name puts the outliers together, next to ordinary patches from the same run.
-
-        Saves the GREEN sub-grid (``crop[0::2, 1::2]``) -- exactly the pixels
-        ``focus_measure_full_res`` scores. The raw Bayer crop shows an RGGB
-        checkerboard that makes sharpness impossible to eyeball, so it would answer a
-        different question than the one being asked.
-
-        Off unless 'Save focus view' is ticked. At 3 patches x ~4 fps this is ~12
-        files/s; the writer drops rather than blocks if it cannot keep up."""
-        if not self._focus_panel.is_save_focus_enabled():
-            return
-        pending = getattr(self, "_af_crop_pending", None)
-        pipe = self._active_pipeline()
-        if pending is None or pipe is None:
-            return
-        # One save per arriving batch: a second accept without fresh crops would otherwise
-        # write the same patch twice under the next pin's name.
-        self._af_crop_pending = None
-        crops, rois, oids = pending
-        for i, crop in enumerate(crops):
-            if crop is None or getattr(crop, "ndim", 0) != 2:
-                continue
-            oid = oids[i] if i < len(oids) else None
-            if keep is not None and oid not in keep:
-                continue  # scored crop the engine did not ask for: a patch that just retired
-            score = self._af_crop_scores[i] if i < len(self._af_crop_scores) else None
-            # Where the crop actually came from. The pipeline shifts the stale pin by the
-            # travel it measures before cropping (``set_preview_rois(follow=True)``), so
-            # the pixels are aligned to the tracker's CURRENT box; naming them with the
-            # pin would report a position one frame of scene motion behind the image.
-            roi = keep.get(oid) if keep is not None else (
-                rois[i] if i < len(rois) else None)
-            # Object id, not the loop index: the index is only a position in the pinned
-            # ROI list (a preview pane) and it rebinds whenever an object retires, so
-            # sorting a folder by it interleaves unrelated patches. Falls back to the
-            # position only where the caller has no oids (the N=2 cross-cal pair).
-            #
-            # Zero-padded because the folder is sorted as TEXT: unpadded, OID10 lands next
-            # to OID1 and y762 sorts after y1093, scrambling the very sequence the folder is
-            # opened to read. y rises as an object crosses the frame, so within one object
-            # name order is also capture order -- except over a stretch where the ROI clamps
-            # at the frame edge and y repeats, where the tie falls to score instead.
-            tag = f"OID{int(oid):03d}" if oid is not None else f"POS{i:02d}"
-            if roi is not None:
-                tag += f"_y{int(roi[1]):04d}"
-            if score is not None:
-                tag += f"_s{int(round(score))}"
-            pipe.submit_focus_capture(crop[0::2, 1::2].copy(), tag=tag)
-
-    def _af_full_res_multi(self, rois, labels=None):
-        """Full-res scores for N tracked patches, all out of ONE frame.
-
-        Pins every ROI on the pipeline's preview-crop channel, which crops them all from
-        the same held full-res slot the AF tile comes from -- so the set is same-frame by
-        construction, not by several signals happening to line up. Every patch also
-        carries the identical one-frame pinning lag, which cancels in any ratio between
-        them. Returns None until a fresh batch lands, so the caller skips the sample
-        rather than mixing scores taken at different times or resolutions; with ``labels``
-        it returns one entry per requested object, None for any the lagging batch cannot
-        answer (a newborn), so one turnover no longer costs its whole batch.
-
-        Two callers: the climb's A/B cross-cal (N=2) and OBSERVE (N=observe_objects)."""
-        p = self._active_pipeline()
-        if p is None or not rois:
-            return None
-        scale = KyfgCamera.SUBSAMPLE_FACTOR
-        # Even origin: the metric scores the green plane (crop[0::2, 1::2]), so an odd
-        # origin would sample a different colour plane and shift the score.
-        full = [((int(x0) * scale) & ~1, (int(y0) * scale) & ~1,
-                 int(x1) * scale, int(y1) * scale) for x0, y0, x1, y1 in rois]
-        try:
-            # follow=True: these ROIs cannot be applied to the frame they were derived
-            # from (the pipeline had already cropped it), so the pipeline shifts them by
-            # the travel it measures on whichever frame it does crop. Without it the
-            # scored tile sits one frame of scene motion behind the tracked object --
-            # two thirds of the box on the stepped rig. src_ts names the frame these ROIs
-            # came off, so the shift covers however many frames we took to answer.
-            p.set_preview_rois(full, follow=True,
-                               src_ts=getattr(self, "_focus_frame_ts", None))
-        except Exception as exc:
-            self._log(f"AF full-res multi set_preview_rois failed: {exc}")
-            return None
-        self._af_crops_active = True
-        # What the batch arriving NOW answers -- established by the pin the pipeline named
-        # when it emitted the batch, not inferred from call order.
-        answered = list(getattr(self, "_af_crop_answered", []))
-        # Remember this pin against the frame it came off, so the batch it eventually
-        # produces can be matched back to it. Bounded: only the last few can still be
-        # in flight.
-        by_ts = getattr(self, "_af_pin_by_ts", None)
-        if by_ts is None:
-            by_ts = self._af_pin_by_ts = {}
-        by_ts[getattr(self, "_focus_frame_ts", None)] = (
-            list(labels) if labels is not None else [], list(rois))
-        if len(by_ts) > 16:
-            for k in list(by_ts)[:-8]:
-                del by_ts[k]
-        self._af_crop_rois_pinned = list(rois)
-        self._af_crop_labels_pinned = list(labels) if labels is not None else []
-        got = self._af_crop_scores
-        if not got or self._af_crop_seq == self._af_crop_scored_seq:
-            self._af_pair_stale += 1
-            return None
-        self._af_crop_scored_seq = self._af_crop_seq
-        self._af_pair_fresh += 1
-        # Marked by ``_orthosim_step``: the display was told to move during the previous
-        # frame, so this frame's exposure may have caught the panel between two scene
-        # positions. The batch is consumed (marked scored above) but not reported -- a
-        # blend halves the score, and a halved score is indistinguishable from real
-        # defocus to everything downstream.
-        if getattr(self, "_af_frame_unsettled", False):
-            self._af_unsettled_skips = getattr(self, "_af_unsettled_skips", 0) + 1
-            return None
-        if labels is None:
-            # The N=2 cross-cal pair before labels were threaded through it: nothing to
-            # match on, so the count is the only available check.
-            if len(got) != len(rois):
-                return None
-            self._save_af_crops(None)
-            return list(got)
-        if len(got) != len(answered):
-            return None
-        # Crops lag the pin by a frame, so this batch answers ``answered``, NOT ``labels``.
-        # Match by NAME rather than position: a patch retiring while another is born on the
-        # same frame leaves the count at N while shifting every member ([1,2,3] -> [2,3,4]),
-        # which handed every score to its neighbour on 13% of frames in the 145717 run.
-        #
-        # Dropping the whole batch on any mismatch fixed that and cost far too much. The
-        # objects in BOTH lists have valid, correctly-labelled crops -- cut from the previous
-        # frame like every accepted sample -- and only the newborn has none, yet all N were
-        # discarded: ~46% of frames in the 234231 run, against stale=1 in ~216 calls, so the
-        # guard was essentially the entire loss. A lookup is also strictly safer than the
-        # equality check it replaces, because crossing two objects stops being detectable
-        # and becomes impossible; reordering now resolves correctly instead of being dropped.
-        by_label = dict(zip(answered, got))
-        out = [by_label.get(lbl) for lbl in labels]
-        if any(v is None for v in out):
-            self._af_crop_identity_partial = getattr(
-                self, "_af_crop_identity_partial", 0) + 1
-        # All-None is indistinguishable from no batch at all, and callers already treat a
-        # per-object None as "no sample" (``_pair_scores`` collapses a half pair to
-        # ``(None, None)`` rather than mixing resolutions).
-        if not any(v is not None for v in out):
-            return None
-        # label -> the ROI the tracker holds NOW, which is where the shifted crop was cut.
-        self._save_af_crops({lbl: roi for lbl, roi, v in zip(labels, rois, out)
-                             if v is not None})
-        return out
-
-    @property
-    def _af_crop_rois(self) -> list:
-        """The coarse ROIs the crops arriving NOW answer.
-
-        Crops lag the pin by one frame, and the handler runs before the engine asks for
-        the next set, so the last-pinned list is the right one to label them with."""
-        return getattr(self, "_af_crop_rois_pinned", [])
-
-    def _af_full_res_pair(self, roi_a, roi_b, labels=None):
-        """The N=2 case: the cross-object cross-cal pair."""
-        got = self._af_full_res_multi([roi_a, roi_b], labels)
-        return (None, None) if got is None else (got[0], got[1])
-
-    # ── field map (M4 optical diagnostic) ────────────────────────────────
-
-    def _field_map_running(self) -> bool:
-        fm = getattr(self, "_field_map", None)
-        return fm is not None and fm.running
-
-    def _field_map_region(self, raw, scale: int):
-        """The box the field-map tiles may live in, in FULL-RES pixels.
-
-        Between the fiducials whenever OrthoSim can see them. The screen covers only
-        ~76 % of the frame HEIGHT at this magnification (~96 % of the width), so
-        tiles placed by frame fraction hang off the panel onto the room behind it —
-        metres away instead of ~3 m — and that shows up as a large vertical tilt that
-        is not a property of the optics at all. The fiducial quad is the only honest
-        boundary, and it is also roughly the region AF itself picks from, which makes
-        the two measurements comparable.
-
-        Falls back to the AF interior inset, then the whole frame.
-        """
-        h, w = raw.shape[:2]
-        box = None
-        # Detection needs only the ArUco dictionary NAME, not an armed OrthoSim
-        # decode, so fall back to the layout default rather than skipping the
-        # search when the toggle is off. (Requiring the layout object is what made
-        # the first fiducial-bounded run silently measure the whole frame.)
-        dict_name = getattr(self._ortho_layout, "aruco_dict", None) or \
-            ScreenLayout.aruco_dict
-        seen: list = []
-        try:
-            from .orthosim_decode import _to_gray_u8, detect_fiducials
-
-            src = detect_fiducials(_to_gray_u8(raw), dict_name, seen)
-            if src is not None:
-                tl, tr, br, bl = src
-                # Largest axis-aligned box inside the (mildly perspective) quad.
-                box = (max(tl[0], bl[0]), max(tl[1], tr[1]),
-                       min(tr[0], br[0]), min(bl[1], br[1]))
-                self._last_fiducial_box = (box, (h, w))
-        except Exception as exc:
-            self._log(f"Field map: fiducial detect failed: {exc}")
-        if box is None and self._last_fiducial_box is not None:
-            # A marker can drop out for a frame or two -- someone leans in, the lens
-            # is parked soft, autoexposure blinks. The screen has not moved, so the
-            # box measured earlier this session still describes it; reuse it rather
-            # than dead-ending a sweep the operator just watched succeed.
-            cached, shape = self._last_fiducial_box
-            if shape == (h, w):
-                box = cached
-                self._log(
-                    f"Field map: only {len(seen)}/4 markers visible (ids {seen}) "
-                    "-- reusing the box measured earlier this session. Valid ONLY "
-                    "if the camera and screen have not moved since."
-                )
-        if box is None:
-            if not self._af_cfg.restrict_interior:
-                # Refuse rather than measure. An unbounded sweep puts tiles on the
-                # wall behind the screen, metres away, and returns that as a huge
-                # "tilt" -- a confident wrong answer, which is worse than none.
-                self._log(
-                    f"Field map: cannot find the screen -- saw {len(seen)}/4 "
-                    f"markers (ids {seen}, dict {dict_name}). Aim the camera so "
-                    "all four are visible, or tick OrthoSim to bound tiles by the "
-                    "interior inset instead. Not sweeping."
-                )
-                return None
-            box = (0.0, 0.0, float(w), float(h))
-            self._log(
-                "Field map: no fiducials; bounding tiles by the whole frame less the "
-                "symmetric bar inset. Check the drawn tiles are all on the screen."
-            )
-        else:
-            self._log(
-                f"Field map: fiducial box = {(box[2] - box[0]) / w * 100:.0f}% x "
-                f"{(box[3] - box[1]) / h * 100:.0f}% of the frame"
-            )
-        # Keep off the optical ground-truth strip: it is bright, hard-edged and not
-        # ortho content, so it would dominate a tile's score. Trimmed from BOTH ends of
-        # BOTH axes rather than the single edge the display config names, because the
-        # display names a SCREEN edge and the optics invert: the bar is drawn at the
-        # screen's top and images at the frame's bottom, so the old one-sided trim cut
-        # the clean end and left the bar inside the box. Symmetric needs no orientation
-        # and, as ``FieldMapConfig.box_inset`` explains, is what keeps the tile cross
-        # centred so top-vs-bottom can tell a tilt from a curvature.
-        box = field_map_inset_box(box, self._field_map_cfg.box_inset)
-        return tuple(int(v * scale) for v in box)
 
     @Slot()
     def _on_af_stop_requested(self) -> None:
-        """One Stop button for whatever is currently driving the focus motor."""
-        fm = self._field_map
-        if fm is not None and fm.running:
-            fm.stop("operator")
-            return
-        if self._autofocus is not None:
-            self._autofocus.stop()
-
-    # ── observe (M4 stitch diagnostic) ───────────────────────────────────
-
-    def _on_observe_row(self, row: dict) -> None:
-        """One tracked patch, one frame. Called from the engine on the GUI thread."""
-        if self._observe_log is not None:
-            self._observe_log.write(row)
-
-    def _on_af_profile(self, row: dict) -> None:
-        """AF3's in-progress station -> the field-profile overlay. Called from the
-        engine on the GUI thread, once per frame, so it only repaints a 260x150 pane
-        and never touches the CSV (the per-object rows already go via
-        :meth:`_on_observe_row`)."""
-        self._focus_panel.field_profile_update(row)
-
-    @Slot()
-    def _on_observe_requested(self) -> None:
-        """Hold the lens still and score several tracked patches every frame.
-
-        This exists because a normal AF run cannot answer the question that is biasing
-        it. On the same frame at the same focus, a freshly acquired patch scores about
-        1.6x the one it replaced (ratio median 0.625 over 131 live samples), and
-        multiplying the climb curve by that at every seam is what collapsed it. Whether
-        the cause is where the patch sits, how old it is, or what it contains cannot be
-        separated on a forward-scrolling scene -- the patch travels at a constant rate,
-        so its age IS its height in the frame.
-
-        Holding focus fixed removes one variable; running the scene both directions
-        (OrthoSim --dir down) reverses the age/height correlation and separates the
-        rest. LET THE SCENE SCROLL: unlike the field map, the patches have to travel."""
-        if self._autofocus is None:
-            return
-        if not self._modes.is_af_mode():
-            self._log("Observe: switch to M4/M5 first.")
-            return
-        if self._autofocus.is_running() or self._field_map_running():
-            self._log("Observe: stop the running AF / field map first.")
-            return
-        if self._align_active():
-            self._log("Observe: turn Align off first -- its pattern is static, and "
-                      "these patches have to travel across a scrolling scene.")
-            return
-        if self._active_pipeline() is None or self._last_coarse_raw is None:
-            self._log("Observe: no focus frames yet; wait for the M4 preview.")
-            return
-        self._force_focus_coarse()
-        hint = self._focus_panel.af_lead_hint()  # None|top|bottom|left|right|static
-        self._autofocus.config.full_frame_target = (hint == "static")
-        lead = None if hint in (None, "static") else hint
-        cfg = getattr(self._autofocus, "_config", None)
-        offset = float(getattr(cfg, "observe_offset_counts", 0.0) or 0.0)
-        self._observe_log = ObserveLog(csv_dir=default_log_dir())
-        path = self._observe_log.open({
-            "objects": getattr(cfg, "observe_objects", "?"),
-            "offset_counts": offset,
-            "seconds": getattr(cfg, "observe_seconds", "?"),
-            "subsample": KyfgCamera.SUBSAMPLE_FACTOR,
-            "lead": hint or "auto",
-        })
-        # Full-res crops are how the patches get scored, same as the climb.
-        self._af_enable_full_res(True)
-        if self._autofocus.start_observe(lead_edge_hint=lead):
-            self._log(f"Observe: running, logging to {path or '(disabled)'}")
-        else:
-            self._af_enable_full_res(False)
-            self._observe_log.close()
-            self._observe_log = None
-
-    @Slot()
-    def _align_active(self) -> bool:
-        return bool(getattr(self, "_align_on", False))
-
-    def _on_align_toggled(self, on: bool) -> None:
-        """Start/stop the live camera-to-screen tilt readout.
-
-        Why this exists: the camera rides a platform aimed at the screen by hand, and
-        the six field maps of 2026-08-31 measured ~1.6 deg pitch / ~1.1 deg yaw between
-        sensor and panel -- 641 encoder counts of focus ramp across one frame against a
-        ~1460c depth of field, so its top and bottom cannot be sharp together. Every
-        sweep since has been measuring that. Nulling it by hand needs the number where
-        the operator's eyes already are, which is the screen, so the measurement goes
-        out to OrthoSim rather than into this app's log.
-
-        Moves no motor, but it is still exclusive with the sweeps: it needs its pattern
-        on the panel, so the ortho scene they score is gone while it runs.
-        """
-        if not on:
-            self._align_on = False
-            self._focus_panel.set_autofocus_status("idle")
-            return
-        if not self._modes.is_af_mode():
-            self._log("Align: switch to M4/M5 first.")
-            self._focus_panel.reset_align()
-            return
-        if (self._autofocus is not None and self._autofocus.is_running()) \
-                or self._field_map_running():
-            self._log("Align: stop the running AF / field map first.")
-            self._focus_panel.reset_align()
-            return
-        self._align_on = True
-        self._align_t = 0.0
-        self._align_n = 0
-        self._log("Align: measuring the screen's orientation ~2 Hz -- press A in "
-                  "OrthoSim for the pattern; the angles show up on the screen.")
-
-    def _feed_align(self, raw) -> None:
-        """Measure the panel's orientation off the alignment pattern and ship it out.
-
-        Runs on the coarse 4x tap on purpose. The precision margin is about 7x (0.02
-        deg of scatter against a 0.36 deg budget), which buys the right to skip
-        full-res emission, an SHM slot and a new pipeline signal entirely -- the frame
-        is already in hand here. Detection costs ~130 ms, so at 2 Hz the GUI thread
-        stays ~74% idle; if it ever stutters, lengthen the period rather than
-        downscaling, because coverage buys more precision than corner count does.
-        """
-        now = time.monotonic()
-        if now - getattr(self, "_align_t", 0.0) < _ALIGN_PERIOD_S:
-            return
-        self._align_t = now
-        self._align_n = getattr(self, "_align_n", 0) + 1
-        try:
-            import orthosim_codec as codec
-            from .align import coarse_intrinsics, measure
-            from .orthosim_decode import _to_gray_u8
-
-            gray = _to_gray_u8(raw)
-            p = self._active_pipeline()
-            res = measure(gray, coarse_intrinsics(
-                None if p is None else p.camera_serial, gray.shape,
-                KyfgCamera.SUBSAMPLE_FACTOR))
-        except Exception as exc:
-            self._align_on = False
-            self._focus_panel.reset_align()
-            self._log(f"Align: measurement failed, stopping: {exc}")
-            return
-        if res is None:
-            if self._align_n % 4 == 1:  # ~every 2 s
-                self._log(
-                    f"Align: not enough pattern (need {codec.ALIGN_MIN_CORNERS}+ "
-                    "corners). Is the A pattern up, and is the lens near focus?")
-            return
-        r = res.reading
-        try:
-            self._orthosim_sock().sendto(
-                codec.encode_align(r), (codec.STEP_HOST, codec.STEP_PORT))
-        except OSError:
-            pass  # display app down; the operator is watching it and will notice
-        # Mirror it locally, so a dead display or a lost datagram doesn't look like a
-        # dead measurement.
-        text = (f"align: v={r.tilt_v_deg:+.2f}\u00b0 h={r.tilt_h_deg:+.2f}\u00b0 "
-                f"({r.n_corners} corners, {res.span_v_frac * 100:.0f}x"
-                f"{res.span_h_frac * 100:.0f}% of frame, {r.distance_mm / 1000:.2f} m)")
-        self._focus_panel.set_autofocus_status(text)
-        # ...and put it in the session log every ~10 s. Only refusals were logged at
-        # first, which meant a WORKING readout left no trace at all: when the operator
-        # reported it misbehaving there was nothing to read back except silence, and
-        # silence had to be inferred to mean success. It also leaves the angles and the
-        # standoff on disk, which is what 36.14.2's acceptance table wants.
-        if self._align_n % 20 == 1:
-            self._log(text)
-
-    def _on_field_map_requested(self) -> None:
-        """Sweep the motor once while scoring five fixed tiles every frame, to measure
-        how best focus varies ACROSS the frame -- screen tilt / lens field curvature --
-        in encoder counts.
-
-        Measuring this by running AF once per region instead would compare runs that
-        each re-zero the encoder, re-seat the lash and park minutes apart; one sweep
-        gives every tile identical positions, frames and mechanical state, so what's
-        left between their vertices is optics.
-
-        Requires a FROZEN scene: the tiles are pinned to sensor pixels."""
-        if self._field_map_running():
-            return
-        if not self._modes.is_af_mode():
-            self._log("Field map: switch to M4/M5 first.")
-            return
-        if self._autofocus is not None and self._autofocus.is_running():
-            self._log("Field map: stop autofocus first -- both drive the motor.")
-            return
-        if self._align_active():
-            self._log("Field map: turn Align off first -- its pattern is on the "
-                      "screen instead of the ortho scene these tiles would score.")
-            return
-        p = self._active_pipeline()
-        raw = self._last_coarse_raw
-        if p is None or raw is None:
-            self._log("Field map: no focus frames yet; wait for the M4 preview.")
-            return
-        if not getattr(self._serial, "encoder_present", False):
-            self._log("Field map: encoder absent ($ENC=-1) -- the sweep needs it.")
-            return
-        scale = KyfgCamera.SUBSAMPLE_FACTOR
-        h, w = raw.shape[:2]
-        region = self._field_map_region(raw, scale)
-        if region is None:
-            return
-        rois = five_tile_rois(w * scale, h * scale, self._field_map_cfg, region)
-        # Draw the tiles on the coarse preview so the operator can SEE what each one
-        # is actually looking at before trusting a vertex from it.
-        self._focus_panel.set_track_rois([
-            (n, tuple(int(v / scale) for v in r))
-            for n, r in zip(FIELD_MAP_TILE_NAMES, rois)
-        ])
-        sweep = FieldMapSweep(
-            axis=EncoderAxis(
-                self._serial.focus_step,
-                lambda: self._serial.encoder_position,
-                counts_per_pulse=self._af_cfg.encoder_counts_per_pulse,
-                backlash_pulses=self._af_cfg.backlash_pulses,
-            ),
-            set_strength=self._serial.set_strength,
-            status=self._focus_panel.set_autofocus_status,
-            finished=self._on_field_map_finished,
-            config=self._field_map_cfg,
-            csv_dir=default_log_dir(),
-        )
-        # Same full-res tap AF uses; the pipeline crops all five ROIs out of the one
-        # held slot, so every tile is scored on the very same frame.
-        self._af_enable_full_res(True)
-        try:
-            p.set_preview_rois(rois)
-        except Exception as exc:
-            self._log(f"Field map: set_preview_rois failed: {exc}")
-            self._af_enable_full_res(False)
-            self._focus_panel.set_track_rois([])
-            return
-        self._field_map = sweep
-        self._focus_panel.set_autofocus_running(True)
-        self._log("Field map: sweeping -- keep the scene FROZEN until it finishes.")
-        sweep.start(rois)
-
-    def _on_field_map_finished(self, ok: bool, report: dict) -> None:
-        for line in report.get("lines", []):
-            self._log(line)
-        self._field_map = None
-        p = self._active_pipeline()
-        if p is not None:
-            try:
-                p.set_preview_rois([])
-            except Exception:
-                pass
-        self._af_enable_full_res(False)
-        self._focus_panel.set_autofocus_running(False)
-        self._focus_panel.set_autofocus_status(
-            "field map: done" if ok else "field map: stopped"
-        )
-
-    @Slot(bool)
-    def _on_csv_log_toggled(self, on: bool) -> None:
-        """Open/close the focus-telemetry CSV logger from the 'Log CSV' toggle."""
-        if on:
-            if self._focus_csv is not None:
-                return
-            self._focus_frame_ct = 0
-            self._focus_csv = FocusCsvLogger()
-            if self._focus_csv.path:
-                self._log(f"Focus CSV: logging to {self._focus_csv.path}")
-            else:
-                self._log("Focus CSV: could not open a log file (see stderr).")
-        else:
-            csv = self._focus_csv
-            self._focus_csv = None
-            if csv is not None:
-                csv.close()
-                self._log("Focus CSV: stopped.")
+        self._autofocus.stop()
 
     def _encoder_now(self) -> Optional[int]:
         """Current motor-shaft encoder count, or None if no encoder is streaming."""
@@ -5308,134 +3829,62 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _on_af_sample(self, pos_counts: int, score: float, fine: bool = False) -> None:
-        """One settled AF measurement -> both overlay graphs. The telemetry graph
-        (bottom-right) plots the read-back ABSOLUTE encoder count, falling back to the
-        engine's own position (run-relative counts) only when no encoder streams; the
-        score-vs-encoder scatter (top-right) gets the same point so it stays live
-        during an AF run, not just during the manual creep workflow."""
-        enc = self._encoder_now()
-        x = enc if enc is not None else int(pos_counts)
-        self._focus_panel.af_graph_add_sample(x, float(score), bool(fine))
-        if enc is not None:
-            self._focus_panel.focus_scatter_add_point(enc, float(score))
+    def _on_af_sample(self, enc: int, score: float, _fine: bool = False) -> None:
+        """One gated w10 frame -> both overlay graphs (the engine reports the raw
+        encoder it read at the frame)."""
+        self._focus_panel.af_graph_add_sample(int(enc), float(score))
+        self._focus_panel.focus_scatter_add_point(float(enc), float(score))
 
     def _on_af_roi_sample(self, enc: int, widths) -> None:
         """w10 AF: the five per-ROI widths of one gated frame -> the scatter's per-ROI
-        view ('ROIs' checkbox). The encoder is the engine's own (raw) reading, the same
-        frame as the pooled sample; a ROI without a w10 (NaN) draws nothing."""
+        view ('ROIs' checkbox). A ROI without a w10 (NaN) draws nothing."""
         for k, wv in enumerate(widths or ()):
             if wv == wv:
                 self._focus_panel.focus_scatter_add_point(float(enc), float(wv), roi=k)
 
-    def _emit_focus_telemetry(
-        self, score, ts_iso: Optional[str] = None, *, to_csv: bool = True
-    ) -> None:
-        """Per-frame focus telemetry: push (encoder, score) to the score-vs-encoder
-        scatter, and -- only when ``to_csv`` and CSV logging is on -- write a row.
-        The scatter is fed every call so it stays live; ``to_csv`` is False when no
-        fixed patch is locked, since the backlash CSV needs the score to track ONE
-        patch (the forward/back hysteresis IS the backlash)."""
-        if score is None:
-            return
-        enc = self._encoder_now()
-        if enc is None:
-            return  # no encoder -> the X axis is meaningless; skip
-        try:
-            self._focus_panel.focus_scatter_add_point(enc, float(score))
-        except Exception as exc:
-            self._log(f"Focus telemetry: scatter update failed: {exc}")
-        if not to_csv:
-            return
-        csv = self._focus_csv
-        if csv is not None:
-            self._focus_frame_ct += 1
-            if ts_iso is None:
-                ts_iso = _dt.datetime.now().isoformat(timespec="milliseconds")
-            try:
-                csv.write_row(ts_iso, self._focus_frame_ct, enc, float(score))
-            except Exception as exc:
-                self._log(f"Focus CSV: write failed: {exc}")
+    @Slot(float, object)
+    def _on_af_live_scored(self, enc: float, stats) -> None:
+        """A frame scored with no AF run active (manual focusing): the same w10 the AF
+        would see, on the status line and the scatter, so the operator can creep onto
+        the minimum by hand."""
+        cfg = self._autofocus.config
+        ok = stats is not None and frame_ok(stats, min_edges=cfg.min_edges, min_roi=cfg.min_roi)
+        self._focus_panel.set_live_w10(
+            int(round(enc)),
+            float(stats["w10"]) if ok else None,
+            int(stats.get("n_edges", 0)) if stats else 0,
+        )
+        if ok:
+            self._focus_panel.focus_scatter_add_point(float(enc), float(stats["w10"]))
+            for k in range(len(ROI_NAMES)):
+                wv = stats.get(f"r{k}_w10")
+                if wv is not None and wv == wv:
+                    self._focus_panel.focus_scatter_add_point(float(enc), float(wv), roi=k)
 
-    def _force_focus_coarse(self) -> None:
-        """Autofocus consumes the coarse decimated tap, so ensure Coarse view."""
-        if self._modes.focus_submode() != FocusSubMode.COARSE:
-            self._modes.set_focus_submode(FocusSubMode.COARSE)
-            self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
-            self._reset_fine_tracker()
-            self._sync_fine_focus_to_pipelines()
+    def _af_preconditions_ok(self) -> bool:
+        if not self._modes.is_af_mode():
+            self._log("Autofocus: switch to M4 (Focus) or M5 (Ground Test) mode first.")
+            return False
+        if not self._pipelines:
+            self._log("Autofocus: no cameras online.")
+            return False
+        return True
 
     @Slot()
     def _on_autofocus_requested(self) -> None:
-        if self._autofocus is None:
+        if not self._af_preconditions_ok():
             return
-        if not self._modes.is_af_mode():
-            self._log("Autofocus: switch to M4 (Focus) or M5 (Ground Test) mode first.")
-            return
-        if self._active_pipeline() is None:
+        pipe = self._active_pipeline()
+        if pipe is None:
             self._log("Autofocus: select a camera to preview first.")
             return
-        if self._align_active():
-            self._log("Autofocus: turn Align off first -- the screen is showing the "
-                      "alignment pattern, not a scene to focus on.")
-            return
-        # Grab the tile Fine was showing BEFORE _force_focus_coarse() resets the tracker:
-        # the operator locked it while sharp, so AF should focus THAT (building/gantry)
-        # rather than re-pick on the blurry frame (which favours coarse bushes).
-        seed_roi = (self._fine_tracker.roi
-                    if self._modes.focus_submode() == FocusSubMode.FINE else None)
-        self._force_focus_coarse()
-        hint = self._focus_panel.af_lead_hint()  # None|top|bottom|left|right|static
-        self._autofocus.config.full_frame_target = (hint == "static")
-        lead = None if hint in (None, "static") else hint
-        # M4 is the FLIGHT focus mode (moving scene); M5 is a BENCH simulation of flight
-        # (moving mirrors). The sweep-and-hold (v2) engine sweeps against the moving
-        # scene -- stitching per-object segments via the two-object handover into one
-        # score-vs-encoder curve -- then parks on the peak and STOPS (one-shot): the
-        # atmospheric lens it corrects is static for hours, so there is nothing to keep
-        # servoing; the operator re-triggers if focus drifts. The legacy dither servo
-        # has no such landing, so it stays continuous (picks its fast/slow profile from
-        # detected scene motion). Choose by the active algorithm, not the mode label.
-        # Named by what CANNOT land, not by what can. Written as `== "sweep_and_hold"`
-        # this silently made AF3 continuous the day it was added: it parked correctly
-        # and then sat in HOLD instead of DONE, so `_finished` never fired, the observe
-        # CSV was never closed (it flushes every 50 rows, so the tail sat in the
-        # buffer), and full-res scoring kept running. Only the legacy dither servo has
-        # no landing; every engine since parks on a measurement and stops.
-        one_shot = self._autofocus.algorithm != "legacy"
-        # Per-object rows for a REAL run too, in the same format the fixed-focus
-        # observations write. On its own an AF run cannot attribute anything -- focus
-        # and frame position move together -- but differenced against an observation
-        # at the same speed and direction, it can. Costs one small CSV per run.
-        self._observe_log = ObserveLog(csv_dir=default_log_dir())
-        self._observe_log.open({
-            "kind": "af_run",
-            "algorithm": self._autofocus.algorithm,
-            "subsample": KyfgCamera.SUBSAMPLE_FACTOR,
-            "lead": hint or "auto",
-        })
-        self._autofocus.start_single(lead_edge_hint=lead, continuous=not one_shot,
-                                     seed_roi=seed_roi)
+        self._autofocus.start_single(pipe.camera_number)
 
     @Slot()
     def _on_autofocus_all_requested(self) -> None:
-        if self._autofocus is None:
+        if not self._af_preconditions_ok():
             return
-        if not self._modes.is_af_mode():
-            self._log("Autofocus: switch to M4 (Focus) or M5 (Ground Test) mode first.")
-            return
-        cams = sorted(p.camera_number for p in self._pipelines)
-        if not cams:
-            self._log("Autofocus: no cameras online.")
-            return
-        self._force_focus_coarse()
-        hint = self._focus_panel.af_lead_hint()  # None|top|bottom|left|right|static
-        self._autofocus.config.full_frame_target = (hint == "static")
-        lead = None if hint in (None, "static") else hint
-        # Profile follows detected motion inside the engine (see _on_autofocus_requested);
-        # both M4 (flight) and M5 (bench flight-sim) use the same tracking servo.
-        # Focus each camera once (servo runs until it first locks, then advances).
-        self._autofocus.start_all(cams, lead_edge_hint=lead)
+        self._autofocus.start_all(sorted(p.camera_number for p in self._pipelines))
 
     @Slot(str)
     def _on_autofocus_status(self, text: str) -> None:
@@ -5447,76 +3896,18 @@ class MainWindow(QMainWindow):
         self._log(f"autofocus finished: ok={ok} {report}")
         if exp := self._focus_panel.exposure_summary():
             self._log(f"exposure at AF end: {exp}")
-        self._log(
-            f"af full-res usage: fresh={self._af_fresh_ct} "
-            f"stale/fallback={self._af_stale_ct}"
-        )
-        # The engine's own af2- lines only reach stdout, so mirror the one number
-        # that says whether cross-object stitching had anything to work with: a pair
-        # starved of fresh crops silently degrades every handover into a re-anchor.
-        self._log(
-            f"af cross-cal pairs: fresh={self._af_pair_fresh} "
-            f"stale={self._af_pair_stale} "
-            # Batches that could not answer every object asked for, i.e. one had just been
-            # born. Was invisible, and had to be reconstructed from gaps in the observe CSV
-            # to discover it -- not staleness -- was losing ~46% of the 234231 run.
-            f"partial={getattr(self, '_af_crop_identity_partial', 0)} "
-            # Frames skipped because the OrthoSim panel had just been stepped. Should be
-            # roughly half of `fresh` on the stepped rig; near zero means the alternation
-            # never ran (frozen scene, or no display attached).
-            f"unsettled={getattr(self, '_af_unsettled_skips', 0)}"
-        )
-        if self._observe_log is not None:
-            self._log(f"observe: {self._observe_log.rows} rows -> "
-                      f"{self._observe_log.path or '(not recorded)'}")
-            self._observe_log.close()
-            self._observe_log = None
-        self._af_fresh_ct = 0
-        self._af_stale_ct = 0
-        self._af_pair_fresh = 0
-        self._af_pair_stale = 0
-        self._af_crop_identity_partial = 0
-        self._af_unsettled_skips = 0
 
     @Slot(bool)
     def _on_autofocus_run_state(self, running: bool) -> None:
         self._focus_panel.set_autofocus_running(running)
         self._focus_panel.set_controls_locked(running)
         if running:
-            self._focus_panel.af_graph_clear()  # fresh trace per run
-            self._focus_panel.focus_scatter_clear()  # score-vs-encoder starts anew per AF run
-            # AF3's station pane stays hidden unless this run actually publishes one.
-            self._focus_panel.field_profile_clear()
-            # AF3's entire result IS the per-object rows -- the station D values are
-            # derived from them -- so an unlogged run cannot be analysed afterwards.
-            # OBSERVE opens its own log before it starts, so only take over when
-            # nothing else owns one.
-            if (getattr(self._autofocus, "_algorithm", "") == "field_profile"
-                    and self._observe_log is None):
-                cfg = getattr(self._autofocus, "_config", None)
-                self._observe_log = ObserveLog(csv_dir=default_log_dir())
-                self._af3_log_owned = True
-                path = self._observe_log.open({
-                    "mode": "af3",
-                    "objects": getattr(cfg, "station_objects", "?"),
-                    "station_step_pulses": getattr(cfg, "station_step_pulses", "?"),
-                    "station_min_traverses": getattr(cfg, "station_min_traverses", "?"),
-                    "sweep_counts": getattr(cfg, "sweep_counts", "?"),
-                    "park_bias_counts": getattr(cfg, "park_bias_counts", "?"),
-                    "subsample": KyfgCamera.SUBSAMPLE_FACTOR,
-                })
-                # Same full-res tap OBSERVE uses. Explicit rather than relying on the
-                # ACQUIRE path having already pinned an ROI.
-                self._af_enable_full_res(True)
-                self._log(f"AF3: station walk, logging to {path or '(disabled)'}")
-        if not running:
+            self._focus_panel.af_graph_clear()       # fresh trace per run
+            self._focus_panel.focus_scatter_clear()  # score-vs-encoder starts anew per run
+        else:
             # Run finished (or aborted): drop back to preview-only emission and
-            # clear the pinned ROI / stale full-res crop.
+            # release the pinned ROIs.
             self._af_enable_full_res(False)
-            if getattr(self, "_af3_log_owned", False):
-                self._observe_log.close()
-                self._observe_log = None
-                self._af3_log_owned = False
 
     def _active_pipeline(self) -> Optional[CameraPipeline]:
         """Return the pipeline whose preview radio is currently on, if any.
@@ -5532,14 +3923,6 @@ class MainWindow(QMainWindow):
                 if p.camera_number == row.camera_number:
                     return p
         return None
-
-    def _update_focus_panel_target(self) -> None:
-        """Make the focus panel save crops only for the active camera and
-        only while in M4."""
-        if self._modes.is_focus_mode():
-            self._focus_panel.set_active_pipeline(self._active_pipeline())
-        else:
-            self._focus_panel.set_active_pipeline(None)
 
     @Slot(object, str)
     def _on_raw_focus_frame_slot(self, raw, ts_iso: str) -> None:
@@ -5575,42 +3958,6 @@ class MainWindow(QMainWindow):
             return
         self._on_raw_focus_frame(pipeline, raw, ts_iso)
 
-    @Slot(object, object)
-    def _on_raw_focus_tile_rgb_slot(self, rgb, meta: dict) -> None:
-        acq = self.sender()
-        pipeline = next(
-            (p for p in self._pipelines if p.acq is acq),
-            None,
-        )
-        if pipeline is None:
-            return
-        self._on_raw_focus_tile_rgb(pipeline, rgb, meta)
-
-    def _on_raw_focus_tile_rgb(
-        self,
-        pipeline: CameraPipeline,
-        rgb,
-        meta: dict,
-    ) -> None:
-        if not self._modes.is_af_mode():
-            return
-        active = self._active_pipeline()
-        if active is None or active.camera_number != pipeline.camera_number:
-            return
-        if self._modes.focus_submode() != FocusSubMode.FINE:
-            return
-        # Remember the tile the operator sees so "Lock tile" can pin exactly it
-        # (the acquisition auto-picks a new best tile each frame otherwise).
-        self._last_fine_tile_roi = meta.get("tile_roi")
-        self._focus_panel.receive_fine_tile_rgb(rgb, meta)
-        # Score-vs-encoder scatter is ALWAYS live in Fine (per-frame best tile),
-        # so it populates without a locked tile. CSV logging stays gated on a lock:
-        # the backlash log needs the score to track ONE fixed patch (not the
-        # per-frame auto-pick) so the forward/back hysteresis IS the backlash.
-        self._emit_focus_telemetry(
-            meta.get("best_score"),
-            to_csv=self._locked_fine_roi is not None,
-        )
 
     @Slot(str)
     def _on_pipeline_failed_slot(self, msg: str) -> None:
@@ -5626,10 +3973,6 @@ class MainWindow(QMainWindow):
         AND we're in M4. The other pipelines' tap stays disabled while
         their preview radios are off, but this guard makes it safe even if
         they were ever toggled on simultaneously."""
-        # Which frame everything computed downstream (tracking, ROIs) is derived from.
-        # Handed back with the pin so the acq thread can charge the travel since exactly
-        # this frame rather than assuming we answered within one.
-        self._focus_frame_ts = ts_iso
         # Diagnostic: surface why frames may or may not be reaching the
         # focus panel from M4. Cheap (1-line bumps + occasional log);
         # gated on focus mode so it doesn't spam in M0/M1.
@@ -5652,36 +3995,6 @@ class MainWindow(QMainWindow):
                     f"{self._raw_focus_drops_wrong_cam}); ignored"
                 )
             return
-        # Optional two-object tools: independent of AF and of the coarse/fine submode,
-        # fed from the raw coarse frame up front. Mutually exclusive so the shared
-        # tracker only advances once per frame -- the green-box overlay (main preview)
-        # takes priority over the split-screen crop preview.
-        self._last_coarse_raw = raw
-        if self._field_map_running() or self._af_crops_active:
-            # The sweep (or an AF climb's cross-cal pair) has pinned its own ROIs on
-            # the pipeline; letting the tracker repoint them mid-run would move the
-            # patches being measured.
-            pass
-        elif self._focus_panel.track_active():
-            self._feed_dual_track(raw)
-        elif self._focus_panel.preview_active():
-            self._feed_dual_preview(raw)
-        # OrthoSim bench rig: decode the on-screen optical ground-truth bar (throttled
-        # inside). Independent of AF and submode; log + overlay only.
-        if self._focus_panel.orthosim_active():
-            self._feed_orthosim(raw)
-        # Screen-tilt readout (throttled inside). Also log + send only, no motor.
-        if self._align_active():
-            self._feed_align(raw)
-        # ...and step the display's scene on. Ungated: the rig is stepped, never
-        # scrolled, so there is no mode in which we want the panel moving under an
-        # exposure. Sent from here because this is the earliest once-per-frame point
-        # already filtered to the ACTIVE camera -- on ``frame_acquired`` a two-camera
-        # rig would step the scene twice per frame.
-        self._orthosim_step()
-        if self._modes.focus_submode() == FocusSubMode.FINE:
-            self._update_fine_leading_edge(active, raw)
-            return
         self._raw_focus_forwarded += 1
         if self._raw_focus_forwarded == 1 or (
             self._raw_focus_forwarded % 16 == 0
@@ -5702,17 +4015,6 @@ class MainWindow(QMainWindow):
                 f"(cam{pipeline.camera_number}){fps}"
             )
         self._focus_panel.receive_raw_frame(raw, ts_iso)
-        # Feed the autofocus engine the coarse decimated frame for the active
-        # camera (tracking + sharpness hill-climb run off this tap).
-        af = getattr(self, "_autofocus", None)
-        af_running = af is not None and af.is_running()
-        if af_running:
-            af.feed_frame(raw)
-        else:
-            # Manual-backlash telemetry in Coarse view: score the pinned full-res
-            # crop (present only when a locked ROI persists into Coarse). Skipped
-            # during an AF run so we don't consume the crop the engine scores off.
-            self._emit_focus_telemetry(self._af_full_res_score(None), ts_iso)
 
     @Slot(QImage)
     def _on_preview_ready(self, qimg: QImage) -> None:
@@ -5778,7 +4080,7 @@ class MainWindow(QMainWindow):
             in_focus = self._modes.is_focus_mode()
             for p in self._pipelines:
                 p.set_preview(True)
-                p.set_focus_tap(False)
+                self._set_focus_tap(p, False)
                 try:
                     p.set_preview_max_edge(edge)
                 except Exception:
@@ -6044,14 +4346,6 @@ class MainWindow(QMainWindow):
         Keeps ``set_full_res_emission`` before ``ModeController.set_mode`` so
         AcquisitionThread doesn't classify in-flight frames as spurious drops.
         """
-        for p in self._pipelines:
-            try:
-                p.set_fine_focus(False)
-            except Exception as exc:
-                self._log(
-                    f"cam{p.camera_number}: set_fine_focus(False) failed: {exc}"
-                )
-
         wants_full_res = mode in (Mode.M0, Mode.M1, Mode.M6)
         for p in self._pipelines:
             try:
@@ -6085,16 +4379,6 @@ class MainWindow(QMainWindow):
         af = getattr(self, "_autofocus", None)
         if af is not None and af.is_running():
             af.stop("mode changed")
-
-        if mode in (Mode.M4, Mode.M5):
-            self._modes.set_focus_submode(FocusSubMode.COARSE)
-            self._focus_panel.sync_focus_submode_toggle(FocusSubMode.COARSE)
-            self._reset_fine_tracker()
-        else:
-            self._reset_fine_tracker()
-        self._dual_tracker.reset()
-        if mode not in (Mode.M4, Mode.M5):
-            self._set_preview_full_res(False)
 
         for p in self._pipelines:
             p.sweep.reset()
@@ -6138,19 +4422,15 @@ class MainWindow(QMainWindow):
                 None,
             )
             preview_on = bool(row and row.preview_radio.isChecked())
-            p.set_focus_tap(in_focus and preview_on)
+            self._set_focus_tap(p, in_focus and preview_on)
 
         self._view_stack.setCurrentIndex(1 if in_focus else 0)
         self._apply_m4_layout(in_focus)
         self._sync_preview_sensor_fields()
-        self._update_focus_panel_target()
         active = self._active_pipeline()
         self._focus_panel.set_active_camera(
             active.camera_number if active is not None else None
         )
-
-        if in_focus:
-            self._sync_fine_focus_to_pipelines()
 
         if in_focus and self._serial.connected:
             if active is not None:
@@ -6192,23 +4472,17 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt naming
         self._log("Shutting down…")
         self._clear_deferred_mode_schedule()
-        # Before anything touches the hardware. The pool is idle by construction (its
-        # only caller blocks on the results), so this returns at once -- but its threads
-        # are non-daemon, and leaving them to the interpreter's atexit hook would put an
-        # unjoined thread behind the grabber teardown that must not be interrupted.
-        pool = getattr(self, "_af_score_pool_obj", None)
-        if pool is not None:
-            self._af_score_pool_obj = None
-            pool.shutdown(wait=True)
-        # Same reason: the live w10 thread is non-daemon; detach it from the pipelines first so no
-        # new offer lands while it drains (at most one ~150 ms score).
+        self._preflight.cancel()   # before the drain loop below can tick it into a dialog
+        # Before anything touches the hardware: the live w10 thread and the AF engine's
+        # scorer thread are non-daemon; leaving them to the interpreter's atexit hook
+        # would put an unjoined thread behind the grabber teardown that must not be
+        # interrupted. Detach the live scorer from the pipelines first so no new offer
+        # lands while it drains (at most one ~150 ms score).
         for p in self._pipelines:
             p.acq.set_w10_live(None)
         self._w10_live.shutdown()
-        # And the w10 AF engine's scorer thread (same one-score drain), if that engine is selected.
-        af_engine = getattr(getattr(self, "_autofocus", None), "_engine", None)
-        if hasattr(af_engine, "shutdown"):
-            af_engine.shutdown()
+        if self._autofocus is not None:
+            self._autofocus.shutdown()
         if self._pending_end_line_timer is not None:
             self._pending_end_line_timer.stop()
             self._pending_end_line_timer.deleteLater()
@@ -6221,10 +4495,6 @@ class MainWindow(QMainWindow):
         # even when our local mode tracker says we're already in M0
         # -- it's idempotent on the PCB side and protects us if the
         # local state ever drifted from the hardware.
-        # Hand the trigger back before anything else. triggerExternal lives on the PCB
-        # and survives this process, so exiting with it set would leave M4 disarmed for
-        # whoever runs next -- a rig that takes no pictures and gives no reason why.
-        self._ls_stop("app shutting down")
         if self._serial.connected:
             try:
                 self._serial.send_mode(0)
@@ -6255,10 +4525,6 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             time.sleep(0.05)
 
-        try:
-            self._focus_panel.shutdown()
-        except Exception:
-            pass
         # If the user closes the window while bring-up is still running,
         # wait for the worker to finish so we don't double-destroy IAs.
         if self._bringup_worker is not None and self._bringup_worker.isRunning():
@@ -6280,13 +4546,6 @@ class MainWindow(QMainWindow):
         try:
             if self._gps_receiver.connected:
                 self._gps_receiver.disconnect_port()
-        except Exception:
-            pass
-        # Close the focus-telemetry CSV if it's still open (Log CSV left on).
-        try:
-            if self._focus_csv is not None:
-                self._focus_csv.close()
-                self._focus_csv = None
         except Exception:
             pass
         # Flush + footer the human-readable session log last so it
@@ -6328,6 +4587,11 @@ def main() -> int:
         "--log-level", default="INFO", help="Python logging level (DEBUG/INFO/WARNING)",
     )
     parser.add_argument(
+        "--demo", action="store_true",
+        help="No hardware: simulated cameras (focus-dependent ROI blur) and a simulated "
+             "ClearCore (acks, banners, encoders, motors). No GPS.",
+    )
+    parser.add_argument(
         "--screen", type=int, default=None,
         help="Monitor index to place the window on (QApplication.screens() order).",
     )
@@ -6339,7 +4603,7 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    cti = args.cti or find_cti_from_env()
+    cti = args.cti or find_cti_from_env() or ("<demo>" if args.demo else None)
     if not cti:
         print(
             "ERROR: no GenTL producer (.cti) found.\n"
@@ -6353,6 +4617,7 @@ def main() -> int:
         cti_path=cti,
         clearcore_port=args.port,
         gps_port=args.gps_port,
+        demo=args.demo,
     )
     win.show()
     if args.screen is not None:

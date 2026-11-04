@@ -10,9 +10,8 @@ so it always knows the commanded mode. Per the operator's spec:
   The host sets ``m3_collecting`` when the operator presses Start line and
   clears it on End line (after the in-progress sweep finishes).
 * M4 is the *focus* mode -- frames are previewed and not written by default.
-  Two separate opt-ins exist. "Save focus view" writes best-tile focus crops
-  as TIFFs, independent of this gate. "Record" sets ``m4_recording`` and does
-  go through this gate, writing full ``.bay14line`` containers exactly as a
+  The one opt-in is "Record": it sets ``m4_recording`` and does go through
+  this gate, writing full ``.bay14line`` containers exactly as a
   recording mode would -- that is how a focus bracket gets captured for
   ground analysis, since every frame's chunk JSON carries the lens encoder
   count. It is a manual arm (unlike M0/M1) because M4 is where the operator
@@ -75,13 +74,6 @@ def mode_display_label(mode: Mode) -> str:
     return MODE_BUTTON_LABELS.get(mode, mode.name)
 
 
-class FocusSubMode(Enum):
-    """M4 preview detail: decimated coarse tile vs full-res fine tile."""
-
-    COARSE = "coarse"
-    FINE = "fine"
-
-
 _RECORDING_MODES = frozenset({Mode.M0, Mode.M1, Mode.M6})
 
 
@@ -91,7 +83,6 @@ class ModeController:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._mode = Mode.UNKNOWN
-        self._focus_submode = FocusSubMode.COARSE
         self._m3_collecting = False
         self._m4_recording = False
 
@@ -161,11 +152,3 @@ class ModeController:
         """
         with self._lock:
             return self._mode in (Mode.M4, Mode.M5)
-
-    def focus_submode(self) -> FocusSubMode:
-        with self._lock:
-            return self._focus_submode
-
-    def set_focus_submode(self, sub: FocusSubMode) -> None:
-        with self._lock:
-            self._focus_submode = sub
