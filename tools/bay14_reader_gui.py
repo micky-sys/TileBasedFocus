@@ -132,6 +132,15 @@ def rewrite_export_stem(line_stem: str) -> str:
     )
 
 
+def export_file_name(
+    line_path: Path, sweep: int, frame_in_sweep: int, extension: str,
+) -> str:
+    """File name (no folder) an exported frame gets, e.g.
+    ``Cam2439007_20260525_Proj_144545_L13_S1_F1.tif``."""
+    stem = rewrite_export_stem(line_path.stem)
+    return f"{stem}_S{sweep}_F{frame_in_sweep}.{extension}"
+
+
 def build_export_path(
     out_dir: Path,
     cam_label: str,
@@ -139,11 +148,10 @@ def build_export_path(
     merged_meta: dict,
     extension: str,
 ) -> Path:
-    stem = rewrite_export_stem(line_path.stem)
-    sweep = merged_meta["sweep"]
-    fin = merged_meta["frame_in_sweep"]
     safe_label = cam_label.replace("/", "_").replace("\\", "_")
-    name = f"{stem}_S{sweep}_F{fin}.{extension}"
+    name = export_file_name(
+        line_path, merged_meta["sweep"], merged_meta["frame_in_sweep"], extension,
+    )
     return out_dir / safe_label / name
 
 

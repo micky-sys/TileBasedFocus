@@ -25,6 +25,7 @@ attitude are injected into the in-memory metadata at export time only.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
 import sys
@@ -477,6 +478,50 @@ def compute_attitude(
                 stats.with_heading += 1
                 rec.attitude_status = "ok"
     return stats
+
+
+# ─── Metadata-only CSV ───────────────────────────────────────────────────────
+
+CSV_FIELDS = (
+    "image", "timestamp_utc", "latitude_deg", "longitude_deg", "altitude_m",
+    "yaw_deg", "pitch_deg", "roll_deg",
+)
+
+
+def write_frame_csv(
+    store: FrameStore,
+    out_path: Path,
+    image_name: Callable[[FrameRecord], str],
+) -> int:
+    """Write one CSV row per frame in *store* -- no pixels are decoded.
+
+    *image_name* maps a record to the file name the image export would
+    have produced, so the CSV lines up with a later (or earlier) image
+    export of the same folders. Frames without a fix / attitude get empty
+    cells rather than being dropped, so every image has a row. Returns the
+    number of rows written.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    recs = sorted(
+        store.records, key=lambda r: (r.cam_index, r.line, r.hhmmss, r.slot),
+    )
+    # utf-8-sig + newline="" so Excel on Windows opens it cleanly (same
+    # recipe as sbf_geotag_exports.write_correlation_csv).
+    with out_path.open("w", encoding="utf-8-sig", newline="") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(CSV_FIELDS)
+        for r in recs:
+            writer.writerow([
+                image_name(r), r.timestamp_utc or "",
+                _fmt(r.lat_deg, 8), _fmt(r.lon_deg, 8), _fmt(r.altitude_m, 3),
+                _fmt(r.yaw_deg, 3), _fmt(r.pitch_deg, 3), _fmt(r.roll_deg, 3),
+            ])
+    return len(recs)
+
+
+def _fmt(value: Optional[float], decimals: int) -> str:
+    return "" if value is None else f"{value:.{decimals}f}"
 
 
 # ─── small helpers ───────────────────────────────────────────────────────────

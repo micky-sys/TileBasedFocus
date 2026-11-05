@@ -19,6 +19,8 @@ A single PySide6 desktop app that merges the old **GPS Correlator** and
 5. Pick an output folder + format (JPEG / raw-Bayer TIFF / demosaiced-RGB
    TIFF, like Bay14Reader) and hit **Export**. Every exported image gets
    GPS coordinates and (if computed) Yaw/Pitch/Roll written into its EXIF.
+   Tick **Metadata CSV only** to skip the images and write just a
+   per-frame CSV (image name, timestamp, lat/lon/alt, Yaw/Pitch/Roll).
 
 The source ``.bay14line`` files are never modified.
 
@@ -87,6 +89,7 @@ from bay14_export_core import (  # noqa: E402
 )
 from bay14_reader_gui import (  # noqa: E402
     build_export_path,
+    export_file_name,
     normalize_fs_path,
     resolve_cam_label,
 )
@@ -104,8 +107,12 @@ from gps_export_studio_core import (  # noqa: E402
     kind_is_oblique,
     load_embedded_camera,
     load_external_camera,
+    write_frame_csv,
 )
 log = logging.getLogger("gps_export_studio")
+
+# Name of the metadata-only CSV written into the output folder.
+CSV_ONLY_NAME = "frame_metadata.csv"
 
 # Low-res ("_S") export width, in pixels. The full frame is ~13400 px wide;
 # the low-res copy keeps the aspect ratio and is written to a sibling
@@ -644,6 +651,18 @@ class StudioWindow(QMainWindow):
         )
         form.addRow("", self._low_res_cb)
 
+        self._csv_only_cb = QCheckBox(
+            f"Metadata CSV only (no images; writes '{CSV_ONLY_NAME}')"
+        )
+        self._csv_only_cb.setToolTip(
+            "Skip the image export and write one CSV row per frame: image "
+            "name, timestamp, latitude/longitude/altitude and Yaw/Pitch/Roll. "
+            "Image names use the selected format's extension. Requires "
+            "'Load / Correlate' (and 'Add Attitude' for the attitude columns)."
+        )
+        self._csv_only_cb.toggled.connect(self._update_format_controls)
+        form.addRow("", self._csv_only_cb)
+
         self._format_group.buttonClicked.connect(self._update_format_controls)
         self._update_format_controls()
         return group
@@ -724,10 +743,14 @@ class StudioWindow(QMainWindow):
     @Slot()
     def _update_format_controls(self) -> None:
         tiff = self._fmt_tiff.isChecked()
-        self._tiff_raw.setEnabled(tiff)
-        self._tiff_rgb.setEnabled(tiff)
-        self._quality_slider.setEnabled(not tiff)
-        self._quality_lab.setEnabled(not tiff)
+        images = not self._csv_only_cb.isChecked()
+        # Format radios stay live in CSV-only mode: they pick the extension
+        # the CSV's image names carry. Pixel-only knobs go grey.
+        self._tiff_raw.setEnabled(tiff and images)
+        self._tiff_rgb.setEnabled(tiff and images)
+        self._quality_slider.setEnabled(not tiff and images)
+        self._quality_lab.setEnabled(not tiff and images)
+        self._low_res_cb.setEnabled(images)
 
     # ── Load / Correlate ──────────────────────────────────────────────────
 
@@ -842,6 +865,9 @@ class StudioWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Output folder", str(exc))
             return
+        if self._csv_only_cb.isChecked():
+            self._export_csv_only(out_dir)
+            return
         if self._store is None:
             choice = QMessageBox.question(
                 self, "No coordinates loaded",
@@ -872,6 +898,36 @@ class StudioWindow(QMainWindow):
         self._export_worker.failed.connect(self._on_export_failed)
         self._export_worker.finished_ok.connect(self._on_export_done)
         self._export_worker.start()
+
+    def _export_csv_only(self, out_dir: Path) -> None:
+        """Write the per-frame metadata CSV from the loaded store, no pixels.
+
+        Runs on the GUI thread: the records are already in memory, so even
+        a full flight is a few thousand rows and finishes instantly.
+        """
+        if self._store is None:
+            QMessageBox.warning(
+                self, "Nothing loaded",
+                "Run 'Load / Correlate' first -- the CSV is built from the "
+                "loaded frames.",
+            )
+            return
+        ext = "jpg" if self._export_kind() == "jpeg" else "tif"
+        out_path = out_dir / CSV_ONLY_NAME
+        try:
+            n = write_frame_csv(
+                self._store, out_path,
+                lambda r: export_file_name(r.line_path, r.sweep, r.frame_in_sweep, ext),
+            )
+        except OSError as exc:
+            log.exception("csv export failed")
+            self._append_log(f"ERROR: {exc}")
+            QMessageBox.critical(self, "CSV export failed", str(exc))
+            return
+        if not self._attitude_done:
+            self._append_log("Note: attitude not computed -- Yaw/Pitch/Roll columns are empty.")
+        self._append_log(f"Wrote {n} row(s) -> {out_path}")
+        self.statusBar().showMessage(f"CSV written: {out_path}")
 
     @Slot()
     def _on_cancel(self) -> None:
