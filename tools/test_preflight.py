@@ -11,8 +11,10 @@ Run: ``py -3 tools/test_preflight.py``
 """
 from __future__ import annotations
 
+import inspect
 import math
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host"))
@@ -28,13 +30,13 @@ _app = QCoreApplication.instance() or QCoreApplication([])
 class FakeRig:
     FRAMES_PER_SWEEP = 40
 
-    def __init__(self, cams=(1, 2, 3), *, dead=(), dead_after_recovery=(), stall=None,
+    def __init__(self, cams=(1, 2, 3), *, dead=(), dead_after_recovery=(), stops=None,
                  gps=True, ack=True, fault_on_mode=None, cpp=850.0):
         self.t = 0.0
         self.cams = list(cams)
         self.alive = {c: c not in dead for c in cams}
         self.dead_after_recovery = set(dead_after_recovery)
-        self.stall = stall or {}            # cam -> counts of '+' travel after which the motor jams
+        self.stops = stops or {}            # cam -> (counts of travel available '-' from start, '+' from start)
         self.gps = gps
         self.ack = ack
         self.fault_on_mode = fault_on_mode  # mode number whose homing prints a fault line
@@ -55,6 +57,7 @@ class FakeRig:
         self.gps_matched = {c: 0 for c in cams}
         self.pending = []           # (due_t, callable)
         self.calls = []             # hook call log
+        self.logged = []            # what the runner wrote to the log
         self.sweeps = 0
         self.recoveries = 0
         self.rotated = 0
@@ -138,12 +141,16 @@ class FakeRig:
         assert self.mode == 4
         cam = self.selected
         self.calls.append(("pulse", cam, sym, n))
-        direction = (1.0 if sym == "+" else -1.0) * self.polarity[cam]
-        travel = abs(self.enc[cam] - self.start_enc[cam])
-        if sym == "+" and cam in self.stall and travel >= self.stall[cam]:
-            return   # jammed: nothing moves
         step = self.cpp_by_strength[self.strength]
-        self.later(0.3, lambda: self.enc.__setitem__(cam, self.enc[cam] + direction * step * n))
+        # Work in travel along the '+' direction so an end stop is a fixed position, not a
+        # distance from start: backing off has to actually buy room back.
+        u = (self.enc[cam] - self.start_enc[cam]) * self.polarity[cam]
+        u += (1.0 if sym == "+" else -1.0) * step * n
+        room = self.stops.get(cam)
+        if room is not None:
+            u = max(-room[0], min(room[1], u))   # (counts available '-' from start, '+' from start)
+        self.later(0.3, lambda v=u: self.enc.__setitem__(
+            cam, self.start_enc[cam] + v * self.polarity[cam]))
 
     def encoder_position(self, cam):
         return self.enc[cam]
@@ -192,7 +199,8 @@ class FakeRig:
             frame_counts=self.frame_counts, frames_delivered=lambda c: self.delivered[c],
             gps_connected=lambda: self.gps, gps_stats=self.gps_stats,
             recording_prerequisites_missing=lambda: [], recover_cameras=self.recover_cameras,
-            rotate_lines=self.rotate_lines, log=lambda m: None,
+            rotate_lines=self.rotate_lines, camera_serial=lambda c: f"243900{9 - c}",
+            log=self.logged.append,
         )
         h.update(over)
         return PreflightHooks(**h)
@@ -213,6 +221,18 @@ def first_fail(res):
     return next(r for r in res if not r.ok)
 
 
+def worst_burst(rig):
+    """Largest |counts| any single burst asked the encoder to track, replaying the call log at
+    the strength in force at the time -- what MOTOR_MAX_MOVE_COUNTS exists to bound."""
+    s, worst = None, 0.0
+    for c in rig.calls:
+        if c[0] == "strength":
+            s = c[1]
+        elif c[0] == "pulse" and s is not None:
+            worst = max(worst, abs(rig.cpp_by_strength[s] * c[3]))
+    return worst
+
+
 def test_healthy_rig_passes_and_ends_in_m0_with_fresh_lines():
     rig = make()
     ok, res = rig.run()
@@ -221,7 +241,8 @@ def test_healthy_rig_passes_and_ends_in_m0_with_fresh_lines():
     assert rig.calls[0] == ("mode", 4) and ("mode", 0) in rig.calls
     assert rig.calls.index(("mode", 0)) > max(i for i, c in enumerate(rig.calls) if c[0] == "pulse"), "motors before the sweep"
     assert rig.sweeps == 1 and rig.recoveries == 0 and rig.rotated == 1
-    n_cal = len(pf.CAL_STRENGTHS) * pf.CAL_REPEATS
+    # Per strength and direction: half the probe bursts, then CAL_REPEATS measured ones.
+    n_cal = len(pf.CAL_STRENGTHS) * (pf.CAL_PROBE_BURSTS // 2 + pf.CAL_REPEATS)
     for c in rig.cams:
         plus = [x for x in rig.calls if x[:3] == ("pulse", c, "+")]
         minus = [x for x in rig.calls if x[:3] == ("pulse", c, "-")]
@@ -236,14 +257,42 @@ def test_healthy_rig_passes_and_ends_in_m0_with_fresh_lines():
 
 
 def test_obstructed_motor_fails_that_camera_and_never_sweeps():
-    rig = make(stall={2: 3000})
+    """Wedged: no room either way, so the back-off cannot buy any and it really is a fault."""
+    rig = make(stops={2: (0, 0)})
     ok, res = rig.run()
     assert not ok
     f = first_fail(res)
     assert f.name == "Focus motor cam2" and "did not move" in f.detail, f.line()
+    assert "will not move on '-' either" in f.detail, f.line()
     assert rig.sweeps == 0 and "Focus motor cam1" in names(res) and "Focus motor cam3" not in names(res)
     assert rig.runner.motor_polarity == {1: rig.polarity[1]}, "only the motor that passed is noted"
     assert list(rig.runner.motor_cpp) == [1]
+
+
+def test_a_lens_parked_at_the_end_stop_is_backed_off_and_passes():
+    """cam2 on 2026-11-05: ~5600 c of '+' room left and plenty behind it. Running out of travel
+    is where the operator parked the lens, not a fault -- back off and redo the leg."""
+    rig = make(stops={2: (20000, 5600)})
+    ok, res = rig.run()
+    assert ok, [r.line() for r in res]
+    detail = next(r for r in res if r.name == "Focus motor cam2").detail
+    assert "backed off" in detail, detail
+    assert rig.sweeps == 1, "the sweep still runs once the motor checks out"
+    assert 2 in rig.runner.motor_cpp and rig.runner.motor_polarity[2] == rig.polarity[2]
+    # The retry has to have been driven from further back than the stop it hit.
+    assert any(c[:3] == ("pulse", 2, "-") for c in rig.calls)
+
+
+def test_travel_shorter_than_the_check_needs_fails_with_the_span():
+    """Room in both directions, but 9600 c of it in total -- the check drives 10000."""
+    rig = make(stops={2: (4000, 5600)})
+    ok, res = rig.run()
+    assert not ok
+    f = first_fail(res)
+    # 5600 c of '+' room plus 4000 c behind it: the back-off measures the span as it goes.
+    assert f.name == "Focus motor cam2", f.line()
+    assert "usable travel is only ~9600 c" in f.detail, f.line()
+    assert rig.sweeps == 0
 
 
 def test_motor_dead_at_fine_strength_fails_calibration():
@@ -254,6 +303,42 @@ def test_motor_dead_at_fine_strength_fails_calibration():
     f = first_fail(res)
     assert f.name == "Focus calibration cam1" and "S0" in f.detail and "does not move" in f.detail, f.line()
     assert rig.sweeps == 0 and 1 in rig.runner.motor_polarity and 1 not in rig.runner.motor_cpp
+
+
+def test_bursts_stay_under_the_unwrap_cap_on_a_motor_no_table_predicted():
+    """2026-11-05 cam1: S1 ran ~330 c/pulse, peaking at 371, where the retired nominal table
+    said 80. That sized a 5-pulse burst, which read 1854 c and failed a healthy motor on the
+    unwrap guard. Sizing each burst from a probe of THIS motor keeps them all inside it."""
+    rig = make()
+    rig.cpp_by_strength = {3: 876.0, 2: 526.0, 1: 371.0, 0: 45.0}
+    ok, res = rig.run()
+    assert ok, [r.line() for r in res]
+    assert worst_burst(rig) <= pf.MOTOR_MAX_MOVE_COUNTS, worst_burst(rig)
+    for c in rig.cams:
+        assert rig.runner.motor_cpp[c] == rig.cpp_by_strength, rig.runner.motor_cpp[c]
+
+
+def test_gps_counters_are_read_by_camera_number_not_serial():
+    """GpsCorrelator counts per camera SERIAL. Read under an app camera number every counter
+    reads zero, so the check failed all three cameras on 2026-11-05 while the files on disk had
+    13/13 frames tagged. int("2439008") is a valid int, so nothing raised to give it away."""
+    raw = {"cameras": {"2439008": {"matched": 13}, "2439007": {"matched": 13}}}
+    serial_by_cam = {1: "2439008", 2: "2439007", 3: "2439006"}
+    assert pf._gps_per_cam(raw).get(1) is None, "the bug: camera 1's counters are filed under 2439008"
+    keyed = pf._gps_per_cam(pf.gps_stats_by_camera(raw, serial_by_cam))
+    assert keyed == {1: {"matched": 13}, 2: {"matched": 13}}, keyed
+
+
+def test_a_motor_finer_than_the_encoder_noise_is_still_calibrated():
+    """One pulse at 8 c reads as 'did not move', so the probe has to grow the burst until the
+    encoder can see it -- with no table left to tell it how far to grow."""
+    rig = make()
+    rig.cpp_by_strength[0] = 8.0
+    ok, res = rig.run()
+    assert ok, [r.line() for r in res]
+    assert worst_burst(rig) <= pf.MOTOR_MAX_MOVE_COUNTS, worst_burst(rig)
+    for c in rig.cams:
+        assert rig.runner.motor_cpp[c][0] == 8.0, rig.runner.motor_cpp[c]
 
 
 def test_dead_camera_in_m4_is_recovered_before_the_sweep_then_passes():
@@ -331,11 +416,87 @@ def test_abort_ends_the_run_with_a_fail():
     assert not rig.runner.is_running()
 
 
+# ── the operator's report ───────────────────────────────────────────────────
+
+def test_a_clean_run_says_one_line_and_keeps_the_numbers_in_the_log():
+    rig = make()
+    ok, res = rig.run()
+    assert ok
+    assert pf.format_report(res) == "Preflight checks pass"
+    assert any("c/pulse" in m for m in rig.logged), "the calibration figures still go somewhere"
+
+
+def test_a_wedged_motor_sends_the_operator_to_that_lens_by_serial():
+    """cam2 is an app index nobody can read off the rig; 2439007 is printed on the camera."""
+    rig = make(stops={2: (0, 0)})
+    ok, res = rig.run()
+    report = pf.format_report(res)
+    assert not ok
+    assert report.splitlines()[0] == "Focus motor failed on cam2 (2439007) -- the lens will not turn"
+    assert "  \u2022 Check the focus ring on cam2 (2439007) is not pulled forward" in report
+    assert "pulse #" not in report, "encoder counts belong in the log, not in front of the operator"
+    assert any("did not move on" in m for m in rig.logged), "...and they are in the log"
+
+
+def test_short_travel_asks_for_a_re_park_rather_than_a_cable_check():
+    """Both end stops found: the lens works and is parked badly, which is nearly the opposite
+    of the advice every other focus failure gives."""
+    rig = make(stops={2: (4000, 5600)})
+    ok, res = rig.run()
+    report = pf.format_report(res)
+    assert not ok and "not enough travel to test" in report
+    assert "Set the lens to roughly mid-focus by hand" in report
+    assert "wires" not in report and "fouling" not in report
+
+
+def test_no_gps_gives_the_three_things_to_check():
+    rig = make(gps=False)
+    ok, res = rig.run()
+    report = pf.format_report(res)
+    assert not ok and report.startswith("GPS failed -- no data from the receiver")
+    for bullet in ("Check the main harness cable, at the control box and at the PCB",
+                   "Check the orange indicator light on the control box",
+                   "Check the antenna connection"):
+        assert f"  \u2022 {bullet}" in report, report
+
+
+def test_every_pcb_fault_string_earns_its_own_advice():
+    """FAULT_RE and the advice groups come off the same table, so a line that trips the
+    detector cannot fall through to the generic block -- and homing/cancelled are checked
+    before the generic alert that usually accompanies them."""
+    for key, pattern in pf._FAULT_ADVICE:
+        for alt in pattern.split("|"):
+            assert pf.FAULT_RE.search(alt), alt
+            assert pf._fault_advice(alt) == key, (alt, pf._fault_advice(alt))
+    assert pf._fault_advice("Motor0: homing FAILED, alert detected") == "mirror-homing"
+    assert pf.ADVICE["mirror-homing"][1][0].startswith("Check for obstructions")
+    assert pf.ADVICE["mirror-fault"][1][0].startswith("Check the system voltage")
+
+
+def test_every_advice_key_the_runner_names_exists_and_every_one_is_used():
+    """The raise sites name their advice by string literal. A typo would silently drop the
+    operator back to the raw technical message -- the thing this report exists to remove."""
+    used = set(re.findall(r'advice=["\'](.*?)["\']', inspect.getsource(pf)))
+    used |= {k for k, _p in pf._FAULT_ADVICE}
+    assert len(used) > 10, "the call sites stopped matching the regex"
+    assert used == set(pf.ADVICE), sorted(used ^ set(pf.ADVICE))
+
+
+def test_a_failure_with_no_advice_still_says_something():
+    r = pf.CheckResult("Some new check", False, "the thing went wrong")
+    assert pf.advice_block(r) == "FAIL  Some new check: the thing went wrong"
+
+
 def main() -> int:
     for t in (
         test_healthy_rig_passes_and_ends_in_m0_with_fresh_lines,
         test_obstructed_motor_fails_that_camera_and_never_sweeps,
+        test_a_lens_parked_at_the_end_stop_is_backed_off_and_passes,
+        test_travel_shorter_than_the_check_needs_fails_with_the_span,
         test_motor_dead_at_fine_strength_fails_calibration,
+        test_bursts_stay_under_the_unwrap_cap_on_a_motor_no_table_predicted,
+        test_a_motor_finer_than_the_encoder_noise_is_still_calibrated,
+        test_gps_counters_are_read_by_camera_number_not_serial,
         test_dead_camera_in_m4_is_recovered_before_the_sweep_then_passes,
         test_camera_dead_after_recovery_fails_with_single_recovery,
         test_camera_dying_only_on_the_sweep_gets_one_retry,
@@ -344,6 +505,13 @@ def main() -> int:
         test_gps_disconnected_is_reported_up_front_and_the_rest_still_runs,
         test_missing_prerequisites_fail_before_touching_hardware,
         test_abort_ends_the_run_with_a_fail,
+        test_a_clean_run_says_one_line_and_keeps_the_numbers_in_the_log,
+        test_a_wedged_motor_sends_the_operator_to_that_lens_by_serial,
+        test_short_travel_asks_for_a_re_park_rather_than_a_cable_check,
+        test_no_gps_gives_the_three_things_to_check,
+        test_every_pcb_fault_string_earns_its_own_advice,
+        test_every_advice_key_the_runner_names_exists_and_every_one_is_used,
+        test_a_failure_with_no_advice_still_says_something,
     ):
         t()
         print(f"  ok: {t.__name__}")

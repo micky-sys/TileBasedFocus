@@ -67,7 +67,8 @@ from .file_naming import sanitize_project_name
 from .focus_panel import FocusPanel, _crop_pixmap_center
 from .gps_correlator import GpsCorrelator
 from .gps_receiver import GpsReceiver
-from .kyfg_backend import DEFAULT_CAMERA_CONFIG
+from .fine_tracker import FineFocusTracker
+from .kyfg_backend import DEFAULT_CAMERA_CONFIG, KyfgCamera
 from .mode_controller import (
     Mode,
     ModeController,
@@ -76,7 +77,7 @@ from .mode_controller import (
     MODE_BUTTON_WIDTH_FULL,
     mode_display_label,
 )
-from .preflight import PreflightHooks, PreflightRunner, format_report
+from .preflight import PreflightHooks, PreflightRunner, format_report, gps_stats_by_camera
 from .pipeline import (
     AcquisitionThread,
     CameraPipeline,
@@ -2539,6 +2540,12 @@ class MainWindow(QMainWindow):
         # which.
         self._focus_panel.camera_chosen.connect(self._on_focus_panel_camera_chosen)
         self._focus_panel.m4_record_toggled.connect(self._on_m4_record_toggled)
+        # Fine view (manual focus): the GUI-side leading-edge tracker picks a patch off
+        # each coarse frame and pins its full-res equivalent for the pipeline to crop.
+        self._fine_tracker = FineFocusTracker()
+        self._locked_fine_roi: Optional[tuple] = None
+        self._focus_panel.fine_view_toggled.connect(self._on_fine_view_toggled)
+        self._focus_panel.fine_lock_changed.connect(self._on_fine_lock_changed)
         # Diagnostic chatter from the focus panel feeds the main log
         # so we can see at a glance whether frames are reaching it
         # and whether the worker is producing results.
@@ -2593,6 +2600,11 @@ class MainWindow(QMainWindow):
             row.preview_radio.blockSignals(True)
             row.preview_radio.setChecked(target)
             row.preview_radio.blockSignals(False)
+        # New camera = a discontinuous frame stream, so the scene-motion reference and
+        # any sensor-pinned lock belong to the camera we just left.
+        self._fine_tracker.reset()
+        self._locked_fine_roi = None
+        self._focus_panel.clear_fine_lock()
         self._on_preview_selected(camera_number)
 
     def _build_serial_bar(self) -> QWidget:
@@ -2700,6 +2712,7 @@ class MainWindow(QMainWindow):
         pipeline.acq.raw_focus_frame.connect(self._on_raw_focus_frame_slot)
         pipeline.acq.set_w10_live(self._w10_live if self._w10_live_enabled else None)
         pipeline.acq.raw_focus_preview_crops.connect(self._on_raw_focus_preview_crops)
+        pipeline.acq.raw_focus_fine_crop.connect(self._on_raw_focus_fine_crop)
         pipeline.acq.failed.connect(self._on_pipeline_failed_slot)
         pipeline.acq.log_line.connect(self._log)
         # AcquisitionThread now owns the drop counter (the writer is a
@@ -3250,6 +3263,17 @@ class MainWindow(QMainWindow):
             p = next((p for p in self._pipelines if p.camera_number == cam), None)
             return p.backend.frames_delivered if p is not None else 0
 
+        def camera_serial(cam: int) -> str:
+            p = next((p for p in self._pipelines if p.camera_number == cam), None)
+            return p.camera_serial if p is not None else ""
+
+        def gps_stats() -> dict:
+            # The correlator counts per camera serial; the runner speaks camera numbers.
+            return gps_stats_by_camera(
+                self._gps_correlator.stats(),
+                {p.camera_number: p.camera_serial for p in self._pipelines},
+            )
+
         def rotate_lines() -> None:
             # The preflight sweep gets its own closed container; the flight starts on a
             # fresh one. Host-only, no PCB traffic. The sweep images have done their job
@@ -3278,11 +3302,12 @@ class MainWindow(QMainWindow):
             frame_counts=frame_counts,
             frames_delivered=frames_delivered,
             gps_connected=lambda: self._gps_receiver.connected,
-            gps_stats=self._gps_correlator.stats,
+            gps_stats=gps_stats,
             recording_prerequisites_missing=self._recording_prerequisites_missing,
             recover_cameras=lambda: self._run_camera_recovery(
                 do_device_reset=True, label="deep/preflight", window_s=25),
             rotate_lines=rotate_lines,
+            camera_serial=camera_serial,
             log=self._log,
         )
         runner = PreflightRunner(hooks, parent=self)
@@ -3339,20 +3364,19 @@ class MainWindow(QMainWindow):
                 self._focus_panel.resend_strength()   # the motor test ran at S3
             except Exception as exc:
                 self._log(f"Preflight: strength restore failed: {exc}")
-        report = format_report(list(results))
-        for line in report.splitlines():
+        # Every measurement goes to the log; the dialog gets the operator's instructions only.
+        measured = "\n".join(r.line() for r in results)
+        for line in measured.splitlines():
             self._session_log.write(f"preflight: {line}", category="PREFLIGHT")
-        self._log("Preflight " + ("PASSED" if ok else "FAILED") + ":\n" + report)
+        self._log("Preflight " + ("PASSED" if ok else "FAILED") + ":\n" + measured)
         self.statusBar().showMessage("Preflight " + ("PASSED" if ok else "FAILED -- see dialog"), 15000)
         if self._preflight_line_paths:
             self._delete_preflight_lines()
+        report = format_report(list(results))
         if ok:
             QMessageBox.information(self, "Preflight check: PASSED", report)
         else:
-            QMessageBox.critical(
-                self, "Preflight check: FAILED",
-                "Fix the first item below before flying.\n\n" + report,
-            )
+            QMessageBox.critical(self, "Preflight check: FAILED", report)
 
     _PREFLIGHT_DELETE_RETRIES = 30
 
@@ -3768,6 +3792,108 @@ class MainWindow(QMainWindow):
                 pass
         self._autofocus.feed_crops(crops)
 
+    # ── Fine view (M4 / M5 manual focus) ─────────────────────────────────
+
+    @Slot(object, str)
+    def _on_raw_focus_fine_crop(self, crop, ts_iso: str) -> None:
+        """The tracked patch at full resolution. Latch released first so the acq thread
+        can stage the next crop while this one is painted (same pattern as the coarse
+        tap and the AF crop batch)."""
+        acq = self.sender()
+        if acq is not None and hasattr(acq, "note_fine_crop_consumed"):
+            acq.note_fine_crop_consumed()
+        if not self._focus_panel.fine_view_enabled():
+            return
+        active = self._active_pipeline()
+        if active is None or active.acq is not acq:
+            return
+        self._focus_panel.receive_fine_crop(crop, ts_iso)
+
+    def _update_fine_tracker(self, pipeline: CameraPipeline, coarse_raw) -> None:
+        """Advance the tracker on one coarse frame and re-pin the pipeline's Fine ROI."""
+        # Size the candidates to what the pane can show AT THIS ZOOM. Set every frame
+        # because both inputs are the operator's: the pane expands with the window and
+        # the zoom is a combo box, so any constant fits one layout and letterboxes the
+        # rest. It takes effect at the next hand-over rather than mid-object, since the
+        # pick only runs on re-acquire -- resizing the live tile would look like the
+        # focus jumped.
+        vw, vh = self._focus_panel.fine_view_sensor_wh()
+        sub = KyfgCamera.SUBSAMPLE_FACTOR
+        fh_c, fw_c = coarse_raw.shape[:2]
+        # Even (Bayer), and never larger than the frame: an oversized tile yields an
+        # EMPTY grid and the pick silently falls back to a centred ROI, dropping the
+        # leading-edge behaviour this whole path exists for.
+        self._fine_tracker.tile_wh = (min(fw_c, max(2, -(-vw // sub))) & ~1,
+                                      min(fh_c, max(2, -(-vh // sub))) & ~1)
+        self._fine_tracker.update(coarse_raw)
+        tr = self._fine_tracker
+        if self._locked_fine_roi is not None:
+            # A lock pins a FIXED sensor ROI and the tracker wants a MOVING one. Keep
+            # tracking (the motion estimate and dwell readout stay live) but let the
+            # lock own the pipeline ROI -- otherwise the tracker overwrites it on the
+            # very next coarse frame and the lock never holds.
+            self._focus_panel.set_fine_track(None, "LOCKED to sensor patch")
+            return
+        roi_coarse = tr.predicted_roi()
+        try:
+            pipeline.set_fine_roi(
+                None if roi_coarse is None else tuple(int(v * sub) for v in roi_coarse))
+        except Exception as exc:
+            self._log(f"Fine view: set_fine_roi failed: {exc}")
+            return
+        left = tr.frames_left()
+        # Texture does not block the pick -- an out-of-focus lens produces none, and
+        # that is exactly when the operator needs something to look at -- so show how
+        # strong the target is instead of refusing to offer one.
+        weak = "  WEAK" if tr.pick_score < tr.cfg.min_texture_score else ""
+        self._focus_panel.set_fine_track(
+            roi_coarse,
+            f"obj #{tr.object_id} from {tr.lead_edge or 'static'}"
+            f"  held {tr.frames_on_object}f  "
+            + (f"~{left}f left" if left is not None else "no flow")
+            + f"  dx{tr.motion_dx:+.1f} dy{tr.motion_dy:+.1f}"
+            + f"  tex {tr.pick_score:.1f}{weak}")
+
+    @Slot(bool)
+    def _on_fine_view_toggled(self, on: bool) -> None:
+        """Start the tracker fresh each time Fine view is entered, and release the
+        pipeline ROI on the way out so no camera keeps cropping for a hidden view."""
+        self._fine_tracker.reset()
+        self._locked_fine_roi = None
+        if not on:
+            self._clear_fine_roi()
+
+    def _clear_fine_roi(self) -> None:
+        for p in self._pipelines:
+            try:
+                p.set_fine_roi(None)
+            except Exception as exc:
+                self._log(f"cam{p.camera_number}: set_fine_roi(clear) failed: {exc}")
+
+    @Slot(bool)
+    def _on_fine_lock_changed(self, locked: bool) -> None:
+        """Freeze the Fine view on the patch it is showing, pinned in sensor coordinates
+        (the scene then slides under it), or return to tracking."""
+        if not locked:
+            self._locked_fine_roi = None
+            self._log("Lock tile: OFF (tracking).")
+            return
+        roi = self._fine_tracker.roi
+        if roi is None:
+            self._log("Lock tile: no tracked tile yet.")
+            self._focus_panel.clear_fine_lock()
+            return
+        sub = KyfgCamera.SUBSAMPLE_FACTOR
+        self._locked_fine_roi = tuple(int(v * sub) for v in roi)
+        p = self._active_pipeline()
+        if p is not None:
+            try:
+                p.set_fine_roi(self._locked_fine_roi)
+            except Exception as exc:
+                self._log(f"Lock tile: set_fine_roi failed: {exc}")
+                return
+        self._log(f"Lock tile: ON (pinned {self._locked_fine_roi}).")
+
     def _set_focus_tap(self, p: CameraPipeline, on: bool) -> None:
         """The focus view's feed from one pipeline: the coarse frame for the preview AND
         the five full-res w10 ROI crops, so the w10 number is live whenever the operator is
@@ -3781,6 +3907,7 @@ class MainWindow(QMainWindow):
                 p.set_preview_rois(roi_boxes())
             else:
                 p.set_preview_rois([])
+                p.set_fine_roi(None)
                 if not self._modes.is_recording_mode():
                     p.set_full_res_emission(False)
         except Exception as exc:
@@ -4015,6 +4142,11 @@ class MainWindow(QMainWindow):
                 f"(cam{pipeline.camera_number}){fps}"
             )
         self._focus_panel.receive_raw_frame(raw, ts_iso)
+        if self._focus_panel.fine_view_enabled():
+            try:
+                self._update_fine_tracker(pipeline, raw)
+            except Exception as exc:
+                self._log(f"Fine view: tracker failed: {exc}")
 
     @Slot(QImage)
     def _on_preview_ready(self, qimg: QImage) -> None:
@@ -4370,6 +4502,11 @@ class MainWindow(QMainWindow):
         prev_mode = self._modes.mode
         self._modes.set_mode(mode)
         self._mode_status_label.setText(f"Current: {mode_display_label(mode)}")
+        # The mirrors re-home on every setMode, so the scene jumps: the tracker's
+        # previous frame is no longer a valid reference for the next one.
+        self._fine_tracker.reset()
+        self._locked_fine_roi = None
+        self._focus_panel.clear_fine_lock()
         # set_mode just cleared m4_recording (any mode change disarms it, including
         # re-entering M4), so the checkbox has to follow or it would lie.
         self._focus_panel.sync_m4_record_toggle(False)

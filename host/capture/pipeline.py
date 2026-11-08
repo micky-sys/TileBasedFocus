@@ -387,6 +387,9 @@ class AcquisitionThread(QThread):
     # cut from the held full-res slot so the w10 engine scores sensor-native pixels
     # instead of the 4x-decimated coarse tap. (list[np.ndarray], ISO timestamp).
     raw_focus_preview_crops = Signal(object, str)
+    # Full-res uint16 crop of the Fine view's tracked ROI (``set_fine_roi``), cut from
+    # the same held slot. Display only -- nothing scores it. (np.ndarray, ISO timestamp).
+    raw_focus_fine_crop = Signal(object, str)
     fetch_timeout_count = Signal(int)
     # Cumulative count of sweep frames AcquisitionThread had to drop
     # rather than submit to the writer subprocess. Reasons include
@@ -500,6 +503,12 @@ class AcquisitionThread(QThread):
         # assignment is atomic under the GIL.
         self._preview_rois: list = []
         self._preview_crops_inflight = False
+        # M4/M5 Fine view: ONE full-res ROI (sensor-pixel coords) that the GUI's
+        # leading-edge tracker moves with the scene, cropped from the same held slot
+        # as the w10 ROIs. Separate from ``_preview_rois`` because the w10 engine
+        # rejects any batch that isn't exactly its five boxes.
+        self._fine_roi: Optional[tuple] = None
+        self._fine_crop_inflight = False
         # State-transition logging for "why we couldn't write": a
         # missing project name + a busy trigger would otherwise emit
         # ~40 lines/sec into the log, freezing the GUI's QPlainTextEdit.
@@ -593,6 +602,17 @@ class AcquisitionThread(QThread):
         """GUI-thread ack for a ``raw_focus_preview_crops`` batch (see
         ``note_focus_frame_consumed``); releases the crop conflation latch."""
         self._preview_crops_inflight = False
+
+    def set_fine_roi(self, roi: Optional[tuple]) -> None:
+        """M4/M5 Fine view: pin one full-res ROI to crop from the held slot each frame,
+        or ``None`` to stop emitting. Unlike ``set_preview_rois`` this one MOVES -- the
+        GUI tracker re-pins it every coarse frame. Tuple assignment is atomic under
+        the GIL, so the run loop always reads a whole ROI."""
+        self._fine_roi = tuple(int(v) for v in roi) if roi else None
+
+    def note_fine_crop_consumed(self) -> None:
+        """GUI-thread ack for a ``raw_focus_fine_crop`` (see ``note_focus_frame_consumed``)."""
+        self._fine_crop_inflight = False
 
     def set_armed(self, armed: bool) -> None:
         """Tell the run loop whether the IA is currently started/streaming.
@@ -868,16 +888,16 @@ class AcquisitionThread(QThread):
                             "%s zoom preview build failed: %s", self.label, exc
                         )
 
-                # Does the focus tap below need to read the full-res slot?
-                # Only when the w10 AF has pinned ROIs it wants scored at full
-                # resolution.
+                # Does the focus tap below need to read the full-res slot? Only when
+                # the w10 AF has pinned ROIs it wants scored at full resolution, or
+                # the Fine view has a tracked ROI it wants shown at 1:1.
                 slot_for_af: Optional[int] = None
                 if (
                     is_valid_slot
                     and in_focus_mode
                     and self._focus_tap_enabled
                     and want_focus_tap
-                    and bool(self._preview_rois)
+                    and (bool(self._preview_rois) or self._fine_roi is not None)
                 ):
                     slot_for_af = int(full_u16)
 
@@ -966,6 +986,26 @@ class AcquisitionThread(QThread):
                                 crops.append(np.array(fvp[py0:py1, px0:px1], order="C"))
                             self._preview_crops_inflight = True
                             self.raw_focus_preview_crops.emit(crops, acquire_ts_iso)
+                        # Fine view: the tracked patch at 1:1, cut from the same slot.
+                        fine_roi = self._fine_roi      # ONE read: the GUI re-pins it live
+                        if (
+                            fine_roi is not None
+                            and slot_for_af is not None
+                            and self._pool is not None
+                            and not self._fine_crop_inflight
+                        ):
+                            fvf = self._pool.slot_view(slot_for_af)
+                            fhf, fwf = fvf.shape[:2]
+                            fx0, fy0, fx1, fy1 = fine_roi
+                            fx0 = max(0, min(int(fx0), fwf - 2)) & ~1   # even: same Bayer quad
+                            fy0 = max(0, min(int(fy0), fhf - 2)) & ~1
+                            fx1 = max(fx0 + 2, min(int(fx1), fwf))
+                            fy1 = max(fy0 + 2, min(int(fy1), fhf))
+                            self._fine_crop_inflight = True
+                            # np.array, not a slice: the finally-block below recycles
+                            # this slot, and a contiguous slice would alias it.
+                            self.raw_focus_fine_crop.emit(
+                                np.array(fvf[fy0:fy1, fx0:fx1], order="C"), acquire_ts_iso)
                         # Conflate: only emit if the GUI has consumed the previous 8 MB
                         # frame. Otherwise drop this one so the queued-event backlog
                         # can't grow unbounded (the crash).
@@ -2394,3 +2434,11 @@ class CameraPipeline:
     def note_preview_crops_consumed(self) -> None:
         """GUI-thread ack releasing the AF crop conflation latch."""
         self.acq.note_preview_crops_consumed()
+
+    def set_fine_roi(self, roi: Optional[tuple]) -> None:
+        """Fine view: pin the tracked full-res ROI (sensor pixels), or ``None`` to stop."""
+        self.acq.set_fine_roi(roi)
+
+    def note_fine_crop_consumed(self) -> None:
+        """GUI-thread ack releasing the Fine crop conflation latch."""
+        self.acq.note_fine_crop_consumed()

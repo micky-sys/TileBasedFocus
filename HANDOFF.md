@@ -6736,7 +6736,8 @@ lockstep checkbox, 2-obj track, Fine tile + insets, the field-map tab. `FocusAxi
 `OpenLoopAxis` went with them; `focus_axis.py` keeps only the AMT203S stream tracking
 (`EncoderAxis`), positions in COUNTS, and the w10 glue converts to pulses itself (54.13).
 `IRON661_AF` is no longer read. Sections 20-29 and 45-50 describe code that no longer exists;
-they stay as the record of why.
+they stay as the record of why. (Fine view came back in sec.56 — the removal took the manual
+focusing aid out along with the AF engines it shared code with.)
 
 ### 55.2 Preflight check (`host/capture/preflight.py`, button next to Reset cameras)
 
@@ -6763,7 +6764,7 @@ locked and the button reads "Abort preflight". Report in a dialog and in the ses
    two directions must be opposite, and the lens must end within 3000 c of where it started
    (lash + slip). Each direction has a 90 s budget. Then **counts/pulse calibration**: at
    S3, S2, S1, S0 in turn, 3 bursts each way (alternating, so the lens stays put), sized
-   from a nominal table (850/300/80/24) to ~400 c, the median of the six kept. Report line:
+   from a probe of that motor at that strength (sec.55.9), the median of the six kept. Report line:
    `PASS Focus calibration cam2 -- S3 850 c/pulse (850-850), S2 300 ..., S1 80 ..., S0 30
    ...; median of 6 bursts each, noted for AF`.
 4. Cameras alive: SDK callback counters (`KyfgCamera.frames_delivered` = `_cb_count`) must
@@ -6789,9 +6790,8 @@ aborts the run with that line. On finish the panel's strength is re-sent (the mo
 at S3). Fake rig + fake clock: `py -3 tools/test_preflight.py` (healthy, obstructed motor,
 motor dead at a fine strength, dead camera + recovery, no sweep, GPS absent up front, abort).
 
-**Rig status: not yet run on hardware.** First PASS report is the thing to eyeball; S2's 300
-c/pulse nominal is a guess (never measured), so if its measured value is far off, the burst
-sizing in `CAL_NOMINAL_CPP` wants the real number.
+**Rig status: run on hardware 2026-11-05, see sec.55.9.** The nominal table it used to size
+bursts from is gone; every burst is now sized from a probe of the motor in front of it.
 
 ### 55.3 AF uses the preflight's numbers
 
@@ -6868,4 +6868,289 @@ py -3 tools/test_af_w10_flight.py
 py -3 tools/test_encoder_axis.py
 $env:QT_QPA_PLATFORM="windows"; py -3 host/main_capture.py --demo
 ```
+
+### 55.9 First preflight runs on the rig (2026-11-05)
+
+ClearCore re-enumerated to **COM13** (auto-detect finds it by the `Teknic ClearCore`
+description, so no `--port` needed). Four runs, none reached the sweep. Everything up to and
+including cam1's motor test behaved exactly as designed; the two things that stopped it were
+one real rig fault and one bug in the check itself.
+
+**cam1's motor is healthy and the numbers are repeatable** — three runs agreeing inside the
+spread the medians are there to absorb:
+
+| | S3 | S2 | S1 | S0 |
+|---|---|---|---|---|
+| measured c/pulse | 856-876 | 502-526 | 330 | 41-45 |
+| retired nominal | 850 | 300 | 80 | 24 |
+
+Travel test: `'+' -10391 c / 13 pulses (-799 c/pulse)`, returning within 319 c of start.
+cam1's polarity is **negative** ('+' drives the count down); cam2's is positive.
+
+**The bug: burst sizing from a table of nominals.** `CAL_NOMINAL_CPP[1]` said 80 c/pulse
+where the motor does 330, so `_calibrate` asked for `round(400/80)` = 5 pulses to reach the
+400 c target and got ~1650 c instead. Every S1 burst across the runs measured 1572-1854 c
+against a `MOTOR_MAX_MOVE_COUNTS` of 1800, and the fourth run finally tripped it: `FAIL Focus
+calibration cam1: S1 x5 '+' read as -1854 c -- more than the encoder can track per burst`. A
+healthy motor, failed by the check's own arithmetic.
+
+The guard was right and stays at 1800 — a burst past the 12-bit half-turn of 2048 silently
+folds, which is the same 4096-count slip already seen on cam3 (sec.55.2 trap / `focus_panel`
+`_MANUAL_MAX_PULSES`). It is the burst that was wrong. Fix: **`CAL_NOMINAL_CPP` is deleted.**
+`_probe_cpp` fires `CAL_PROBE_BURSTS` (4) alternating bursts and takes the median, starting at
+one pulse and **doubling only after a burst too small to read** (`MOTOR_MIN_MOVE_COUNTS`), so a
+motor finer than the encoder noise still gets sized while growth can never climb toward the
+guard. `_burst_pulses` then sizes the six measuring bursts from that, clamped by
+`CAL_MAX_BURST_COUNTS` (900) so a motor running harder than it probed still lands inside the
+guard. Both the probe and the measurement go through one `_burst` helper. Cost: 10 bursts per
+strength instead of 6.
+
+Regression test `test_bursts_stay_under_the_unwrap_cap_on_a_motor_no_table_predicted` models
+S1 at its worst observed 371 c/pulse; against the old table sizing it reproduces the rig
+failure to within a count (`+1855 c`). `test_a_motor_finer_than_the_encoder_noise_is_still_calibrated`
+covers the other end (8 c/pulse, where a one-pulse probe reads as "did not move").
+
+**cam2 was at the end of its travel — the check now backs off instead of failing.** Across four
+runs cam2's '+' leg stalled having covered 0, 20 and finally 5636 c, each time with a smoothly
+decaying per-pulse profile (518, 571, 608, 631, 599, 533, 451, 405, 337, 259, 216, 156, 153,
+69, 99, 31, then 15 → stall) and a best pulse of only 631 c against cam1's 800-850, i.e. under
+load from the first pulse. Manual focus drove the same lens freely with the encoder tracking,
+so nothing was faulted: preflight was demanding 10,000 c in a direction that had ~5,600 c left.
+
+Running out of room is where the operator parked the lens, not a fault, so `_move_out` now
+**backs off and retries the leg once**: on a stall it drives '-' up to `MOTOR_TRAVEL_COUNTS +
+MOTOR_BACKOFF_MARGIN_COUNTS` (13,000 c — the margin keeps the retry's last pulse off the same
+stop) and runs '+' again. The back-off is also the diagnosis, which is why `_move` now raises
+`_Stalled` rather than failing on the spot:
+
+- moves neither way → `FAIL ... and will not move on '-' either: obstructed, or drive/relay not
+  reaching this motor` (the only genuine fault case).
+- backs off less than `MOTOR_TRAVEL_COUNTS` → it reached the far stop, so what the back-off
+  covered IS the usable span: `FAIL ... usable travel is only ~9600 c -- less than the 10000 c
+  this check drives`. Tells you to park better or lower the spec, with a measured number.
+- otherwise the retry runs and the PASS line records `backed off -13000 c off the '+' end stop
+  first`.
+
+A '-' stall is still a straight fail: that leg retraces ground the '+' leg just covered, so it
+has room by construction. `test_a_lens_parked_at_the_end_stop_is_backed_off_and_passes`,
+`test_travel_shorter_than_the_check_needs_fails_with_the_span`, and the obstructed test now
+models a lens wedged with no room either way. The fake rig grew a real travel model for this
+(`stops={cam: (counts available '-', counts available '+')}` from the start position, replacing
+the old distance-from-start `stall`) — the previous model let a back-off "recover" from a jam
+that should have stayed jammed.
+
+**GPS: dead for the first three launches, verified on the fourth.** `$E*` was acknowledged and
+answered `$EventFired*` every time while no NMEA sentence came back on COM3 across three probes
+per launch — host side fine, break downstream (bridge, RS232 lead, or the receiver's EXT_EVENT
+input). Preflight reported it up front as non-fatal, as designed. By 12:32 it came good:
+`GPS: link verified on COM3 at +32.170276, +34.831342`.
+
+**Then the GPS check failed a rig that was tagging perfectly — the `acq` trap all over again.**
+`FAIL GPS tagging: cam(s) [1, 2, 3] have frames without a GPS event: cam1 matched 0/13, cam2
+matched 0/13, cam3 matched 0/13`, while `tools/bay14_gps_check.py --root D:\Project` on the very
+containers that sweep wrote says **13/13 frames tagged on all three cameras**. `GpsCorrelator`
+counts per camera **serial** (`pop_fix_for` gets `AcquisitionThread._camera_serial`, and
+`_cams.setdefault(camera_serial, ...)`), but every `PreflightHooks` callable speaks app camera
+numbers, so `_gps_per_cam` filed cam1's counters under `2439008` and the lookup for camera `1`
+found nothing. It read zero for every camera on every run — the check could never have passed.
+And nothing raised: `int("2439008")` is a perfectly good int, so the `except (TypeError,
+ValueError)` guard in `_gps_per_cam` never fired. Fix: `gps_stats_by_camera(stats,
+serial_by_cam)` in `preflight.py`, called from the `gps_stats` hook in
+`_build_preflight_runner`; the runner still knows nothing about serials.
+`test_gps_counters_are_read_by_camera_number_not_serial` asserts both directions.
+
+**Open (real, and not preflight's): cam1's fixes lag one trigger.** `bay14_gps_check` check 1
+reports 12 cross-camera TOW mismatches on that line, all the same shape — `2439008`'s TOW at
+`fis=N` equals `2439006`/`2439007`'s at `fis=N-1` (e.g. sweep 1 fis=4: 006/007 both
+`1793875674630000`, 008 `1793875674190000`, which is their fis=3). One camera off by exactly one
+slot, consistently, is a correlator slot-matching question, not a wiring one.
+
+## 56. Fine view is back, with its tracker (2026-11-05)
+
+`7d68360` removed the Fine view along with the AF engines, because it borrowed their tracking
+primitives. It is the **manual** focusing aid, not an AF feature: the coarse preview averages
+4x4 sensor pixels, so it physically cannot show the detail focus is judged on. Restored.
+
+### 56.1 `host/capture/fine_tracker.py` (new, 467 lines)
+
+The tracking maths lifted back out of the deleted `autofocus.py` and trimmed to what this view
+uses: `PatchTracker` (phase correlation for the scene motion vector), `leading_edge_from_motion`,
+the leading-edge tile pick scored on **unclipped** texture (`_unclipped_texture` / `_best_tile`),
+`clamp_roi`, `roi_pinned_against_flow`, and `FineFocusTracker`. All the hard-won comments came
+with it — they are the record of what was tried and why it was wrong.
+
+Deliberately NOT restored: the motor servo, the OrthoSim bench interior masking (that rig is
+gone), and `acquire_lane_frac`. The lane was actively wrong here: at the AF value of 0.34 it cut
+the leading-edge candidates to one, so the winning-tile scoring was decorative.
+`AutoFocusConfig` (200 lines, mostly servo knobs) is replaced by `FineTrackerConfig` — the five
+fields this path actually reads.
+
+The old build's two-pane `DualObjectTracker` and `align.py` (ChArUco bench alignment) stay
+deleted; neither is part of Fine view.
+
+### 56.2 New: a tile flush with a border no longer retires on one noisy frame
+
+`TileGrid._build_grid_edge` lays its last row flush with the far border, so **a quarter of all
+picks start pinned**. The old `_roi_pinned_against_flow` test fired on a single frame, and a
+heavily defocused frame — exactly when this view is in use — produces a couple of pixels of
+correlation noise on the cross axis. Found by `test_racking_focus_does_not_make_the_tile_hop_to_another_object`:
+a sigma-7 blur measured `dy=+2.1` on a static scene and handed the object over. Now
+`cfg.pinned_frames_to_retire` (2) consecutive pinned frames are required. At 5 fps that is 0.2 s
+of extra dwell on a real exit, invisible.
+
+### 56.3 Pipeline: one more ROI on the slot that is already held
+
+`AcquisitionThread.set_fine_roi(roi)` + `raw_focus_fine_crop` + `note_fine_crop_consumed`, with
+its own conflation latch. It crops from the **same held full-res slot** as the w10 ROIs, inside
+the same focus-tap block, so Fine view adds no emission management at all: `_set_focus_tap`
+already turns full-res emission on whenever the focus view is showing a camera in M4/M5.
+
+It is a separate ROI rather than a sixth entry in `set_preview_rois` because the w10 engine
+rejects any batch that is not exactly its five boxes (`feed_crops` / `score_live`:
+`len(crops) != 5`). Appending would have silently killed the live w10.
+
+### 56.4 The pin is extrapolated one frame
+
+The acq thread can only apply a pin to a LATER frame than the coarse one it was derived from
+(the GUI sees that frame after the acq thread has passed it), so `FineFocusTracker.predicted_roi()`
+offsets by one frame of measured flow. At the flown ~650 sensor px/frame, not doing this leaves
+the crop trailing by half the pane.
+
+`ponytail:` one frame of lag, assumed constant — true whenever the GUI keeps up, and the GUI
+conflates under load. The old build's acq-side travel odometer (stamp each frame's cumulative
+flow, charge the pin against its own source frame) is the upgrade path; it costs a second phase
+correlation on the acq thread, which is why it is not here yet.
+
+### 56.5 GUI (`focus_panel.py`)
+
+`Fine view` toggle, `Lock tile`, `Zoom` (1x / 2x / 4x), and a dwell readout
+(`obj #3 from right  held 7f  ~22f left  dx-168.2 dy+0.4  tex 5.1`). The display shows the crop
+at **exactly** N screen px per sensor px and never below 1:1 — filling the label the way the
+coarse preview does becomes a downscale as soon as the tile is bigger than the pane, which
+averages sensor pixels together and shows a sharp lens as soft. Oversized tiles lose their
+margins, not their detail. Integer zoom uses nearest neighbour: it replicates whole pixels and
+invents nothing.
+
+Bottom-left inset: the whole coarse frame with the tracked tile boxed. At 1:1 the view is well
+under 1% of the frame, and the **tracker** chose it, so without the inset the operator cannot
+tell what they are focusing on.
+
+`Lock tile` pins the patch in SENSOR coordinates and the scene slides under it. Tracking keeps
+running underneath (the motion estimate and dwell readout stay live) but the lock owns the
+pipeline ROI — otherwise the tracker overwrites it on the very next coarse frame and the lock
+never holds, which is how it behaved before.
+
+Candidate tiles are sized from `fine_view_sensor_wh()` every frame, because both inputs are the
+operator's: the pane is Expanding and grows with the window, and the zoom is a combo box. It
+takes effect at the next hand-over, not mid-object — resizing the live tile looks like the focus
+jumped.
+
+### 56.6 Reset points
+
+The tracker is reset on **camera change** and on **mode change** (the mirrors re-home on every
+setMode, so the scene jumps and the previous frame is no longer a valid reference), and the lock
+is cleared with it. Not on re-acquire: `PatchTracker` measures the SCENE, not the ROI, so its
+previous frame is still correct across a hand-over. Resetting there cost 672 sensor px of
+instant offset per object in the old build.
+
+### 56.7 Reproduce / check
+
+```
+py -3 tools/test_fine_tracker.py
+```
+
+13 self-checks against a synthetic world scrolled past a window. Two traps the harness itself
+hit first, both worth knowing if you extend it: a scene whose texture is **re-randomised per
+frame** translates by nothing however far the nominal object "moved" (phase correlation measures
+how far the SAME content moved), and panning off the end of the world silently returns a
+narrower frame, which changes the tile grid under the test and looks like a tracker bug — hence
+the bounds assert in `scene()`.
+
+**Not yet run on the rig.** The two things to watch first: whether one frame of extrapolation is
+the right amount at the real frame rate, and whether a maximised pane at 1x (a ~6 MB crop per
+frame) competes with the AF crop batch on the GUI thread. Both are bounded by the conflation
+latch — the fine crop is dropped before the AF batch is, since the AF batch is emitted first.
+
+## 57. The preflight report now tells the operator what to check (2026-11-08)
+
+### 57.1 What changed
+
+The report dialog used to be the raw check log: nine `PASS` lines with counts per pulse and
+frame tallies on a good run, and on a bad one a `FAIL` naming an encoder reading. All of it true,
+none of it an instruction. A clean run now prints exactly:
+
+```
+Preflight checks pass
+```
+
+and a failure prints a headline and the things to go and check, in bullets. Everything the
+checks measured still goes to the log, in full, exactly as before — `_pass` logged it already
+and `_fail` (new) now does the same for failures, which previously only reached the log via the
+dialog text. `MainWindow._on_preflight_finished` writes `r.line()` for every result to the
+session log and the GUI log, then shows `format_report()` in the dialog. Nothing was deleted;
+the two audiences were separated.
+
+### 57.2 Advice is a fault type, not a check name
+
+Each failure carries an `advice` key into `preflight.ADVICE` (a headline plus its bullets) and a
+`subject` naming who it is about. The key is chosen at the raise site, not derived from the
+message text, so rewording a technical detail cannot silently change what the operator is told.
+A failure whose key is missing from `ADVICE` falls back to the old `PASS/FAIL name: detail` line
+rather than vanishing.
+
+Fifteen focus-motor messages collapse into four instructions, because the operator action genuinely
+differs:
+
+| advice | fires on | what it asks for |
+|---|---|---|
+| `lens-stuck` | stall with room, too slow, dead both ways, "does not move at this strength" | ring not pulled forward, nothing fouling it, motor wires |
+| `encoder-silent` | no `$ENC` after `$C`, encoder never settled | encoder cable, motor wires, re-run |
+| `encoder-wrong` | reversed mid-run, over the unwrap cap, '+'/'-' same way, lens did not return, burst against polarity | ring not pulled forward, encoder slipping on the ring, re-run then service |
+| `lens-travel` | `usable travel is only ~N c` | **re-park the lens at mid-focus** — nearly the opposite of the others |
+
+The ring-pulled-forward bullet is deliberately absent from `encoder-silent`: the ring position
+cannot cause a silent encoder, and a bullet that cannot be the cause trains operators to skip
+bullets.
+
+### 57.3 ClearPath faults are split by firmware string
+
+`_FAULT_ADVICE` is the one table that both builds `FAULT_RE` and picks the advice, so a line that
+trips the detector can never fall through to a generic block. Homing and cancelled-move are
+matched **before** the generic alert, because a homing failure usually arrives with
+`alert detected` on the same line and "look for an obstruction" is the more useful thing to say
+when it does. `mirror-fault` leads with system voltage, `mirror-homing` and `mirror-cancelled`
+lead with obstructions.
+
+### 57.4 The lens is named by serial (`camera_serial` hook)
+
+Every `PreflightHooks` callable speaks app camera numbers, but `cam2` is an index the operator
+cannot read off the rig — `2439007` is printed on the camera. `PreflightHooks.camera_serial` is
+new (defaulted to `""`, so a caller that does not supply it degrades to `cam2`), wired in
+`MainWindow._build_preflight_runner` off `pipeline.camera_serial`. `PreflightRunner._cams()`
+formats `cam2 (2439007)` and the result carries it as `subject`.
+
+This is the mapping that broke the GPS check on 5 November (sec.55.9) when counters keyed by
+serial were read by camera number. Here it is cosmetic — a wrong serial misnames a lens, it does
+not change a verdict — but `test_a_wedged_motor_sends_the_operator_to_that_lens_by_serial` pins
+it end to end anyway.
+
+### 57.5 Reproduce / check
+
+```
+py -3 tools/test_preflight.py
+```
+
+23 self-checks, 7 of them new. The one worth knowing about is
+`test_every_advice_key_the_runner_names_exists_and_every_one_is_used`: it greps the module source
+for `advice="..."` literals and asserts the set matches `ADVICE` exactly. Twenty-eight raise
+sites name their advice by string, and a typo at any of them would quietly drop that failure back
+to the raw technical message — the exact thing this rewrite exists to remove — with no other test
+noticing. It also catches dead advice entries.
+
+The bullet is U+2022 and the report is shown only in the Qt dialog, never logged, so it cannot hit
+a cp1252 log handler.
+
+**Open:** your wording put the orange GPS indicator on the *control box* for "no data" and on the
+*receiver* for "frames untagged"; both are in as given. If that is one light it should get one
+name. Only fast-blinking is explained; solid and off are not.
 

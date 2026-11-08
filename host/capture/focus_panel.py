@@ -4,6 +4,13 @@ Shows the decimated uint16 frames from the acquisition tap as a live Bayer
 grayscale preview, with the w10 autofocus controls, the score-vs-encoder
 scatter, the AF telemetry trace and the exposure histogram as overlays.
 
+Fine view (toggle): the full-resolution crop of the patch
+:class:`~capture.fine_tracker.FineFocusTracker` is following, drawn at an exact
+integer number of screen pixels per sensor pixel so nothing is ever averaged
+away, with a coarse overview inset showing where on the frame it sits. This is
+the manual-focus view -- at 1:1 the operator can see the focus change that the
+decimated preview hides.
+
 Arrow keys drive focus steps and trigger period via serial (the on-screen
 +/− and </> group boxes are hidden; the step-count spinbox remains for
 hotkey strength).
@@ -16,8 +23,10 @@ from __future__ import annotations
 
 import logging
 import math
+from math import ceil
 from typing import Optional
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
@@ -32,6 +41,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QGroupBox,
     QDoubleSpinBox,
     QHBoxLayout,
@@ -44,8 +54,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .bayer_demosaic import opencv_bayer_rgb_demosaic_code
 from .pipeline import (
-    SENSOR_FULL_SCALE, _downsample_bayer_to_gray8, exposure_line, exposure_stats,
+    SENSOR_FULL_SCALE, _downsample_bayer_to_gray8, _u16_to_gray8, exposure_line,
+    exposure_stats,
 )
 from .serial_client import SerialClient
 
@@ -62,6 +74,22 @@ def _crop_pixmap_center(pm: QPixmap, tw: int, th: int) -> QPixmap:
     x = max(0, (sw - tw) // 2)
     y = max(0, (sh - th) // 2)
     return pm.copy(x, y, tw, th)
+
+
+def _fine_view_crop(w: int, h: int, tw: int, th: int, zoom: float) -> tuple[int, int, int, int]:
+    """Centre crop ``(x0, y0, cw, ch)`` of a *w* x *h* tile to show in a *tw* x *th*
+    pane at *zoom* screen px per sensor px.
+
+    Rounds up, so the magnified crop covers the pane rather than leaving bars:
+    ``cw * zoom < tw + zoom``. Any overshoot is under one magnified pixel and the label
+    clips it (it never rescales -- ``setScaledContents(False)``). What it never does is
+    return a crop needing a DOWNSCALE; see :meth:`FocusPanel._paint_fine_tile` for why
+    that matters.
+    """
+    zoom = max(1.0, float(zoom))
+    cw = min(int(w), max(2, int(ceil(int(tw) / zoom))))
+    ch = min(int(h), max(2, int(ceil(int(th) / zoom))))
+    return (int(w) - cw) // 2, (int(h) - ch) // 2, cw, ch
 
 
 class _FocusTileDisplayLabel(QLabel):
@@ -361,6 +389,10 @@ class FocusPanel(QWidget):
     autofocus_stop_requested = Signal()
     m4_record_toggled = Signal(bool)     # arm/disarm .bay14line writing while in M4
 
+    # Fine view: full-res tracked tile instead of the coarse whole-frame preview.
+    fine_view_toggled = Signal(bool)
+    fine_lock_changed = Signal(bool)     # freeze the tracked tile on the sensor
+
     # Emitted at low cadence whenever the panel receives a coarse frame. Used by
     # the MainWindow to surface the M4 focus-tap chain.
     diag_log = Signal(str)
@@ -376,6 +408,10 @@ class FocusPanel(QWidget):
         self._cam_device_ids: dict[int, str] = {}
         self._cam_available: dict[int, bool] = {}
         self._controls_locked = False
+        # Fine view state: the latest full-res crop, and where on the COARSE frame the
+        # tracker says it came from (for the overview inset).
+        self._last_fine_crop: Optional[np.ndarray] = None
+        self._fine_roi_coarse: Optional[tuple] = None
 
         self._build_ui()
         self._install_m4_arrow_hotkeys()
@@ -671,7 +707,57 @@ class FocusPanel(QWidget):
         self._m4_record_toggle.toggled.connect(self.m4_record_toggled.emit)
         row.addWidget(self._m4_record_toggle)
 
+        row.addSpacing(12)
+        self._fine_toggle = QPushButton("Fine view")
+        self._fine_toggle.setCheckable(True)
+        self._fine_toggle.setToolTip(
+            "Show the full-resolution crop of one tracked patch instead of the coarse\n"
+            "whole-frame preview. The tracker picks the most focusable tile entering the\n"
+            "leading edge and follows it until it pans off, so a manual focus adjustment\n"
+            "stays on the same subject. The decimated preview averages 4x4 sensor pixels\n"
+            "together and cannot show the detail focus is judged on; this can."
+        )
+        self._fine_toggle.toggled.connect(self._on_fine_toggled)
+        row.addWidget(self._fine_toggle)
+
+        self._lock_tile_chk = QCheckBox("Lock tile")
+        self._lock_tile_chk.setEnabled(False)
+        self._lock_tile_chk.setToolTip(
+            "Freeze the Fine view on the patch it is showing now, pinned in SENSOR\n"
+            "coordinates. The scene then slides under it. Use it to creep focus on one\n"
+            "fixed part of the frame (a bench target, a distant edge) without the\n"
+            "tracker handing over to the next object mid-adjustment."
+        )
+        self._lock_tile_chk.toggled.connect(self.fine_lock_changed.emit)
+        row.addWidget(self._lock_tile_chk)
+
+        row.addWidget(QLabel("Zoom:"))
+        self._zoom_box = QComboBox()
+        self._zoom_box.addItems(["1x", "2x", "4x"])
+        self._zoom_box.setEnabled(False)
+        self._zoom_box.setToolTip(
+            "Fine view magnification, in SCREEN pixels per SENSOR pixel. Integer only,\n"
+            "and never below 1x: a view scaled below 1x averages sensor pixels together,\n"
+            "which blurs away the high spatial frequencies focus is judged on and shows a\n"
+            "sharp lens as soft. Raising the zoom shows less of the tracked tile, never\n"
+            "more detail than the sensor captured."
+        )
+        self._zoom_box.currentIndexChanged.connect(self._repaint_fine_tile)
+        row.addWidget(self._zoom_box)
+
         row.addStretch(1)
+
+        self._dwell_label = QLabel("")
+        self._dwell_label.setStyleSheet(
+            "font-family:Consolas, monospace; color:#aaa; font-size:11px;"
+        )
+        self._dwell_label.setToolTip(
+            "The tracked object in Fine view: which one (obj), which edge it entered from,\n"
+            "how many frames it has been held, roughly how many are left before it exits,\n"
+            "the measured scene flow in coarse px/frame, and the patch's texture score.\n"
+            "WEAK means there is little detail here to judge focus by."
+        )
+        row.addWidget(self._dwell_label)
 
         self._active_cam_label = QLabel("(no camera selected)")
         self._active_cam_label.setStyleSheet(
@@ -912,6 +998,134 @@ class FocusPanel(QWidget):
         """Reset the scatter (a new AF run)."""
         self._scatter_graph.clear()
 
+    # ── Fine view ───────────────────────────────────────────────────────
+
+    def fine_view_enabled(self) -> bool:
+        return self._fine_toggle.isChecked()
+
+    def fine_view_sensor_wh(self) -> tuple[int, int]:
+        """Sensor pixels this pane can display right now, as ``(width, height)``.
+
+        The same ``ceil(pane / zoom)`` as :func:`_fine_view_crop`, so a tile cut to this
+        size is displayed WHOLE: nothing tracked gets cropped away, and no pane pixel is
+        left grey. It cannot be a constant -- the display label is Expanding/Expanding so
+        it grows with the window, and the zoom is a combo box.
+        """
+        zoom = self._fine_zoom()
+        return (max(2, ceil(self._display.width() / zoom)),
+                max(2, ceil(self._display.height() / zoom)))
+
+    def _fine_zoom(self) -> float:
+        """Screen pixels per sensor pixel for the Fine view; >= 1 by construction."""
+        try:
+            return max(1.0, float(self._zoom_box.currentText().rstrip("xX")))
+        except ValueError:
+            return 1.0
+
+    def _on_fine_toggled(self, on: bool) -> None:
+        self._lock_tile_chk.setEnabled(bool(on))
+        self._zoom_box.setEnabled(bool(on))
+        if not on:
+            if self._lock_tile_chk.isChecked():
+                self._lock_tile_chk.setChecked(False)   # emits; the lock has no meaning in coarse
+            self._last_fine_crop = None
+            self._fine_roi_coarse = None
+            self._dwell_label.setText("")
+            self._refresh_coarse_preview()
+        self.fine_view_toggled.emit(bool(on))
+
+    def clear_fine_lock(self) -> None:
+        """Untick 'Lock tile' without emitting (the camera or mode changed under it)."""
+        self._lock_tile_chk.blockSignals(True)
+        self._lock_tile_chk.setChecked(False)
+        self._lock_tile_chk.blockSignals(False)
+
+    def set_fine_track(self, roi_coarse: Optional[tuple], info: str) -> None:
+        """Where the tracker has the patch on the COARSE frame, plus its dwell readout.
+        The ROI drives the overview inset; it is not what gets cropped (the pipeline
+        crops the full-res equivalent)."""
+        self._fine_roi_coarse = tuple(roi_coarse) if roi_coarse else None
+        self._dwell_label.setText(info)
+
+    def receive_fine_crop(self, crop_u16: np.ndarray, ts_iso: str) -> None:
+        """Slot for ``AcquisitionThread.raw_focus_fine_crop`` (full-res tracked patch)."""
+        if crop_u16 is None or getattr(crop_u16, "ndim", 0) < 2:
+            log.warning("receive_fine_crop: bad crop %s", getattr(crop_u16, "shape", None))
+            return
+        self._last_fine_crop = crop_u16
+        self._paint_fine_tile(crop_u16)
+
+    def _repaint_fine_tile(self) -> None:
+        """Re-render the held crop (zoom changed, or the pane was resized)."""
+        if self._fine_toggle.isChecked() and self._last_fine_crop is not None:
+            self._paint_fine_tile(self._last_fine_crop)
+
+    def _paint_fine_tile(self, crop_u16: np.ndarray) -> None:
+        """Paint the crop at EXACTLY ``_fine_zoom()`` screen px per sensor px.
+
+        This must never scale below 1:1. Filling the label with
+        ``KeepAspectRatioByExpanding`` -- which is what the coarse preview does -- turns
+        into a DOWNSCALE as soon as the tracked tile is larger than the pane, averaging
+        sensor pixels together. That destroys precisely the high spatial frequencies
+        focus is judged on, so a well-focused lens looks soft and the view lies about the
+        one thing it exists to show. So: crop to the sensor pixels that fit and show
+        those. Oversized tiles lose their margins, not their detail.
+        """
+        gray8 = _u16_to_gray8(crop_u16, self._display_gain)
+        rgb = cv2.cvtColor(gray8, opencv_bayer_rgb_demosaic_code(
+            {"genicam_pixel_format": "BayerRG14"}))
+        zoom = self._fine_zoom()
+        h, w = rgb.shape[:2]
+        x0, y0, cw, ch = _fine_view_crop(
+            w, h, max(1, self._display.width()), max(1, self._display.height()), zoom)
+        view = np.ascontiguousarray(rgb[y0:y0 + ch, x0:x0 + cw])
+        pm = QPixmap.fromImage(
+            QImage(view.data, cw, ch, cw * 3, QImage.Format.Format_RGB888).copy())
+        if zoom > 1.0:
+            # An integer zoom replicates whole pixels, so nearest neighbour is exact and
+            # invents nothing -- smooth would soften the very pixel edges being judged
+            # and hand back a blur that reads as defocus.
+            pm = pm.scaled(round(cw * zoom), round(ch * zoom),
+                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.FastTransformation)
+        self._display.setPixmap(self._with_overview_inset(pm))
+
+    def _with_overview_inset(self, base: QPixmap) -> QPixmap:
+        """Bottom-left thumbnail of the whole coarse frame with the tracked tile boxed.
+
+        At 1:1 the Fine view shows well under 1% of the frame, so without this the
+        operator cannot tell WHAT they are focusing on -- which matters because the
+        tracker, not they, chose it.
+        """
+        coarse = self._last_coarse_raw
+        if coarse is None or self._fine_roi_coarse is None:
+            return base
+        inset_w = max(96, int(base.width() * 0.18))
+        gray = _downsample_bayer_to_gray8(coarse, inset_w, self._display_gain)
+        gray = np.ascontiguousarray(cv2.resize(
+            gray, (inset_w, max(2, round(inset_w * coarse.shape[0] / coarse.shape[1]))),
+            interpolation=cv2.INTER_AREA))
+        ih, iw = gray.shape[:2]
+        pm = QPixmap.fromImage(
+            QImage(gray.data, iw, ih, iw, QImage.Format.Format_Grayscale8).copy())
+        sx, sy = iw / float(coarse.shape[1]), ih / float(coarse.shape[0])
+        rx0, ry0, rx1, ry1 = self._fine_roi_coarse
+
+        margin = 10
+        out = QPixmap(base)
+        p = QPainter(out)
+        ix, iy = margin, base.height() - ih - margin
+        p.drawPixmap(ix, iy, pm)
+        p.setPen(QPen(QColor(220, 255, 0), 1))     # the tracked tile
+        p.drawRect(int(ix + rx0 * sx), int(iy + ry0 * sy),
+                   max(1, int((rx1 - rx0) * sx)), max(1, int((ry1 - ry0) * sy)))
+        p.setPen(QPen(QColor(200, 200, 200), 1))
+        p.drawRect(ix, iy, iw - 1, ih - 1)
+        p.end()
+        return out
+
+    # ── coarse preview ──────────────────────────────────────────────────
+
     def _show_coarse_preview(self, raw_u16: np.ndarray) -> None:
         dw = max(64, self._display.width())
         dh = max(64, self._display.height())
@@ -931,7 +1145,7 @@ class FocusPanel(QWidget):
 
     def _refresh_coarse_preview(self) -> None:
         raw = self._last_coarse_raw
-        if raw is not None:
+        if raw is not None and not self._fine_toggle.isChecked():
             self._show_coarse_preview(raw)
 
     def exposure_summary(self) -> str:
@@ -943,11 +1157,16 @@ class FocusPanel(QWidget):
         repaints the current view so the change shows before the next frame."""
         self._display_gain = float(gain)
         self._refresh_coarse_preview()
+        self._repaint_fine_tile()
 
     def receive_raw_frame(self, raw_u16: np.ndarray, ts_iso: str) -> None:
-        """Slot for ``AcquisitionThread.raw_focus_frame`` (M4 coarse preview)."""
+        """Slot for ``AcquisitionThread.raw_focus_frame``.
+
+        Held even in Fine view: it is what the tracker runs on (via the MainWindow),
+        what the exposure histogram reads, and what the overview inset draws."""
         self._last_coarse_raw = raw_u16
-        self._show_coarse_preview(raw_u16)
+        if not self._fine_toggle.isChecked():
+            self._show_coarse_preview(raw_u16)
         # ~3 ms on the 4x tap (a further 2x inside); kept current even with the
         # overlay hidden so the AF-DONE / Record-arm log line is never stale.
         self._last_exposure = exposure_stats(raw_u16)
@@ -966,3 +1185,4 @@ class FocusPanel(QWidget):
     def resizeEvent(self, event) -> None:  # noqa: N802 -- Qt naming
         super().resizeEvent(event)
         self._refresh_coarse_preview()
+        self._repaint_fine_tile()
