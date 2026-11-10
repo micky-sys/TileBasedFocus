@@ -12,6 +12,13 @@ budget out 600-1500 c short of focus while w10 was still falling. Three rules ca
 * ``W10Focus`` extends the sweep budget once when w10 is still falling at its end, instead of failing on the
   way down the flank.
 
+And from the flight's five DONE runs (0.87 px frame scatter, three of them one-sided), 2026-11-09:
+
+* a flank counts as seen only ``far_depths`` (2) depths past the vertex and from ``min_far`` (5) frames
+  (``flank_seen``): the V has risen ~1.1 px there, not the 0.15 px the old 1-depth/3-frame rule accepted;
+* ``dwell_frames`` holds the lens for N gated frames per station (the panel's "Dwell x3"), with the vertex CI
+  bootstrapped by station, not by frame.
+
 Run: ``py -3 tools/test_af_w10_flight.py``
 """
 from __future__ import annotations
@@ -19,11 +26,13 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host"))
 
-from af_w10_replay import SyntheticLens, run_engine  # noqa: E402
-from capture.af_w10 import W10Config  # noqa: E402
+from af_w10_replay import FlightLens, SyntheticLens, run_engine  # noqa: E402
+from capture.af_w10 import W10Config, bootstrap_vertex  # noqa: E402
 from capture.autofocus_w10 import AutoFocusController, AutoFocusEngineW10  # noqa: E402
 
 
@@ -139,10 +148,66 @@ def test_span_extends_while_falling() -> None:
     print(f"span extension spent once, then: {af.log[-1]}")
 
 
+_FLIGHT = dict(direction=-1, start_offset=2500, span_counts=7000, lash_counts=1500)
+
+
+def _parks(seeds, **kw):
+    errs, frames = [], []
+    for s in seeds:
+        lens = FlightLens(seed=s)
+        af = run_engine(lens, W10Config(**_FLIGHT, **kw), max_frames=600)
+        assert af.state.value == "done", (s, kw, af.log[-2:])
+        errs.append(lens.lens_pos() - lens.e0); frames.append(af.frames)
+    errs = np.array(errs)
+    return float(np.sqrt(np.mean(errs ** 2))), float(np.abs(errs).max()), float(np.median(frames))
+
+
+def test_far_flank_brackets_in_flight_noise() -> None:
+    # The old rule (1 depth, 3 frames, +0.15 px) on the flight's noise: 5 of 40 parks outside the depth of
+    # focus, worst 1036 c. The 2-depth / 5-frame rule: none outside, for ~5 more frames per run.
+    seeds = range(20)
+    rms_old, worst_old, fr_old = _parks(seeds, far_depths=1.0, min_far=3)
+    rms, worst, fr = _parks(seeds)
+    depth = 400.0   # FlightLens default
+    assert worst <= depth, (worst, "a park outside the depth of focus with the far-flank rule")
+    assert rms < rms_old, (rms, rms_old)
+    assert fr - fr_old < 15, (fr, fr_old, "walking two depths out should cost a few frames, not a sweep")
+    print(f"far flank: old rule rms {rms_old:.0f} c worst {worst_old:.0f} c in {fr_old:.0f} frames; "
+          f"new rule rms {rms:.0f} c worst {worst:.0f} c in {fr:.0f} frames")
+
+
+def test_dwell_holds_per_station_and_refines_finer() -> None:
+    lens = FlightLens(seed=3)
+    af = run_engine(lens, W10Config(**_FLIGHT, dwell_frames=3, tol_frac=0.1), max_frames=600)
+    assert af.state.value == "done", af.log[-2:]
+    per_station = np.bincount(np.asarray(af.station))
+    per_station = per_station[per_station > 0]
+    # every station the sweep finished got exactly 3 gated samples (the last may be cut short by the park)
+    assert (per_station[:-1] == 3).all(), per_station
+    assert len(af.station) >= 3 * 30, len(af.station)
+    # the station bootstrap is the honest one: frames of a station share their ground, so counting them as
+    # independent shrinks the CI by ~sqrt(3)
+    e, w, st = np.array(af.enc), np.array(af.w10), np.array(af.station)
+    lo_f, hi_f = bootstrap_vertex(e, w, 100, seed=1)
+    lo_s, hi_s = bootstrap_vertex(e, w, 100, seed=1, blocks=st)
+    assert (hi_s - lo_s) > 1.2 * (hi_f - lo_f), (hi_s - lo_s, hi_f - lo_f)
+    # and with the park tolerance tightened to go with it, dwell x3 parks finer than creep (sim: 65 vs 96 c
+    # rms over 40 seeds), at roughly 3x the frames
+    seeds = range(12)
+    rms_c, _, fr_c = _parks(seeds)
+    rms_d, _, fr_d = _parks(seeds, dwell_frames=3, tol_frac=0.1)
+    assert rms_d < rms_c, (rms_d, rms_c)
+    assert fr_d < 3.5 * fr_c, (fr_d, fr_c)
+    print(f"dwell x3: {len(per_station)} stations, CI by station {hi_s - lo_s:.0f} c vs by frame {hi_f - lo_f:.0f} c; "
+          f"parks rms {rms_d:.0f} c in {fr_d:.0f} frames vs creep {rms_c:.0f} c in {fr_c:.0f}")
+
+
 if __name__ == "__main__":
     test_burst_cap_in_counts()
     test_known_polarity_skips_the_probe()
     test_backoff_stall_far_from_start_fails()
     test_backoff_stall_at_start_rebases()
     test_span_extends_while_falling()
+    test_far_flank_brackets_in_flight_noise()
+    test_dwell_holds_per_station_and_refines_finer()
     print("OK")

@@ -13,7 +13,13 @@
 >   Anything keyed on the mode label rather than on what the scene does is WRONG (M4 in
 >   flight is moving).
 
-_Last updated: 2026-11-04 — **w10 is the only AF; preflight check; demo mode** (§55):
+_Last updated: 2026-11-09 — **AF walks two depths past the vertex before it believes a flank;
+"Dwell x3" checkbox** (§58). The 2026-11-02 flight's DONE runs had 0.87 px frame scatter and
+three of five were one-sided: the old bracket test (3 frames, +0.15 px, one depth out) passed on
+noise. Now `far_depths` 2 / `min_far` 5 (the V has risen ~1.1 px there); on a flight-noise
+synthetic lens parks outside the depth of focus went 5/40 → 0/40 for ~5 frames more. Dwell x3
+(3 gated frames per station, CI bootstrapped by station, park CI ≤ ±40 c) halves the park rms at
+3x the run time. Previous (2026-11-04): **w10 is the only AF; preflight check; demo mode** (§55):
 the legacy AF1–3 engines, Fine/dual-object trackers, field-map and OrthoSim are **deleted**
 (`7d68360`, 43 files / 19.7k lines; §20–29 and §45–50 now describe history). New **Preflight
 check** button (`host/capture/preflight.py`): `$M4*` gated on the `Mode 4:` banner (the
@@ -7153,4 +7159,105 @@ a cp1252 log handler.
 **Open:** your wording put the orange GPS indicator on the *control box* for "no data" and on the
 *receiver* for "frames untagged"; both are in as given. If that is one light it should get one
 name. Only fast-blinking is explained; solid and off are not.
+
+## 58. The AF walks further before it believes a flank; Dwell x3 (2026-11-09)
+
+### 58.1 Why
+
+The 2026-11-02 flight's five DONE runs (`Session logs\Iron661_w10af_20261102_*.csv`) have a
+residual sd about the fitted V of **0.87 px** (0.55–1.20 per run) against the bench's 0.45, with
+lag-1 autocorrelation **+0.43** — about half of it is slowly varying ground content, half
+per-frame whole-frame blur. Not photon-limited (sd by brightness tercile 0.67/0.87/1.03), so
+exposure cannot buy it back. **Three of the five were one-sided**: the vertex sat within ~1 depth
+of the end of travel and moved by hundreds of counts when the last frames were dropped.
+
+The `bracketed` test let that through: on each side of e0 it wanted 3 frames beyond one depth
+whose median beat the near median by rise/2 = **0.15 px**. The median of 3 frames at 0.9 px
+noise is ±0.6 px; the test was z ≈ 0.3, i.e. decided by the noise, whichever way. The replay
+harness (§54.7) never saw it because every one-sided recording was excluded by hand before
+replay, the random-frame-in-window serving decorrelated the content term, and parks were
+scored against a vertex fitted on the same pool they sampled from.
+
+### 58.2 What changed (`host/capture/af_w10.py`)
+
+- **`flank_seen(…, far_depths, min_far)`**: the far frames start `far_depths` (config, **2.0**)
+  depths past e0, there must be `min_far` (**5**) of them, and their median must exceed the near
+  median by half the rise the fitted V predicts at that distance:
+  `rise_far = sqrt(w0² + far_depths²·((w0+r)² − w0²)) − w0`. At `far_depths` 1 that is exactly
+  the old rise/2; at 2 it is ~0.55 px (the V is quadratic in w², so one more depth of walking is
+  4x the signal). Cost on a ±400 c lens: ~5 frames.
+- **`fit_v_local` keeps the global fit when the local refit's vertex leaves its own window** —
+  the refit on a one-sided window produced a near-flat parabola with its vertex 10⁵ c away
+  (found on a dwell run; applies to creep too).
+- **`dwell_frames`** (config, 1): gated frames per station before the next step. `_move`
+  resets `station_n`, gated samples increment it, `_dwelling()` returns a `hold` until it is
+  met, in SWEEP and REFINE alike. `min_frames` is a count of *stations*, so `min_samples =
+  min_frames × dwell_frames` is what the engine now waits for before it believes a fit
+  (8 samples = 3 stations found 145 c "bowls" 3000 c from focus). `max_refine_frames` and the
+  bracket-lost patience scale the same way.
+- **`bootstrap_vertex(…, blocks=)`** resamples by **station**: the frames of one station share
+  their ground and so their content bias; counted as independent, three per station shrank the
+  CI by √3 for nothing and REFINE stopped with a third of creep's lever arm (dwell rms 210 c
+  vs creep 123 with the frame bootstrap; 149 by station; 65 once the tolerance lets REFINE
+  use the frames, below). Creep is unchanged by this (one frame per block).
+- **Panel**: `Dwell x3` checkbox in the autofocus row (locked during a run) →
+  `MainWindow._on_af_dwell_toggled` sets `dwell_frames` 3 **and `tol_frac` 0.1** (= `tol_min`
+  40 c on these lenses), else 1 / 0.5. Dwell at the creep tolerance is pointless (149 vs 123);
+  dwell's gain is in the extra REFINE stations the tighter tolerance buys.
+
+### 58.3 Numbers (`FlightLens` in `tools/af_w10_replay.py`, 40 seeds, ±400 c lens)
+
+`FlightLens` is the flight's noise, not the old self-check's: 0.44 px white + AR(1) content of sd
+0.75, ρ 0.58 per frame (lag-1 of the sum 0.43), metric clamped at 11 px.
+
+| rule | parks outside the depth | rms | worst | median frames |
+|---|---|---|---|---|
+| old (1 depth, 3 far, +0.15 px), creep | **5 / 40** | 322 c | 1036 c | 65 |
+| new (2 depths, 5 far), creep, tol ½ depth | 0 / 40 | 123 c | 269 c | 70 |
+| new, creep, tol 0.1 | 0 / 40 | 96 c | 221 c | 76 |
+| new, dwell x3, tol ½ depth (station CI) | 0 / 40 | 149 c | 394 c | 169 |
+| new, dwell x3, tol 0.1 (the checkbox) | 0 / 40 | **65 c** | 156 c | 190 |
+
+Reading: the far-flank rule is the fix for one-sided parks and costs five frames. Dwell x3 is a
+precision option — half the rms — for 2.7x the frames (~40 s vs ~15 s at 4.8 fps), and only
+with the tolerance tightened to go with it. §54.3's "creep beats dwell" still holds at equal
+frame budgets; the checkbox is for when time is cheap and the operator wants the bottom.
+Caveat the sim cannot settle: the real content term's correlation *shape* (the sim's AR(1) is
+fitted to one lag); an 8-frame block model made dwell manufacture 150 c bowls out of 0.6 px
+content steps, which the `min_samples` scaling then suppressed. Watch the first dwell runs for a
+fitted depth well under the creep runs' 300–500 c.
+
+### 58.3a Min-of-3 or mean-of-3 at a dwell station? Mean (measured 2026-11-10)
+
+Asked because blur is one-sided (it only adds width), so the "luckiest" frame should sit closest
+to the optics. Measured on the flight's mapping lines (lens fixed, 9,233 gated frames,
+`D:\Top10_w10_RamHash_2026_11_02\all_frames_w10.csv`, residual = w10 minus the per-line per-F-slot
+median; consecutive triples within a sweep as stations): the per-frame scatter *is* one-sided
+(skew +0.52, p95 +1.30 vs p5 −0.94 px), but with three frames the mean still wins:
+
+| station estimate | sd across stations | vs one frame (0.69 px) |
+|---|---|---|
+| min of 3 | 0.46 px | 0.67× (Gaussian theory 0.75) |
+| **mean of 3** | **0.43 px** | 0.63× |
+| median of 3 | 0.49 px | 0.71× |
+
+And the min carries two biases the mean does not: it reads 0.47 px low by an amount that grows
+with the noise, and noise grows with softness, so it would pull the flanks down more than the
+bottom (flatter V → wider fitted depth → looser park tolerance; e0 itself survives, symmetric); and
+the frame it picks has fewer edges (median 1965 vs 2176) — partly the thin-edge low-read of
+§54.3 c, not optics. The engine already does the mean: the three dwell samples enter the
+least-squares individually and `fit_v`'s 3σ trim removes a gust-hit frame. Min would win with many
+frames per station (converges on the blur-free floor) or on a day when blur dominates content.
+
+### 58.4 Reproduce / check
+
+```
+py -3 tools/test_af_w10_flight.py        # + test_far_flank_brackets_in_flight_noise, test_dwell_holds_per_station_and_refines_finer
+py -3 tools/af_w10_replay.py --self-check
+```
+
+Not yet flown. Open from the same analysis, not done: weight frames by edge count in the fit
+(corr(residual, log n_edges) +0.31), a block-aware CI for *creep* (ρ 0.43 between consecutive
+stations makes its CI optimistic too; `tol_frac` 0.5 absorbs it today), and the replay harness
+serving recorded frames sequentially rather than `rng.choice` within the window.
 

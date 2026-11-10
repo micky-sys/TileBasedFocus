@@ -387,6 +387,7 @@ class FocusPanel(QWidget):
     autofocus_requested = Signal()       # one w10 run on the active camera
     autofocus_all_requested = Signal()   # focus cam1..3 once, in sequence
     autofocus_stop_requested = Signal()
+    autofocus_dwell_toggled = Signal(bool)  # "Dwell x3": 3 gated frames per station, finer park
     m4_record_toggled = Signal(bool)     # arm/disarm .bay14line writing while in M4
 
     # Fine view: full-res tracked tile instead of the coarse whole-frame preview.
@@ -801,6 +802,17 @@ class FocusPanel(QWidget):
         self._af_stop_button.clicked.connect(self.autofocus_stop_requested.emit)
         row.addWidget(self._af_stop_button)
 
+        self._af_dwell_chk = QCheckBox("Dwell x3")
+        self._af_dwell_chk.setToolTip(
+            "Hold the lens for 3 gated frames at every station instead of 1, and refine until\n"
+            "the vertex CI is within +-40 c (not half a depth of focus). Averages the per-frame\n"
+            "blur for a finer park (sim at flight noise: ~60 c rms vs ~100 c), at about 3x the\n"
+            "run time (~40 s vs ~15 s). Ground content bias does not average: for that the\n"
+            "engine still walks. Read before each run; a run in progress keeps its setting."
+        )
+        self._af_dwell_chk.toggled.connect(self.autofocus_dwell_toggled.emit)
+        row.addWidget(self._af_dwell_chk)
+
         self._roi_graph_chk = QCheckBox("ROIs")
         self._roi_graph_chk.setToolTip(
             "Score-vs-encoder graph: plot the w10 AF's five ROIs separately (TL red, TR "
@@ -893,6 +905,7 @@ class FocusPanel(QWidget):
         self._af_button.setEnabled(not running)
         self._af_all_button.setEnabled(not running)
         self._af_stop_button.setEnabled(running)
+        self._af_dwell_chk.setEnabled(not running)
 
     def set_autofocus_status(self, text: str) -> None:
         self._af_status_text = text

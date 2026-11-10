@@ -15,8 +15,9 @@ and parking at ``e0``.
 Shape of a run
 --------------
     START    first frame fixes the origin; command a move AGAINST the sweep direction by ``start_offset``
-    SWEEP    creep in the sweep direction ``step_counts`` per gated frame, refitting the V on every frame
-    REFINE   both flanks have risen ``rise_px`` above the floor: smaller steps until the vertex CI <= tol
+    SWEEP    creep in the sweep direction ``step_counts`` per station (``dwell_frames`` gated frames each),
+             refitting the V on every frame
+    REFINE   both flanks seen ``far_depths`` depths out (``flank_seen``): smaller steps until the vertex CI <= tol
     PARK     return past the vertex on the start side by ``lash_counts``, then re-approach e0 in the sweep
              direction -- the encoder is on the motor side of ~1000 counts of lash (sec.49/53.5), so the lens
              is only where the curve says it is when approached the way the curve was measured
@@ -121,24 +122,35 @@ def fit_v_local(e, w, rise_px: float, window_depths: float, min_frames: int = 8,
             fit, keep = fit_v(e[seed], w[seed], trim), seed
     if fit is None or window_depths <= 0:
         return fit, keep
-    win = np.abs(e - fit.e0) <= window_depths * depth_counts(fit, rise_px)
+    win_c = window_depths * depth_counts(fit, rise_px)
+    win = np.abs(e - fit.e0) <= win_c
     if min_frames <= win.sum() < len(e):
         local = fit_v(e[win], w[win], trim)
-        if local is not None:
+        # A refit whose vertex leaves the window it was fitted on is extrapolation from one slope (the
+        # window sat at the end of a one-sided sweep): a near-flat parabola with its vertex 10^5 c away
+        # replaced a sound global fit on a dwell run (seed 21 of the 2026-11-09 check). Keep the global one.
+        if local is not None and abs(local.e0 - fit.e0) <= win_c:
             return local, win
     return fit, keep
 
 
-def bracketed(e, w, fit: Optional[Vfit], rise_px: float, min_far: int = 3) -> bool:
-    """Has the sweep SEEN both flanks? Model-light on purpose: on each side of e0 the frames beyond one depth of
-    focus must be at least ``min_far`` and their median w10 must exceed the near frames' median by rise/2. A fit
-    extrapolated from one flank puts e0 outside the data and fails this on the empty side."""
-    return flank_seen(e, w, fit, rise_px, -1, min_far) and flank_seen(e, w, fit, rise_px, 1, min_far)
+def bracketed(e, w, fit: Optional[Vfit], rise_px: float, min_far: int = 3, far_depths: float = 1.0) -> bool:
+    """Has the sweep SEEN both flanks? Model-light on purpose: on each side of e0 the frames beyond
+    ``far_depths`` depths of focus must be at least ``min_far`` and their median w10 must exceed the near
+    frames' median by half the rise the V predicts there. A fit extrapolated from one flank puts e0 outside
+    the data and fails this on the empty side."""
+    return (flank_seen(e, w, fit, rise_px, -1, min_far, far_depths)
+            and flank_seen(e, w, fit, rise_px, 1, min_far, far_depths))
 
 
-def flank_seen(e, w, fit: Optional[Vfit], rise_px: float, side: int, min_far: int = 3) -> bool:
-    """One side of ``bracketed``: at least ``min_far`` frames beyond one depth on that side of e0, rising by
-    rise/2 over the near frames' median (``side`` is +1 for encoder values above e0, -1 below)."""
+def flank_seen(e, w, fit: Optional[Vfit], rise_px: float, side: int, min_far: int = 3,
+               far_depths: float = 1.0) -> bool:
+    """One side of ``bracketed``: at least ``min_far`` frames beyond ``far_depths`` depths on that side of e0
+    (``side`` is +1 for encoder values above e0, -1 below), rising over the near frames' median by half of
+    what the V predicts at that distance. At ``far_depths`` 1 that is rise/2 (0.15 px); at 2 it is ~0.55 px,
+    because w10^2 is quadratic in defocus -- four times the signal for one more depth of travel, which is why
+    the engine walks that far (2026-11-02: three of five DONE runs were one-sided with 0.9 px frame noise;
+    0.15 px over 3 frames was decided by the noise)."""
     if fit is None:
         return False
     e = np.asarray(e, float); w = np.asarray(w, float)
@@ -151,17 +163,29 @@ def flank_seen(e, w, fit: Optional[Vfit], rise_px: float, side: int, min_far: in
     near = np.abs(e - fit.e0) < dep
     if near.sum() < min_far:
         return False
-    far = side * (e - fit.e0) >= dep
-    return far.sum() >= min_far and float(np.median(w[far]) - np.median(w[near])) >= rise_px / 2
+    far = side * (e - fit.e0) >= far_depths * dep
+    rise_far = math.sqrt(fit.w0 ** 2 + far_depths ** 2 * ((fit.w0 + rise_px) ** 2 - fit.w0 ** 2)) - fit.w0
+    return far.sum() >= min_far and float(np.median(w[far]) - np.median(w[near])) >= rise_far / 2
 
 
-def bootstrap_vertex(e, w, n_boot: int = 100, seed: int = 0, q=(2.5, 97.5)) -> tuple[float, float]:
-    """Percentile interval of e0 over frame resamples; (-inf, inf) when the fit fails on >30% of resamples."""
+def bootstrap_vertex(e, w, n_boot: int = 100, seed: int = 0, q=(2.5, 97.5), blocks=None) -> tuple[float, float]:
+    """Percentile interval of e0 over frame resamples; (-inf, inf) when the fit fails on >30% of resamples.
+    ``blocks`` (one label per sample) resamples whole blocks -- the frames of one station -- because frames
+    taken standing still share their ground and so their content bias: counted as independent, three
+    frames per station shrank the CI by sqrt(3) for nothing and REFINE stopped with a third of creep's
+    lever arm (dwell check, 2026-11-09: rms 210 c vs 123 for creep; by station, 95 c)."""
     e = np.asarray(e, float); w = np.asarray(w, float)
     rng = np.random.default_rng(seed)
     out = []
+    members = None
+    if blocks is not None:
+        _, inv = np.unique(np.asarray(blocks), return_inverse=True)
+        members = [np.flatnonzero(inv == k) for k in range(inv.max() + 1)]
     for _ in range(n_boot):
-        idx = rng.integers(0, len(e), len(e))
+        if members is None:
+            idx = rng.integers(0, len(e), len(e))
+        else:
+            idx = np.concatenate([members[k] for k in rng.integers(0, len(members), len(members))])
         f = fit_v(e[idx], w[idx])
         if f is not None:
             out.append(f.e0)
@@ -208,6 +232,14 @@ class W10Config:
     max_backoffs: int = 3        # back-offs allowed (the first one included) before giving up on the near flank
     fit_window_depths: float = 2.5   # refit on samples within this many depths of the vertex (0 = use all)
     rise_px: float = 0.3         # flank rise that defines "bracketed" and the depth of focus
+    far_depths: float = 2.0      # a flank counts as seen only from this many depths past the vertex, where the
+                                 # V has risen ~1.1 px, not 0.3: one more depth of walking buys 4x the signal
+                                 # against the 0.9 px flight frame noise (``flank_seen``)
+    min_far: int = 5             # ... and from at least this many frames out there (median of 5 at 0.9 px
+                                 # noise is +-0.5 px; 3 was +-0.6 and passed on luck)
+    dwell_frames: int = 1        # gated frames per station before the next step (1 = creep, the sec.54
+                                 # study's design; 3 = the panel's "Dwell x3", averaging the white per-frame
+                                 # blur for a finer vertex at 3x the run time -- content bias does not average)
     tol_frac: float = 0.5        # park tolerance (95% CI half-width) as a fraction of the depth of focus: half
                                  # a depth costs +0.075 px of w10, invisible; 1/3 was unreachable in a sane
                                  # budget on the 2026-09-30 flight (CI +-250..400 at 30 frames, sec.54)
@@ -247,6 +279,9 @@ class W10Focus:
     backoff_from: Optional[float] = None   # encoder when the latest back-off was commanded
     span_extended: bool = False  # the one-time span extension has been spent
     far_target: Optional[float] = None
+    station_n: int = 0           # gated samples taken since the last move (dwell bookkeeping)
+    station_id: int = 0          # moves commanded so far; ``station`` labels each sample with it
+    station: list = field(default_factory=list)
     enc_hist: list = field(default_factory=list)   # every encoder reading seen (the stall detector's input)
     log: list = field(default_factory=list)
 
@@ -263,7 +298,16 @@ class W10Focus:
 
     def _move(self, target: float) -> Action:
         self.target = float(target)
+        self.station_n = 0
+        self.station_id += 1
         return Action("move", self.target)
+
+    def _dwelling(self) -> Optional[Action]:
+        """Hold for more frames at this station while fewer than ``dwell_frames`` gated samples were taken
+        here; None once the station is done."""
+        if self.station_n < self.cfg.dwell_frames:
+            return Action("hold", reason=f"dwell {self.station_n}/{self.cfg.dwell_frames}")
+        return None
 
     def _step(self, encoder: float, step: float) -> Action:
         """Next creep target: one step beyond the further of the reading and the last target, so a reading that
@@ -281,11 +325,19 @@ class W10Focus:
         self._say("FAIL " + reason)
         return Action("fail", reason=reason)
 
+    @property
+    def min_samples(self) -> int:
+        """``min_frames`` counts STATIONS (the sec.54 design samples one frame per station); with dwell the
+        same stations take ``dwell_frames`` times the samples, and a fit believed after 8 samples = 3
+        stations found 145 c "bowls" in 0.9 px noise 3000 c from focus (dwell check, 2026-11-09)."""
+        return self.cfg.min_frames * self.cfg.dwell_frames
+
     def _refit(self) -> None:
         e = np.asarray(self.enc); w = np.asarray(self.w10)
-        self.fit, keep = fit_v_local(e, w, self.cfg.rise_px, self.cfg.fit_window_depths, self.cfg.min_frames)
-        if self.fit is not None and keep.sum() >= self.cfg.min_frames:
-            self.ci = bootstrap_vertex(e[keep], w[keep], self.cfg.n_boot, seed=len(e))
+        self.fit, keep = fit_v_local(e, w, self.cfg.rise_px, self.cfg.fit_window_depths, self.min_samples)
+        if self.fit is not None and keep.sum() >= self.min_samples:
+            self.ci = bootstrap_vertex(e[keep], w[keep], self.cfg.n_boot, seed=len(e),
+                                       blocks=np.asarray(self.station)[keep])
         else:
             self.ci = (-math.inf, math.inf)
 
@@ -303,7 +355,10 @@ class W10Focus:
         return (self.ci[1] - self.ci[0]) / 2
 
     def _bracketed(self) -> bool:
-        return bracketed(self.enc, self.w10, self.fit, self.cfg.rise_px)
+        return bracketed(self.enc, self.w10, self.fit, self.cfg.rise_px, self.cfg.min_far, self.cfg.far_depths)
+
+    def _flank_seen(self, side: int) -> bool:
+        return flank_seen(self.enc, self.w10, self.fit, self.cfg.rise_px, side, self.cfg.min_far, self.cfg.far_depths)
 
     def _span_budget(self) -> float:
         return self.cfg.span_counts * (1.0 + self.cfg.span_extend if self.span_extended else 1.0)
@@ -343,11 +398,10 @@ class W10Focus:
         within one depth of the start (or behind it), or there is no convex fit and w10 only rises with travel."""
         d = self.cfg.direction
         e = np.asarray(self.enc); w = np.asarray(self.w10)
-        if len(e) - self.n_at_backoff < self.cfg.min_frames:
+        if len(e) - self.n_at_backoff < self.min_samples:
             return False   # the verdict on a start point needs samples taken from it
         if (self.fit is not None and e.min() < self.fit.e0 < e.max()
-                and flank_seen(e, w, self.fit, self.cfg.rise_px, d)
-                and not flank_seen(e, w, self.fit, self.cfg.rise_px, -d)):
+                and self._flank_seen(d) and not self._flank_seen(-d)):
             # the vertex was passed and the end flank is in (same test as ``bracketed``), yet the start-side
             # flank is not: it never will be from this start point. (An early fit whose vertex falls outside
             # the travelled range is extrapolation and is not trusted here.)
@@ -432,14 +486,15 @@ class W10Focus:
                 return self._fail(f"{self.bad_run} consecutive frames failed the w10 gate")
             return Action("hold", reason="frame gated out")
         self.bad_run = 0
-        self.enc.append(float(encoder)); self.w10.append(float(stats["w10"]))
+        self.enc.append(float(encoder)); self.w10.append(float(stats["w10"])); self.station.append(self.station_id)
+        self.station_n += 1
         self._refit()
 
         if self.state == AFW10State.SWEEP:
-            if len(self.enc) >= cfg.min_frames and self._bracketed():
+            if len(self.enc) >= self.min_samples and self._bracketed():
                 self.state = AFW10State.REFINE
                 self._say(f"bracketed: vertex {self.fit.e0:.0f} CI +-{self.ci_half:.0f}, depth +-{self.depth:.0f}, tol +-{self.tol:.0f}")
-            elif len(self.enc) >= cfg.min_frames and self._started_past_vertex():
+            elif len(self.enc) >= self.min_samples and self._started_past_vertex():
                 # the start point was already on the far side of the vertex (or inside one depth of it), so
                 # the start-side flank can never be seen from here: back off again and come through once more
                 if self.backoffs >= cfg.max_backoffs:
@@ -455,25 +510,27 @@ class W10Focus:
                     # with the lens 600-1500 c from focus and sharpening on every frame.
                     self.span_extended = True
                     self._say(f"budget spent at {travelled:.0f} c but w10 still falling: extending the sweep once")
-                    return self._step(encoder, cfg.step_counts)
+                    return self._dwelling() or self._step(encoder, cfg.step_counts)
                 return self._fail(f"swept {travelled:.0f} counts without bracketing the vertex")
             else:
-                return self._step(encoder, cfg.step_counts)
+                return self._dwelling() or self._step(encoder, cfg.step_counts)
 
         if self.state == AFW10State.REFINE:
             self.refine_frames += 1
             if not self._bracketed():
-                if self.refine_frames > 5:
+                if self.refine_frames > 5 * cfg.dwell_frames:
                     # the refit un-bracketed us: keep sweeping rather than park on a guess
                     self.state = AFW10State.SWEEP; self.refine_frames = 0
                     self._say("bracket lost on refit; back to SWEEP")
-                return self._step(encoder, cfg.step_counts)
-            if self.ci_half <= self.tol or self.refine_frames > cfg.max_refine_frames or travelled > self._span_budget():
+                return self._dwelling() or self._step(encoder, cfg.step_counts)
+            if (self.ci_half <= self.tol or self.refine_frames > cfg.max_refine_frames * cfg.dwell_frames
+                    or travelled > self._span_budget()):
                 return self._begin_park()
             # keep collecting: fine steps through the bowl, then normal steps out along the far flank (more
             # lever arm on the curvature); standing still would only re-sample one patch of ground
+            # (unless dwelling, which trades that for averaging the per-frame blur)
             past = d * (encoder - self.fit.e0) > self.depth
-            return self._step(encoder, cfg.step_counts if past else cfg.refine_step)
+            return self._dwelling() or self._step(encoder, cfg.step_counts if past else cfg.refine_step)
         return Action("hold")
 
     def _begin_park(self) -> Action:

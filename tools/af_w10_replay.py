@@ -193,6 +193,22 @@ class SyntheticLens:
         return self.pos + self.rng.normal(0, 2), stats
 
 
+class FlightLens(SyntheticLens):
+    """The 2026-11-02 flight's per-frame scatter: residual sd 0.87 px about the V with lag-1 autocorrelation
+    +0.43 (five DONE runs) -- the bench's 0.44 px white term plus an AR(1) content term of sd 0.75 and rho
+    0.58 per frame (lag-1 of the sum = 0.58 * 0.75^2 / 0.87^2 = 0.43). The metric saturates at 11 px
+    (sec.52). No cloud: this lens is for precision statistics, not gate yield."""
+    RHO, SD_C, SD_W = 0.58, 0.75, 0.44
+
+    def frame(self):
+        self.n += 1
+        self.bias = self.RHO * self.bias + math.sqrt(1 - self.RHO ** 2) * self.rng.normal(0, self.SD_C)
+        w = math.sqrt(self.w0 ** 2 + self.c * (self.lens_pos() - self.e0) ** 2) + self.bias + self.rng.normal(0, self.SD_W)
+        stats = dict(w10=min(max(w, 1.75), 11.0), n_edges=int(self.rng.integers(400, 3000)), n_roi=5,
+                     med_mean=9000.0, enc_stale=0)
+        return self.pos + self.rng.normal(0, 2), stats
+
+
 def self_check():
     for seed in range(4):
         lens = SyntheticLens(seed=seed)

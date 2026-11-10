@@ -2565,6 +2565,7 @@ class MainWindow(QMainWindow):
         self._focus_panel.autofocus_requested.connect(self._on_autofocus_requested)
         self._focus_panel.autofocus_all_requested.connect(self._on_autofocus_all_requested)
         self._focus_panel.autofocus_stop_requested.connect(self._on_af_stop_requested)
+        self._focus_panel.autofocus_dwell_toggled.connect(self._on_af_dwell_toggled)
         self._autofocus.status.connect(self._on_autofocus_status)
         self._autofocus.finished.connect(self._on_autofocus_finished)
         self._autofocus.run_state_changed.connect(self._on_autofocus_run_state)
@@ -4006,6 +4007,16 @@ class MainWindow(QMainWindow):
             self._log("Autofocus: select a camera to preview first.")
             return
         self._autofocus.start_single(pipe.camera_number)
+
+    @Slot(bool)
+    def _on_af_dwell_toggled(self, on: bool) -> None:
+        """Panel 'Dwell x3': 3 gated frames per station and a +-40 c park tolerance (tol_frac 0.1 of
+        a 400 c depth clamps to tol_min), else the sec.54 creep design. ``W10Focus`` shares this
+        config object, so the panel locks the checkbox while a run is active."""
+        cfg = self._autofocus.config
+        cfg.dwell_frames = 3 if on else 1
+        cfg.tol_frac = 0.1 if on else 0.5
+        self._log(f"w10 AF: {'dwell x3, park CI <= +-40 c' if on else 'creep (1 frame/station), park CI <= half a depth'}")
 
     @Slot()
     def _on_autofocus_all_requested(self) -> None:
