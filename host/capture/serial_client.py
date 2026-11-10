@@ -62,6 +62,7 @@ class SerialClient(QObject):
 
     line_received = Signal(str)
     connection_changed = Signal(bool)
+    link_changed = Signal(str)   # "via Kmopoflight" / "USB COMn" (BridgingFocusController only)
 
     def __init__(self, mode_controller: ModeController,
                  controller: Optional[FocusController] = None) -> None:
@@ -196,6 +197,11 @@ class SerialClient(QObject):
     @property
     def connected(self) -> bool:
         return self._ctrl.connected
+
+    @property
+    def link(self) -> str:
+        """Human-readable transport: bridge or USB port (empty for a plain controller)."""
+        return getattr(self._ctrl, "link", "")
 
     def connect_port(self, port: str) -> None:
         self._ctrl.connect(port, on_response=self._on_line)

@@ -8,11 +8,11 @@ by the same PCB pulse.
 
 **Windows host:** use **`Serial`** only — the ClearCore’s **USB virtual COM port** (115200 baud). That is the correct link for the focus app.
 
-**`Serial0`** is separate hardware: **RS-232** (`Serial0.ttl(false)`) for other onboard / external equipment (e.g. collection / nav). The focus app must **not** use `Serial0`.
+**`Serial0`** is separate hardware: **RS-232** (`Serial0.ttl(false)`) for other onboard / external equipment (e.g. collection / nav). The focus app must **not** open `Serial0` itself — but it can now *reach* the board through it indirectly, with the navigation app relaying. See [Reaching the board over RS-232](#reaching-the-board-over-rs-232-kmopoflight-bridge) below.
 
 Messages are **line-oriented**: the firmware buffers until it sees **LF** (`\n`) only (see `checkSerialMessage()` in the sketch).
 
-Source sketch: [Parallax_CLRCR_V2_2_copy_20260405110355.ino](../Parallax_CLRCR_V2_2_copy_20260405110355/Parallax_CLRCR_V2_2_copy_20260405110355.ino).
+Source sketch: [Parallax_CLRCR_V2_4.ino](../Parallax_CLRCR_V2_4/Parallax_CLRCR_V2_4.ino).
 
 ## Baud rate
 
@@ -115,6 +115,65 @@ ack: <exact line without newline>;  A# <incrementing counter>
 Then it may print mode-specific lines (`Camera 1 set`, `PicDelay:300`, motor debug, etc.).
 
 Use these for logging; do not rely on a rigid binary ACK unless you tighten the protocol.
+
+All host output goes through a `Host` tee (`TeePrint`), which always writes to USB and
+**also** to `Serial0` while the last host command arrived there (`hostOnSerial0`). TopoFlight,
+the other possible `Serial0` peer, never sends host commands, so it never sees this chatter —
+it only gets the `$Done*` / `$Ready*` it already expects.
+
+## Reaching the board over RS-232 (Kmopoflight bridge)
+
+When the navigation app **Kmopoflight** is running in X‑Parallax mode it holds the ClearCore's
+RS-232 port open, and the capture app's ClearCore traffic is relayed through it over loopback
+UDP instead of USB (`host/capture/kmopo_bridge.py` ↔ Kmopoflight's `bridge.py`,
+127.0.0.1:56611):
+
+```text
+Iron661 capture ──UDP 56611──▶ Kmopoflight ──COMn (RS-232 / Serial0)──▶ ClearCore
+                ◀── one datagram per printed line ──  ◀── Host tee ──
+```
+
+- Capture pings `#PING` once a second; Kmopoflight answers `#PONG` only while its camera port
+  is open. PONG → bridged (USB released); 3 s without PONG → back to USB. Automatic both ways.
+- Commands cross in the **unchanged USB format** (`$M4*\n`, `+++\n`, `?\n`); Kmopoflight
+  re-frames them for RS-232, which cuts on `*` and not on newline. Only ≤64 printable-ASCII
+  characters per command are forwarded.
+- `checkSerial0Message()` drains **one complete `*`-terminated message per call**, matching
+  `checkSerialMessage()` on USB. It previously consumed a single *byte* per call, so a message
+  needed as many `loop()` iterations as it had characters — and the sweeping modes block
+  inside `Sweep()` for a whole sweep (~3 s), which stretched a 14-character `$Collectionon*`
+  to **~45 s** before the board acted on it. After the fix, `$CollectionOFF*` → `$Done*` in
+  **2.77 s** (one blocking sweep). A command still waits up to one `Sweep()` to be *read*;
+  removing that means calling `CheckMessages()` from inside `Sweep()`'s settle/wait loops.
+
+### Liveness probe — and a prefix hazard
+
+There is no "are you there" command, but the `Serial0` handler passes anything it does not
+recognise to `handleHostCommand()`, which unconditionally echoes `ack: <cmd>;  A# <n>` through
+the `Host` tee. So **an unrecognised token round-trips**: the sender's `$`…`*` framer lifts the
+echoed command back out of the ack, proving the board is powered *and* parsing, with no side
+effect beyond incrementing the ack counter. Kmopoflight uses `$KMOPO*` for this (measured
+round-trip 13 ms).
+
+⚠️ A probe token must collide with **nothing**. Several commands match by **prefix** —
+`$P`, `$W`, `$FT`, `$SV`, `$Click` — so the obvious `$Ping*` is a trap: it matches `$P` and is
+read as *set mode-5 positions per sweep*, silently reconfiguring the sweep instead of just
+answering. Check any new token against both the prefix list and the exact-match list
+(`$stop*`, `$M0*`–`$M6*`, `$T*`, `$E*`, `$X0*`, `$X1*`, `$S0*`–`$S3*`, `$C1*`–`$C3*`,
+`$reset*`) before using it.
+
+### Replies the `Serial0` branch produces directly
+
+| Received on `Serial0` | Reply |
+|---|---|
+| `$Collectionon`, `$CollectionON`, `$CollectionOff`, `$CollectionOFF` | `$Done*` |
+| `$Sensor=…` | `$Ready*` |
+| `$Click` | *(none)* |
+| `$AboutToEnter` | *(silence — ignored)* |
+| anything else | `hostOnSerial0 = true`, then `handleHostCommand()` → `ack: <cmd>;  A# <n>` |
+
+Note the branches are **case-sensitive**: `$CollectionOff` and `$CollectionOFF` are matched
+separately on purpose.
 
 ## Quick reference (host sends)
 

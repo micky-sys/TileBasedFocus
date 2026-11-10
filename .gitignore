@@ -16,6 +16,8 @@ Thumbs.db
 
 # Runtime logs and temporary outputs
 *.log
+*.log.err
+*.log.out
 bench_outputs/
 _tmp*/
 build/

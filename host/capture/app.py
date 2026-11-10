@@ -69,6 +69,8 @@ from .gps_correlator import GpsCorrelator
 from .gps_receiver import GpsReceiver
 from .fine_tracker import FineFocusTracker
 from .kyfg_backend import DEFAULT_CAMERA_CONFIG, KyfgCamera
+from .kmopo_bridge import BRIDGE_PORT_NAME, BridgingFocusController, probe_bridge
+from .nav_link import NavLink
 from .mode_controller import (
     Mode,
     ModeController,
@@ -755,9 +757,16 @@ class MainWindow(QMainWindow):
         # ── Core state ──────────────────────────────────────────────────
         self._modes = ModeController()
         self._context = CaptureContext(project="Project", line=1)
-        self._serial = SerialClient(self._modes, controller=demo_ctrl)
+        # Real rigs get the bridging controller: ClearCore traffic goes through
+        # Kmopoflight's open COM port whenever that app is up, USB otherwise.
+        # The callback runs on the bridge monitor thread -> hop via the signal.
+        ctrl = demo_ctrl or BridgingFocusController(
+            on_link_changed=lambda name: self._serial.link_changed.emit(name)
+        )
+        self._serial = SerialClient(self._modes, controller=ctrl)
         self._serial.line_received.connect(self._on_serial_line)
         self._serial.connection_changed.connect(self._on_serial_connection_changed)
+        self._serial.link_changed.connect(self._on_serial_link_changed)
 
         # GPS: a shared correlator + receiver. The receiver pushes
         # every decoded ExtEventPVTGeodetic block straight into the
@@ -827,6 +836,10 @@ class MainWindow(QMainWindow):
 
         # ── Build UI shell first so log + status bar exist before camera open
         self._build_ui()
+        # Kmopoflight (navigation app) pushes project + line over loopback UDP
+        # in X-Parallax mode so the operator does not retype them here.
+        self._nav_link = NavLink(parent=self, log_fn=self._log)
+        self._nav_link.event.connect(self._on_nav_event)
         self._install_button_press_logging()
         self._sync_preview_sensor_fields()
         self._preflight = self._build_preflight_runner()
@@ -1333,6 +1346,10 @@ class MainWindow(QMainWindow):
 
     def _auto_connect_clearcore(self) -> None:
         port = self._clearcore_port_arg or SerialClient.auto_detect()
+        if not port and probe_bridge():
+            # No ClearCore on USB here, but Kmopoflight has its RS232 port open:
+            # bridge-only link (no USB to fall back to).
+            port = BRIDGE_PORT_NAME
         if not port:
             return
         self._port_combo.setCurrentText(port)
@@ -2960,8 +2977,18 @@ class MainWindow(QMainWindow):
         self._sync_mode_buttons_ui(banner_mode)
 
     @Slot(bool)
+    def _on_serial_link_changed(self, link: str) -> None:
+        """Bridge <-> USB flip (see kmopo_bridge). Connection state is unchanged;
+        only the transport label and the session log need to know."""
+        self._log(f"ClearCore link: {link}")
+        if self._serial.connected:
+            self._serial_status_label.setText(f"connected ({link})")
+
     def _on_serial_connection_changed(self, connected: bool) -> None:
-        self._serial_status_label.setText("connected" if connected else "disconnected")
+        link = self._serial.link
+        self._serial_status_label.setText(
+            f"connected ({link})" if connected and link else ("connected" if connected else "disconnected")
+        )
         self._serial_status_label.setStyleSheet(
             "color:#3a7;" if connected else "color:#888;"
         )
@@ -3460,6 +3487,19 @@ class MainWindow(QMainWindow):
         # next frames land in a file that reflects the new project.
         if cleaned != previous and self._modes.is_recording_mode():
             self._roll_line_containers(reason=f"project -> {cleaned!r}")
+
+    def _on_nav_event(self, ev: dict) -> None:
+        """Validated Kmopoflight event (see :mod:`nav_link`)."""
+        if ev["type"] not in ("project", "line_start"):
+            self._log(f"nav: {ev['type']} line {ev['line']} seq {ev['seq']}")
+            return
+        self._log(f"nav: {ev['type']} -> project {ev['project']!r}"
+                  + (f", line {ev['line']}" if ev["type"] == "line_start" else ""))
+        if self._project_edit.text() != ev["project"]:
+            self._project_edit.setText(ev["project"])
+            self._on_project_edited()          # editingFinished is not emitted by setText
+        if ev["type"] == "line_start":
+            self._line_spin.setValue(ev["line"])   # valueChanged -> _on_line_changed (no-op if unchanged)
 
     def _on_line_changed(self, value: int) -> None:
         # Sweep counter reset happens inside CameraPipeline.open_line
@@ -4619,6 +4659,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt naming
         self._log("Shutting down…")
+        self._nav_link.close()
         self._clear_deferred_mode_schedule()
         self._preflight.cancel()   # before the drain loop below can tick it into a dialog
         # Before anything touches the hardware: the live w10 thread and the AF engine's

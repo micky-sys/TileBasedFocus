@@ -11,6 +11,34 @@
 #include "ClearCore.h"
 #include <math.h>
 
+// HOST LINK. The capture app (Iron661) historically talked to this board over
+// USB (Serial). It can now also reach us through the RS232 collection port
+// (Serial0 / COM-0) with the navigation app (Kmopoflight) acting as a bridge:
+// Kmopoflight forwards the capture app's commands onto Serial0 and relays our
+// replies back over UDP. Serial0 frames on '*', so the bridge appends one to
+// every command; handleHostCommand() puts it back for '$...*' commands.
+//
+// All human/host output goes through `Host`, which always writes to USB and,
+// while the last host command arrived on Serial0, ALSO to Serial0. TopoFlight
+// (the other possible Serial0 peer) never sends host commands, so it never
+// gets this chatter -- it only ever sees the $Done*/$Ready* it already knows.
+bool hostOnSerial0 = false;
+
+class TeePrint : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    if (hostOnSerial0) { Serial0.write(c); }
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t n) override {
+    Serial.write(buf, n);
+    if (hostOnSerial0) { Serial0.write(buf, n); }
+    return n;
+  }
+};
+TeePrint Host;
+
 #define motor0 ConnectorM0  //Vertical camera motor
 #define motor1 ConnectorM1  //Oblique camera motor
 
@@ -298,42 +326,42 @@ void setup() {
 
     // Enables the motor; homing will begin automatically if enabled
     EnableAndHome ();
-    Serial.print("M0Exists is  ");
-    Serial.println(M0Exists);
-    Serial.print("M1Exists is  ");
-    Serial.println(M1Exists);
+    Host.print("M0Exists is  ");
+    Host.println(M0Exists);
+    Host.print("M1Exists is  ");
+    Host.println(M1Exists);
 
 	// Check if motor alert occurred during enabling
 	// Clear alert if configured to do so 
     if (M0Exists) {  
       if (motor0.StatusReg().bit.AlertsPresent) {
-        Serial.println("Motor 0 alert detected.");		
+        Host.println("Motor 0 alert detected.");		
         PrintAlerts();
         if(HANDLE_ALERTS){
           HandleAlerts();
       } else {
-        Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+        Host.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
         }
-        Serial.println("Enabling may not have completed as expected. Proceed with caution.");		
-        Serial.println();
+        Host.println("Enabling may not have completed as expected. Proceed with caution.");		
+        Host.println();
       } else {
-      Serial.println("Motor 0 Ready");	
+      Host.println("Motor 0 Ready");	
       }
     }
   
     if (M1Exists) {  
       if (motor1.StatusReg().bit.AlertsPresent) {
-        Serial.println("Motor 1 alert detected.");		
+        Host.println("Motor 1 alert detected.");		
         PrintAlerts();
         if(HANDLE_ALERTS){
           HandleAlerts();
       } else {
-        Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+        Host.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
         }
-        Serial.println("Enabling may not have completed as expected. Proceed with caution.");		
-        Serial.println();
+        Host.println("Enabling may not have completed as expected. Proceed with caution.");		
+        Host.println();
       } else {
-      Serial.println("Motor 1 Ready");	
+      Host.println("Motor 1 Ready");	
       }
     }
 
@@ -444,11 +472,72 @@ void CheckMessages() {
   checkSerial0Message();   
     
   if (SerialMessageComplete) {
+    hostOnSerial0 = false;   // the USB host is talking directly again: stop mirroring to RS232
+    handleHostCommand();
+    SerialMessageComplete=false;
+  }
+
+  if (Serial0MessageComplete) {
+    // Peers may send "\r\n" after the '*'; the framer puts it at the head of the
+    // NEXT message, which then no longer startsWith("$"). Trim it off.
+    incomingSerial0Message.trim();
+    if (incomingSerial0Message.equals("$Collectionon")){
+      Host.print("Serial 0 message: "); Host.println(incomingSerial0Message);
+      if (mode != 0){
+        setMode(0);
+      }
+      Serial0.println("$Done*");
+    }
+    else if (incomingSerial0Message.startsWith("$Click")){
+      SweepNeedsToStart=true;
+    }
+    else if (incomingSerial0Message.startsWith("$CollectionON")){
+      Host.print("Serial 0 message: "); Host.println(incomingSerial0Message);
+      setMode(1);
+      Serial0.println("$Done*");
+    }
+    else if (incomingSerial0Message.startsWith("$CollectionOff")){
+      Host.print("Serial 0 message: "); Host.println(incomingSerial0Message);
+      if (mode != 0){
+        setMode(0);
+      }
+      Serial0.println("$Done*");
+    }
+    else if (incomingSerial0Message.startsWith("$CollectionOFF")){
+      Host.print("Serial 0 message: "); Host.println(incomingSerial0Message);
+      stop();
+      Serial0.println("$Done*");
+    }
+    else if (incomingSerial0Message.startsWith("$Sensor=")){
+      Serial0.println("$Ready*");
+    }
+    else if (incomingSerial0Message.startsWith("$AboutToEnter")){
+      // Navigator's "line ahead" notice. The Simplex rig parks its mirror on it;
+      // this board has nothing to pre-position, so it is acknowledged by silence.
+    }
+    else if (incomingSerial0Message.length() > 0){
+      // Anything else on the RS232 port is a USB-style host command bridged by
+      // Kmopoflight from the capture app. Run the very same handler; `Host`
+      // mirrors its acks/debug onto Serial0 so the bridge can relay them back.
+      hostOnSerial0 = true;
+      incomingSerialMessage = incomingSerial0Message;
+      if (incomingSerialMessage.startsWith("$")) {
+        incomingSerialMessage += "*";   // the Serial0 framer consumed it; the host parser expects it
+      }
+      handleHostCommand();
+    }
+    Serial0MessageComplete=false;
+  }
+}
+
+// USB host command set (also reached from Serial0 via the Kmopoflight bridge,
+// see CheckMessages). Operates on incomingSerialMessage.
+void handleHostCommand() {
     ackNumber++;
-    Serial.print("ack: ");
-    Serial.print(incomingSerialMessage);
-    Serial.print (";  A# ");
-    Serial.println (ackNumber);
+    Host.print("ack: ");
+    Host.print(incomingSerialMessage);
+    Host.print (";  A# ");
+    Host.println (ackNumber);
    if (incomingSerialMessage.startsWith("$")){
       if (incomingSerialMessage.equals("$stop*")){
        stop();            
@@ -479,8 +568,8 @@ void CheckMessages() {
         if (requested < 2) { requested = 2; }
         if (requested > 64) { requested = 64; }  //clamp to verticalAngles[] size
         m5Positions = requested;
-        Serial.print(" M5 positions:");
-        Serial.println(m5Positions);
+        Host.print(" M5 positions:");
+        Host.println(m5Positions);
         if (mode==5) {  //apply live: recompute angles and restart the stepped sweep
           Positions = m5Positions;
           calculateMotorAngles();
@@ -492,8 +581,8 @@ void CheckMessages() {
         if (requested < 1) { requested = 1; }
         if (requested > 60) { requested = 60; }
         m5SweepAngle = requested;
-        Serial.print(" M5 sweep angle (deg):");
-        Serial.println(m5SweepAngle);
+        Host.print(" M5 sweep angle (deg):");
+        Host.println(m5SweepAngle);
         if (mode==5) {  //apply live: recompute angles and restart the stepped sweep
           calculateMotorAngles();
           m5Index = 0;
@@ -504,7 +593,7 @@ void CheckMessages() {
       }
       if (incomingSerialMessage.equals("$E*")){  //Fires ONE GNSS event pulse, no camera, no motors.
         eventClick();
-        Serial.println("$EventFired*");
+        Host.println("$EventFired*");
       }
       if (incomingSerialMessage.equals("$X1*")){  //M4 lockstep ON: stop self-triggering, wait for $T* per frame
         triggerExternal = true;
@@ -512,60 +601,60 @@ void CheckMessages() {
                                      //suppressed, centre once here. Servos hold a commanded
                                      //position, so per-trigger re-centring would only add jitter
                                      //to the one thing that now has to be tightly timed.
-        Serial.println("Trigger: external, $T* per frame");
+        Host.println("Trigger: external, $T* per frame");
       }
       if (incomingSerialMessage.equals("$X0*")){  //M4 lockstep OFF: back to internally timed triggers
         triggerExternal = false;
-        Serial.println("Trigger: internal, timed");
+        Host.println("Trigger: internal, timed");
       }
       if (incomingSerialMessage.startsWith("$FT")){  //Focus pulse time-increment in ms per '+'/'-' char, e.g. "$FT1*". Default 10 (normal AF). The backlash test drops it to 1 so it can scan sub-10ms open times to find the minimum move; it restores 10 afterwards. Clamped [1,100].
         int reqInc = incomingSerialMessage.substring(3).toInt();  //toInt stops at the trailing '*'
         if (reqInc < 1) { reqInc = 1; }
         if (reqInc > 100) { reqInc = 100; }
         focusTimeIncrement = reqInc;
-        Serial.print("Focus time increment ");
-        Serial.println(focusTimeIncrement);
+        Host.print("Focus time increment ");
+        Host.println(focusTimeIncrement);
       }
       if (incomingSerialMessage.startsWith("$SV")){  //Variable focus duty for the backlash/min-duty test, e.g. "$SV1200*". Lets the host drive GENTLER than str0 (below stiction) and ramp up to find the minimum duty that actually turns the shaft. Clamped to [0, str3].
         int requested = incomingSerialMessage.substring(3).toInt();  //toInt stops at the trailing '*'
         if (requested < 0) { requested = 0; }
         if (requested > str3) { requested = str3; }  //never exceed the coarsest fixed level
         focusStrength = requested;
-        Serial.print("Focus duty ");
-        Serial.println(focusStrength);
+        Host.print("Focus duty ");
+        Host.println(focusStrength);
       }
       else if (incomingSerialMessage.equals("$S0*")){  //Extra-fine focus step: duty str0 (7000) at a 3 ms pulse -- the shortest reliable move.
-        Serial.println("Focus strength 0");
+        Host.println("Focus strength 0");
         focusStrength = str0;
         focusTimeIncrement = 3;  //fine step is a 3 ms pulse
       }
       if (incomingSerialMessage.equals("$S1*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
-        Serial.println("Focus strength 1");
+        Host.println("Focus strength 1");
         focusStrength = str1;
         focusTimeIncrement = 10;  //coarser steps use the normal 10 ms increment
       }  
       if (incomingSerialMessage.equals("$S2*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
-        Serial.println("Focus strength 2");
+        Host.println("Focus strength 2");
         focusStrength = str2;
         focusTimeIncrement = 10;
       }      
       if (incomingSerialMessage.equals("$S3*")){  //Mode 6, which is a slow "Take pics in place", for manual focus test
-        Serial.println("Focus strength 3");
+        Host.println("Focus strength 3");
         focusStrength = str3;
         focusTimeIncrement = 10;
       }
       // Selecting a camera moves BOTH the H-bridge and the encoder SPI bus --
       // the same relays do both. See selectCamera().
       if (incomingSerialMessage.equals("$C1*")){
-        Serial.println("Camera 1 set");
+        Host.println("Camera 1 set");
         selectCamera(1);
       } 
       if (incomingSerialMessage.equals("$C2*")){
-        Serial.println("Camera 2 set");
+        Host.println("Camera 2 set");
         selectCamera(2);
       } 
       if (incomingSerialMessage.equals("$C3*")){
-        Serial.println("Camera 3 set");
+        Host.println("Camera 3 set");
         selectCamera(3);
       }  
 
@@ -578,7 +667,7 @@ void CheckMessages() {
                   
     }
     if (incomingSerialMessage.startsWith("+")){  //Sends pulse command to currently selected focus motor in positive direction
-      Serial.println(mode);
+      Host.println(mode);
       if (mode==4 || mode==5) {
         // N chars => N discrete pulses (on/gap), sequenced by serviceFocusPulse().
         startFocusBurst(+1, incomingSerialMessage.length());
@@ -595,8 +684,8 @@ void CheckMessages() {
         if (picsInPlaceDelay > 1500) {
           picsInPlaceDelay = 1500;
         }
-        Serial.print(" PicDelay:");
-        Serial.println(picsInPlaceDelay);
+        Host.print(" PicDelay:");
+        Host.println(picsInPlaceDelay);
       }      
     }
     if (incomingSerialMessage.startsWith("<")){  //Shortens time between pics, down to the camera's max FPS (minTimeBetweenFrames)
@@ -605,59 +694,22 @@ void CheckMessages() {
         if (picsInPlaceDelay<minTimeBetweenFrames) {
           picsInPlaceDelay = minTimeBetweenFrames;
         }
-        Serial.print(" PicDelay:");
-        Serial.println(picsInPlaceDelay);
+        Host.print(" PicDelay:");
+        Host.println(picsInPlaceDelay);
       }      
     }
     if (incomingSerialMessage.startsWith("?")){  //Send command in Mode 7
       if (mode==3) {
         SweepNeedsToStart=true;
-        Serial.println("Line start");
+        Host.println("Line start");
       }      
     }
     if (incomingSerialMessage.startsWith("!")){  //Send command in Mode 7
       if (mode==3) {
         SweepNeedsToStart=false;
-        Serial.println("Line end");
+        Host.println("Line end");
       }      
     }
-    SerialMessageComplete=false;
-  }
-
-  if (Serial0MessageComplete) {
-    Serial.print("Serial 0 message: ");
-    Serial.println(incomingSerial0Message);
-   if (incomingSerial0Message.startsWith("$")){
-      if (incomingSerial0Message.equals("$Collectionon")){
-       if (mode != 0){
-        setMode(0);
-       }
-       Serial0.println("$Done*");            
-      }
-      if (incomingSerial0Message.startsWith("$Click")){
-       SweepNeedsToStart=true;          
-      }
-      if (incomingSerial0Message.startsWith("$CollectionON")){
-       setMode(1); 
-       Serial0.println("$Done*");            
-      }
-      if (incomingSerial0Message.startsWith("$CollectionOff")){
-       if (mode != 0){
-        setMode(0);
-       } 
-       Serial0.println("$Done*");            
-      }
-      if (incomingSerial0Message.startsWith("$CollectionOFF")){
-       stop();  
-       Serial0.println("$Done*");            
-      } 
-      if (incomingSerial0Message.startsWith("$Sensor=")){
-       Serial0.println("$Ready*");            
-      }                            
-    }
- 
-    Serial0MessageComplete=false;
-  }
 }
 
 void checkSerialMessage (){
@@ -685,14 +737,26 @@ void checkSerialMessage (){
 }
 
 void checkSerial0Message () {
-  serial0input = Serial0.read();
-  // If there was a valid byte read-in, print it.
-  if (serial0input != -1) {
+  // Drain up to ONE complete '*'-terminated message per call, the way
+  // checkSerialMessage() already does for USB. This used to consume a SINGLE
+  // byte per call, so a message needed as many loop() iterations as it has
+  // characters -- and in the sweeping modes loop() blocks inside Sweep() for a
+  // whole sweep (~3 s), which stretched a 14-char "$Collectionon*" arriving on
+  // the Kmopoflight bridge to ~45 s before the board ever acted on it.
+  // Like the USB path, any bytes after the '*' stay buffered for the next call
+  // so a trailing command cannot overwrite this one before CheckMessages()
+  // acts on it.
+  // ponytail: a command still waits up to one blocking Sweep() (~3 s) to be
+  // READ at all, because loop() is where we get called from. Driving it to
+  // ~0 means calling CheckMessages() from inside Sweep()'s settle/wait loops,
+  // the way mode 5 (SweepStepM5) already returns to the main loop per step.
+  while ((serial0input = Serial0.read()) != -1) {
     char inChar = (char)serial0input;
     if (inChar == '*') {
       Serial0MessageComplete = true;
       incomingSerial0Message=Serial0Message;
       Serial0Message="";
+      return;
     }
     else {
       Serial0Message += inChar;
@@ -809,11 +873,11 @@ void reportEncoder() {
   // Tagged with the camera because the host keeps one unwrap accumulator per
   // encoder. An untagged count folded into the wrong accumulator would invent
   // up to half a revolution of travel that never happened.
-  Serial.print("$ENC=");
-  Serial.print(selectedCamera);
-  Serial.print(",");
-  Serial.print(pos);
-  Serial.println("*");
+  Host.print("$ENC=");
+  Host.print(selectedCamera);
+  Host.print(",");
+  Host.print(pos);
+  Host.println("*");
 }
 
 // Read ALL THREE encoders back to back and report each. Called between sweeps.
@@ -845,11 +909,11 @@ void pollAllEncoders() {
     delay(relaySettleMs);   // contacts still bouncing; a read now is meaningless
     readEncoderRaw();       // throwaway: flush the state machine the switch interrupted
     int pos = readEncoderPosition();
-    Serial.print("$ENC=");
-    Serial.print(cam);
-    Serial.print(",");
-    Serial.print(pos);
-    Serial.println("*");
+    Host.print("$ENC=");
+    Host.print(cam);
+    Host.print(",");
+    Host.print(pos);
+    Host.println("*");
   }
   // Restore before anything else can act on the selection: the focus +/-
   // buttons drive whatever is selected, so leaving it moved would silently
@@ -867,7 +931,7 @@ void EnableAndHome () {
   motor1.EnableRequest(true);   
   delay(commandDelay); 
 
-  Serial.println("entering homing sequence");
+  Host.println("entering homing sequence");
   startTime = millis(); //Start time for homing sequence timeout
 
   if ((M0Exists && M1Exists) || (!M1Exists && !M0Exists)) {  //This happens on startup or when both motors are connected
@@ -875,17 +939,17 @@ void EnableAndHome () {
     {
       continue;
     }
-    Serial.print("  home wait "); Serial.print(millis() - startTime); Serial.println(" ms");
+    Host.print("  home wait "); Host.print(millis() - startTime); Host.println(" ms");
     //See which motor has homed, if at all
     bool m0Homed = (motor0.HlfbState() == MotorDriver::HLFB_ASSERTED);
     bool m1Homed = (motor1.HlfbState() == MotorDriver::HLFB_ASSERTED);
     if (m0Homed){
       M0Exists=true;
-      Serial.println("M0 homing success");
+      Host.println("M0 homing success");
     }
     if (m1Homed){
       M1Exists=true;
-      Serial.println("M1 homing success");
+      Host.println("M1 homing success");
     }
     // A motor that did NOT assert HLFB within the timeout has FAILED to home.
     // Leaving it enabled lets the ClearPath keep running its homing move -- the
@@ -895,17 +959,17 @@ void EnableAndHome () {
     // connected-but-faulted drive, so also flag the host.
     if (!m0Homed) {
       motor0.EnableRequest(false);
-      Serial.println("M0 homing FAILED - motor disabled to stop homing motion");
+      Host.println("M0 homing FAILED - motor disabled to stop homing motion");
     }
     if (!m1Homed) {
       motor1.EnableRequest(false);
-      Serial.println("M1 homing FAILED - motor disabled to stop homing motion");
+      Host.println("M1 homing FAILED - motor disabled to stop homing motion");
     }
     if (m0Homed != m1Homed) {
       Serial0.println("$Fault*");
     }
     if (!m0Homed && !m1Homed) {
-      Serial.println("Motor homing failure");
+      Host.println("Motor homing failure");
     }
     if (M0Exists || M1Exists) {
       Serial0.println("$Ready*");
@@ -918,12 +982,12 @@ void EnableAndHome () {
       continue;
     }
     if (motor0.HlfbState() == MotorDriver::HLFB_ASSERTED){
-      Serial.println("M0 homing success");
+      Host.println("M0 homing success");
       Serial0.println("$Ready*");
       return;
     }
     motor0.EnableRequest(false);  // homing failed within timeout -> stop the homing motion
-    Serial.println("M0 homing FAILED - motor disabled to stop homing motion");
+    Host.println("M0 homing FAILED - motor disabled to stop homing motion");
     Serial0.println("$Fault*");
   }
   
@@ -933,12 +997,12 @@ void EnableAndHome () {
       continue;
     }
     if (motor1.HlfbState() == MotorDriver::HLFB_ASSERTED){
-      Serial.println("M1 homing success");
+      Host.println("M1 homing success");
       Serial0.println("$Ready*");
       return;
     }
     motor1.EnableRequest(false);  // homing failed within timeout -> stop the homing motion
-    Serial.println("M1 homing FAILED - motor disabled to stop homing motion");
+    Host.println("M1 homing FAILED - motor disabled to stop homing motion");
     Serial0.println("$Fault*");
   }
 }
@@ -1069,13 +1133,13 @@ void testClick(){
 
 void stop() {
   MoveAbsolutePosition(0, 0);
-  Serial.println("sending disable");
+  Host.println("sending disable");
   motor0.EnableRequest(false);
   motor1.EnableRequest(false);
-  Serial.println("disable sent");
+  Host.println("disable sent");
   mode = 0;
   i=0;
-  Serial.println("Stopping");
+  Host.println("Stopping");
 }
 
 void setupMotorsFast() {
@@ -1103,41 +1167,41 @@ void setupMotorsSlow() {
   switch (switchToMode) {
     case 0: 
      mode = 0;
-     Serial.println("Mode 0: Collection On, Nav point based");          
+     Host.println("Mode 0: Collection On, Nav point based");          
      Positions = basePositions;
      calculateMotorAngles();
      setupMotorsFast();
     break;
     case 1:
      mode = 1;
-     Serial.println("Mode 1: Collection ON, continous");          
+     Host.println("Mode 1: Collection ON, continous");          
      Positions = basePositions;
      calculateMotorAngles();
      setupMotorsFast();
     break;
     case 2:
       mode = 2;
-      Serial.println("Mode 2: Slow and Steady");
+      Host.println("Mode 2: Slow and Steady");
       Positions = basePositions;
       calculateMotorAngles();
       setupMotorsSlow();
     break;
     case 3:
       mode = 3;
-      Serial.println("Mode 3: Collection ON Line by line");
+      Host.println("Mode 3: Collection ON Line by line");
       Positions = basePositions;
       calculateMotorAngles();
       setupMotorsFast();
     break;
     case 4:
      mode = 4;
-     Serial.println("Mode 4: Focus adjustment");
+     Host.println("Mode 4: Focus adjustment");
      setupMotorsFast();
      picsInPlaceDelay = minTimeBetweenFrames;  //AF runs at the camera's max FPS (209 ms floor); reset any leftover (e.g. M6's 1000 ms)
     break;
     case 5:
      mode = 5;
-     Serial.println("Mode 5: Ground test (stepped sweep + background autofocus)");
+     Host.println("Mode 5: Ground test (stepped sweep + background autofocus)");
      Positions = m5Positions;
      calculateMotorAngles();
      setupMotorsFast();
@@ -1146,7 +1210,7 @@ void setupMotorsSlow() {
     break;
     case 6:
      mode = 6;
-     Serial.println("Mode 6: Timelapse (mid position, 1 Hz, full-res recording)");
+     Host.println("Mode 6: Timelapse (mid position, 1 Hz, full-res recording)");
      setupMotorsFast();
      picsInPlaceDelay = 1000;  //one trigger per second
     break;
@@ -1154,7 +1218,7 @@ void setupMotorsSlow() {
  }
 
  void calculateMotorAngles () {
-  Serial.println("calculating angles");
+  Host.println("calculating angles");
   float span = (mode==5) ? m5SweepAngle : sweepAngleVertical;  //M5 ground test uses its own narrow, tunable sweep; flight sweeps keep the full 60 deg
   for (i=0; i<Positions; i++){
     theta_deg = (span/2)-i*span/(Positions-1);
@@ -1180,9 +1244,9 @@ void setupMotorsSlow() {
       }
     }
     alpha_deg = alpha * RAD_TO_DEG; 
-    Serial.print (theta_deg);
-    Serial.print ("  -->  ");
-    Serial.println(alpha_deg);
+    Host.print (theta_deg);
+    Host.print ("  -->  ");
+    Host.println(alpha_deg);
     verticalAngles[i] = alpha_deg;
   }
  }
@@ -1192,27 +1256,27 @@ bool MoveAbsolutePosition(int position0, int position1) {
     // Check if a motor alert is currently preventing motion
 	// Clear alert if configured to do so 
     if (M0Exists && motor0.StatusReg().bit.AlertsPresent) {
-		Serial.println("Motor alert detected.");		
+		Host.println("Motor alert detected.");		
 		PrintAlerts();
 		if(HANDLE_ALERTS){
 			HandleAlerts();
 		} else {
-			Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+			Host.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
 		}
-		Serial.println("Move canceled.");		
-		Serial.println();
+		Host.println("Move canceled.");		
+		Host.println();
         //return false;
     }
     if (M1Exists && motor1.StatusReg().bit.AlertsPresent) {
-		Serial.println("Motor alert detected.");		
+		Host.println("Motor alert detected.");		
 		PrintAlerts();
 		if(HANDLE_ALERTS){
 			HandleAlerts();
 		} else {
-			Serial.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
+			Host.println("Enable automatic alert handling by setting HANDLE_ALERTS to 1.");
 		}
-		Serial.println("Move canceled.");		
-		Serial.println();
+		Host.println("Move canceled.");		
+		Host.println();
         //return false;
     }
 
@@ -1240,15 +1304,15 @@ bool MoveAbsolutePosition(int position0, int position1) {
 	// Check if motor alert occurred during move
 	// Clear alert if configured to do so 
     if ((M0Exists && motor0.StatusReg().bit.AlertsPresent) || (M1Exists && motor1.StatusReg().bit.AlertsPresent)) {
-		Serial.println("Motor alert detected.");		
+		Host.println("Motor alert detected.");		
 		PrintAlerts();
 		if(HANDLE_ALERTS){
 			HandleAlerts();
 		} else {
-			Serial.println("Enable automatic fault handling by setting HANDLE_ALERTS to 1.");
+			Host.println("Enable automatic fault handling by setting HANDLE_ALERTS to 1.");
 		}
-		Serial.println("Motion may not have completed as expected. Proceed with caution.");
-		Serial.println();
+		Host.println("Motion may not have completed as expected. Proceed with caution.");
+		Host.println();
 		consecutiveMoveFaults++;
 		if (consecutiveMoveFaults >= maxMoveFaults) {
 			abortToSafeMode();
@@ -1256,7 +1320,7 @@ bool MoveAbsolutePosition(int position0, int position1) {
 		return false;
     } else {
 		consecutiveMoveFaults = 0;
-		//Serial.println("Move Done");
+		//Host.println("Move Done");
 		return true;
 	}
 
@@ -1269,7 +1333,7 @@ void abortToSafeMode() {
   // disable both motors, drop to mode 0 (which does not sweep on its own), and
   // report it so the host/operator can investigate the drive or power-cycle.
   // sweepAborted unwinds any sweep currently in progress (see Sweep/SweepStepM5).
-  Serial.println("SAFE ABORT: motor kept faulting; disabling motors, returning to mode 0.");
+  Host.println("SAFE ABORT: motor kept faulting; disabling motors, returning to mode 0.");
   Serial0.println("$Fault*");
   motor0.EnableRequest(false);
   motor1.EnableRequest(false);
@@ -1285,12 +1349,12 @@ void calculateSweepTime() {
   int totalSweepTime = millis()-lastSweepTime;
   int netSweepTime = millis()-sweepStartTime;
   lastSweepTime = millis();
-  Serial.print ("Swp# ");
-  Serial.print (sweepCount);
-  Serial.print (";  Total sweep time ");
-  Serial.print(totalSweepTime);
-  Serial.print (";  Net sweep time "); 
-  Serial.println(netSweepTime);
+  Host.print ("Swp# ");
+  Host.print (sweepCount);
+  Host.print (";  Total sweep time ");
+  Host.print(totalSweepTime);
+  Host.print (";  Net sweep time "); 
+  Host.println(netSweepTime);
 }
 
  ///**********************SUPPORT FUNCTIONS FROM CLEARCORE*************************//////
@@ -1298,7 +1362,7 @@ void calculateSweepTime() {
  void HandleAlerts(){
 	if(M0Exists && motor0.AlertReg().bit.MotorFaulted){
 		// if a motor fault is present, clear it by cycling enable
-		Serial.println("Faults present. Cycling enable signal to motor to clear faults.");
+		Host.println("Faults present. Cycling enable signal to motor to clear faults.");
 		motor0.EnableRequest(false);
 		Delay_ms(10);
 		motor0.EnableRequest(true);
@@ -1306,46 +1370,46 @@ void calculateSweepTime() {
  
  	if(M1Exists && motor1.AlertReg().bit.MotorFaulted){
 		// if a motor fault is present, clear it by cycling enable
-		Serial.println("Faults present. Cycling enable signal to motor to clear faults.");
+		Host.println("Faults present. Cycling enable signal to motor to clear faults.");
 		motor1.EnableRequest(false);
 		Delay_ms(10);
 		motor1.EnableRequest(true);
 	}
 	// clear alerts
-	Serial.println("Clearing alerts.");
+	Host.println("Clearing alerts.");
 	motor0.ClearAlerts();
-  Serial.println("Clearing alerts.");
+  Host.println("Clearing alerts.");
 	motor1.ClearAlerts();
  }
 
  void PrintAlerts(){
 	// report status of alerts
- 	Serial.println("Alerts present: ");
+ 	Host.println("Alerts present: ");
 	if(motor0.AlertReg().bit.MotionCanceledInAlert){
-		Serial.println("Motor0:    MotionCanceledInAlert "); }
+		Host.println("Motor0:    MotionCanceledInAlert "); }
 	if(motor0.AlertReg().bit.MotionCanceledPositiveLimit){
-		Serial.println("Motor0:    MotionCanceledPositiveLimit "); }
+		Host.println("Motor0:    MotionCanceledPositiveLimit "); }
 	if(motor0.AlertReg().bit.MotionCanceledNegativeLimit){
-		Serial.println("Motor0:    MotionCanceledNegativeLimit "); }
+		Host.println("Motor0:    MotionCanceledNegativeLimit "); }
 	if(motor0.AlertReg().bit.MotionCanceledSensorEStop){
-		Serial.println("Motor0:    MotionCanceledSensorEStop "); }
+		Host.println("Motor0:    MotionCanceledSensorEStop "); }
 	if(motor0.AlertReg().bit.MotionCanceledMotorDisabled){
-		Serial.println("Motor0:    MotionCanceledMotorDisabled "); }
+		Host.println("Motor0:    MotionCanceledMotorDisabled "); }
 	if(motor0.AlertReg().bit.MotorFaulted){
-		Serial.println("Motor0:    MotorFaulted ");
+		Host.println("Motor0:    MotorFaulted ");
 	}
   if(motor1.AlertReg().bit.MotionCanceledInAlert){
-		Serial.println("Motor1:    MotionCanceledInAlert "); }
+		Host.println("Motor1:    MotionCanceledInAlert "); }
 	if(motor1.AlertReg().bit.MotionCanceledPositiveLimit){
-		Serial.println("Motor1:    MotionCanceledPositiveLimit "); }
+		Host.println("Motor1:    MotionCanceledPositiveLimit "); }
 	if(motor1.AlertReg().bit.MotionCanceledNegativeLimit){
-		Serial.println("Motor1:    MotionCanceledNegativeLimit "); }
+		Host.println("Motor1:    MotionCanceledNegativeLimit "); }
 	if(motor1.AlertReg().bit.MotionCanceledSensorEStop){
-		Serial.println("Motor1:    MotionCanceledSensorEStop "); }
+		Host.println("Motor1:    MotionCanceledSensorEStop "); }
 	if(motor1.AlertReg().bit.MotionCanceledMotorDisabled){
-		Serial.println("Motor1:    MotionCanceledMotorDisabled "); }
+		Host.println("Motor1:    MotionCanceledMotorDisabled "); }
 	if(motor1.AlertReg().bit.MotorFaulted){
-		Serial.println("Motor1:    MotorFaulted ");
+		Host.println("Motor1:    MotorFaulted ");
 	}
  }
 
