@@ -31,6 +31,7 @@ import numpy as np
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QImage,
     QKeySequence,
     QPainter,
@@ -201,8 +202,10 @@ class _FocusScatterGraph(QWidget):
         self._roi: list[Optional[int]] = []   # None = pooled / manual-creep score, 0..4 = one ROI's w10
         self._per_roi = False                 # view: pooled dots (False) or the five ROI traces (True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setFixedSize(230, 130)
+        self.setFixedSize(230, 130 + self._READOUT_H)
         self.hide()
+
+    _READOUT_H = 30   # band under the dots for the newest score, in large type (it used to sit among the dots)
 
     def clear(self) -> None:
         self._enc.clear()
@@ -250,7 +253,7 @@ class _FocusScatterGraph(QWidget):
             p.end()
             return
         pad_l = pad_r = 6
-        pad_t, pad_b = 15, 14
+        pad_t, pad_b = 15, 14 + self._READOUT_H
         plot_w = w - pad_l - pad_r
         plot_h = h - pad_t - pad_b
         enc = [self._enc[i] for i in idx]
@@ -270,12 +273,25 @@ class _FocusScatterGraph(QWidget):
             p.setPen(QPen(newest if (is_newest and not self._per_roi) else col, 1))
             r = 2.5 if is_newest else 1.5
             p.drawEllipse(int(x - r), int(y - r), int(2 * r), int(2 * r))
-        # Corner labels: encoder span (X) and score at the newest dot.
+        # Encoder span (X) right under the dots, then the newest score on its own band in large type,
+        # clear of the plot (the small in-plot figure was lost among the dots in flight).
         p.setPen(QColor(170, 170, 170))
-        p.drawText(pad_l, h - 3, f"{int(emin)}")
-        p.drawText(w - 46, h - 3, f"{int(emax)}")
+        p.drawText(pad_l, h - self._READOUT_H - 3, f"{int(emin)}")
+        p.drawText(w - 46, h - self._READOUT_H - 3, f"{int(emax)}")
+        p.setPen(QPen(QColor(90, 90, 90), 1))
+        p.drawLine(1, h - self._READOUT_H, w - 2, h - self._READOUT_H)
+        small = p.font()
+        big = QFont(small)
+        big.setPixelSize(22)
+        big.setBold(True)
+        p.setFont(big)
         p.setPen(newest if not self._per_roi else self.ROI_COLORS[self._roi[last]])
-        p.drawText(5, h - 15, f"{self._score[last]:.1f}")
+        label = f"{self._score[last]:.2f} px" if not self._per_roi else \
+            f"{self.ROI_NAMES[self._roi[last]]} {self._score[last]:.2f} px"
+        p.drawText(6, h - 7, label)
+        p.setFont(small)
+        p.setPen(QColor(170, 170, 170))
+        p.drawText(w - 70, h - 7, f"@{int(self._enc[last]):+d}c")
         p.end()
 
 

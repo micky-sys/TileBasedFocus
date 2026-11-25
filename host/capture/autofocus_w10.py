@@ -26,8 +26,9 @@ field-profile engines were removed on 2026-11-02 after the flight showed only w1
   neither scored nor fed. The next burst goes out only once the encoder has read flat for
   ``settle_ticks`` frames (motor stopped, 10 Hz encoder caught up), so nothing is re-commanded on
   stale feedback (sec.23.7). Bursts are capped (``max_pulses_per_burst``, and the binding
-  ``max_counts_per_burst``: under half a motor turn, or the 12-bit encoder unwrap loses a
-  revolution -- the 2026-11-02 flight) and, beyond a few pulses, aim ``approach_frac`` of the way,
+  ``max_counts_per_burst``: one sweep step, 100 c -- the long legs (back-off, park return, final
+  approach) now walk at the sweep's pace, because those were the only moves whose count ever lost a
+  revolution: 2026-11-02 and 2026-11-12, never a 100 c step) and, beyond a few pulses, aim ``approach_frac`` of the way,
   so an uncalibrated long-burst counts/pulse cannot overshoot the final approach onto the vertex --
   the one place an overshoot costs focus. A burst that moves the encoder not at all is handed to
   the engine unscored, so its own stall detector sees the limit.
@@ -103,7 +104,7 @@ class AutoFocusEngineW10(QObject):
         config: Optional[W10Config] = None,
         strength: int = 0,
         max_pulses_per_burst: int = 50,
-        max_counts_per_burst: float = 700.0,
+        max_counts_per_burst: float = 100.0,
         approach_frac: float = 0.75,
         settle_ticks: int = 2,
         no_motion_frames: int = 6,
@@ -140,7 +141,12 @@ class AutoFocusEngineW10(QObject):
         # firmware's double-read agreement), so "between reports" can be the whole burst: the
         # 2026-11-02 flight lost 4096 c on cam3 in five of eight back-offs with 50-pulse lines
         # (~1150-1500 c each), drove the lens into its end stop, and the stall points all agree
-        # modulo 4096. 700 c leaves ~3x margin even if the train coasts past the probe's c/pulse.
+        # modulo 4096. 700 c was then thought a 3x margin; on 2026-11-12 cam2 still lost turns
+        # on its 1500-3500 c legs (park return / approach / back-off: 700 c bursts, re-sent when
+        # unseen) while no 100 c sweep step ever did. So the legs now WALK: 100 c per burst, one
+        # settle each -- a 1500 c park leg is ~15 bursts (~10 s), a 3500 c back-off ~25 s, about
+        # what the 700 c legs took with their re-sends. Even four stacked bursts stay far under
+        # half a turn.
         self._max_counts = abs(float(max_counts_per_burst))
         self._approach_frac = float(approach_frac)
         self._settle_ticks = int(settle_ticks)
@@ -335,7 +341,13 @@ class AutoFocusEngineW10(QObject):
             # fail. Meanwhile re-send the pulses every no_motion_frames WITHOUT resetting the
             # bookkeeping, so the feeding continues until something moves.
             self._apply(self._feed(f, enc, None), enc)
-            if self.running and self._since_burst and self._since_burst % self._no_motion_frames == 0:
+            if (self.running and self._since_burst and self._since_burst % self._no_motion_frames == 0
+                    and self._since_burst // self._no_motion_frames <= 1):
+                # ONE re-send only. "No motion" may be a stalled $ENC stream over a motor that did move
+                # (cam3 2026-10, cam2 2026-11-12: the count jumped whole revolutions during runs whose
+                # bursts never exceeded 700 c); each unseen re-send adds another burst to the gap
+                # between two readings, and past 2048 c the unwrap folds a turn. Two bursts stay
+                # under it; after that the engine's stall rule decides.
                 self._burst(f.target, enc, fresh=False)
             return
         self._learn_cpp(enc)
@@ -482,6 +494,7 @@ class AutoFocusController(QObject):
         counts_per_pulse: float,
         pin_rois_cb: Callable[[Optional[list]], None],
         select_camera_cb: Optional[Callable[[int], None]] = None,
+        config: Optional[W10Config] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -493,6 +506,7 @@ class AutoFocusController(QObject):
             encoder_read=lambda: serial.encoder_position,
             encoder_present=lambda: serial.encoder_present,
             counts_per_pulse=counts_per_pulse,
+            config=config,
             pin_rois_cb=pin_rois_cb,
             set_strength=serial.set_strength,
             status=self.status.emit,

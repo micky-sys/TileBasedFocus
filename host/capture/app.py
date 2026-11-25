@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .af_w10 import W10Config
 from .autofocus_w10 import AutoFocusController, ROI_NAMES
 from .psf_w10 import frame_ok, roi_boxes
 from .camera_manager import CameraManager, OpenedCamera, find_cti_from_env
@@ -100,6 +101,18 @@ PREVIEW_PLACEHOLDER_LABEL = "Pick a camera's preview radio to display its feed"
 # SIGN is only a starting guess -- the w10 engine probes the real polarity (and
 # magnitude) at the start of every run, since each lens motor may be wired either way.
 AF_COUNTS_PER_PULSE = -24.0
+# Focus-drive pitch relative to the rig the w10 AF constants were tuned on (HANDOFF 59). The motor
+# -> 45:1 -> 70T/108T chain is unchanged (284k counts per focus-ring turn), but the ring now moves
+# the group 1.5 mm per turn instead of the Pentax helicoid's ~17 mm, so every lens-travel distance
+# in counts is 17 / 1.5 ~= 11.3x what it was (60 nm -> 5.3 nm per count; depth of focus +-300 c ->
+# +-3400 c). ``W10Config.scaled`` applies it to the lens-travel fields only. Edit here if the pitch
+# or the gearing changes again; 1.0 is the tuned rig.
+#
+# MUST MATCH THE LENS ON THE RIG. 1.0 while the original helicoid is installed; set to 17.0 / 1.5
+# the day the 1.5 mm drive goes in. The wrong value either way drives the lens into its stops
+# (scaled config on the helicoid: 1.6 mm back-off, 4.7 mm sweep) or never leaves one depth
+# (unscaled config on the 1.5 mm drive: 7000 c budget = 37 um).
+LENS_COUNT_SCALE = 1.0
 
 _COM_PANEL_STYLE_CONNECTED = (
     "QGroupBox { border: 1px solid #4a4a4a; border-radius: 4px; margin-top: 8px; "
@@ -2575,6 +2588,7 @@ class MainWindow(QMainWindow):
             self._serial,
             self._modes,
             counts_per_pulse=AF_COUNTS_PER_PULSE,
+            config=W10Config.scaled(LENS_COUNT_SCALE),
             pin_rois_cb=self._af_pin_rois,
             select_camera_cb=self._on_focus_panel_camera_chosen,
             parent=self,
@@ -4050,13 +4064,13 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def _on_af_dwell_toggled(self, on: bool) -> None:
-        """Panel 'Dwell x3': 3 gated frames per station and a +-40 c park tolerance (tol_frac 0.1 of
-        a 400 c depth clamps to tol_min), else the sec.54 creep design. ``W10Focus`` shares this
+        """Panel 'Dwell x3': 3 gated frames per station and a park tolerance of tol_min (tol_frac 0.1 of
+        a typical depth clamps to it), else the sec.54 creep design. ``W10Focus`` shares this
         config object, so the panel locks the checkbox while a run is active."""
         cfg = self._autofocus.config
         cfg.dwell_frames = 3 if on else 1
         cfg.tol_frac = 0.1 if on else 0.5
-        self._log(f"w10 AF: {'dwell x3, park CI <= +-40 c' if on else 'creep (1 frame/station), park CI <= half a depth'}")
+        self._log(f"w10 AF: {f'dwell x3, park CI <= +-{cfg.tol_min:.0f} c' if on else 'creep (1 frame/station), park CI <= half a depth'}")
 
     @Slot()
     def _on_autofocus_all_requested(self) -> None:

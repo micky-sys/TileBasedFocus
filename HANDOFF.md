@@ -13,7 +13,21 @@
 >   Anything keyed on the mode label rather than on what the scene does is WRONG (M4 in
 >   flight is moving).
 
-_Last updated: 2026-11-09 — **AF walks two depths past the vertex before it believes a flank;
+_Last updated: 2026-11-25 — **Encoder stream verified in motion on the bench; the 25 ms
+cadence needed three more firmware fixes to exist** (§59.5). The §59.3 firmware (read tolerance
+128 c mod 4096) is flashed and clean: 0 outliers over 7 relay cycles, 0 in-motion read failures,
+and the preflight's ±10k c S3 travel test returned to **+64 c** of start. But `$ENC` was running at
+**4.8/s, not 10/s and not 40/s**: in M4 `loop()` spends its whole life inside `TakePicsInPlace()`'s
+209 ms busy-wait, which never called `reportEncoder()`, so `encoderReportFastMs` was dead code and
+the unwrap envelope was 9.8k c/s — a quarter of an S3 train. Fixed by servicing the report inside
+the three trigger busy-waits and by turning the 60 ms trigger-pulse `delay()` into the same
+busy-wait (it also held a focus pulse energised for the whole 60 ms): now **40/s, worst gap 47 ms
+(43k c/s), max raw step 50 c**. The §25.4 "PCB wedges, power-cycle to recover" bug fired once on
+reconnect; candidate mechanism found in libClearCore (`SendChar` spins forever once a DTR drop
+mid-transfer leaves `m_sendActive` set) and a bounded-wait **USB TX guard** in `TeePrint` turns it
+into a mute-but-alive board. Only one camera (2439007, PCB slot 2) and one encoder were on this
+bench; `LENS_COUNT_SCALE` stays 1.0 (helicoid). Runbook §59.4: A, B1–B4 done; C/D still open.
+Previous (2026-11-09): **AF walks two depths past the vertex before it believes a flank;
 "Dwell x3" checkbox** (§58). The 2026-11-02 flight's DONE runs had 0.87 px frame scatter and
 three of five were one-sided: the old bracket test (3 frames, +0.15 px, one depth out) passed on
 noise. Now `far_depths` 2 / `min_far` 5 (the V has risen ~1.1 px there); on a flight-noise
@@ -7260,4 +7274,362 @@ Not yet flown. Open from the same analysis, not done: weight frames by edge coun
 (corr(residual, log n_edges) +0.31), a block-aware CI for *creep* (ρ 0.43 between consecutive
 stations makes its CI optimistic too; `tol_frac` 0.5 absorbs it today), and the replay harness
 serving recorded frames sequentially rather than `rng.choice` within the window.
+
+## 59. Focus drive re-pitched to 1.5 mm/turn; AF config scaled (2026-11-24)
+
+### 59.1 What changed on the lens
+
+The Pentax 645 focus group had large axial play inside its helicoid. The group's drive was
+rebuilt: the focus ring now moves the group **1.5 mm per turn** (was the helicoid's ~17 mm),
+the group is **spring-preloaded**, and the usable stroke is **~10 mm** (was ~35 mm; infinity is
+the only target). The motor → 45:1 → 70T/108T chain of §23.1 is unchanged: still **284k
+counts per ring turn**.
+
+| | tuned rig (§23–58) | 1.5 mm drive |
+|---|---|---|
+| counts per mm of glass | ~16.7k | ~189k |
+| nm per count | 60 | 5.3 |
+| depth of focus (±0.3 px), typical | ±300–400 c | ±3400–4500 c |
+| full stroke | ~585k c (143 motor revs) | ~1.9M c (460 motor revs) |
+| gear take-up ~1200 c, optically | ~3 depths | **0.26 depth** |
+| one lost encoder revolution (4096 c) | ~11 depths | **~1 depth** |
+
+The last two rows are the point: the lash the §49/§53.5 machinery exists for is now below the
+AF's own tolerance whether or not the preload takes it up, and a 12-bit unwrap slip is a
+tolerable park error rather than a ruined run. (`verify_rise_px` 2.5 px ≈ 3.3 depths therefore no
+longer catches a single slip; it does not need to.)
+
+### 59.2 Software: one constant, one classmethod
+
+`W10Config`'s count-valued defaults are left as tuned (every recorded flight and replay is in
+those counts). They split into two families, named in the class:
+
+- **lens travel** — `step_counts`, `refine_step`, `span_counts`, `tol_min`, `tol_max`, and the
+  part of `start_offset` beyond the take-up. These scale with counts-per-mm.
+- **motor side** — `takeup_counts`, `backoff_stall_counts`, `lash_counts` (gear lash referred to
+  the motor), `settle_counts` (encoder noise; also the stall detector's flatness threshold).
+  Pitch-independent, untouched.
+
+`W10Config.scaled(k)` applies `k` to the first family; `app.py` defines `LENS_COUNT_SCALE` and
+passes `W10Config.scaled(LENS_COUNT_SCALE)` into `AutoFocusController` (new `config=` kwarg).
+**`LENS_COUNT_SCALE` must match the lens on the rig**: it is **1.0 in the tree today** because
+the helicoid is still installed, and becomes `17.0 / 1.5` the day the new drive goes in (§59.4
+step C). At 17/1.5: start_offset 27.3k, step 1133, refine 567, span 79.3k, tol 453..3400 c.
+Wrong either way is bad: the scaled config on the helicoid backs off 1.6 mm, steps 3 depths and
+sweeps 4.7 mm into the stops; the unscaled config on the 1.5 mm drive has `tol =
+clamp(0.5·depth, 40, 300)` pinned at 300 c = 0.1 depth so REFINE never converges, and a 7000 c
+budget = 37 µm = one depth so every run FAILs "swept N counts without bracketing".
+
+Preflight (`preflight.py`) and the panel's manual pulse caps are motor-side (unwrap safety,
+counts per S3 pulse) and are not scaled. One S3 click is now ~4.5 µm (0.2 depth), one S0 click
+~0.13 µm.
+
+Checks: `tools/af_w10_replay.py --self-check` runs the synthetic lens at both scales
+(`SyntheticLens(scale=k)`: vertex/depth/start scale, lash does not);
+`tools/test_af_w10_flight.py::test_scaled_config_scales_lens_travel_only` pins the field split.
+30 seeds at each scale: |park error|/depth rms 0.29 vs 0.30, same tail (3–4 of 30 past 0.5
+depth, the 95 % CI spec) — the engine is scale-invariant, as it should be since it works in
+depths. Recorded flights replay with the DEFAULT config, not the scaled one.
+
+### 59.3 Run time, gated by the encoder: root cause and firmware fix (not yet flashed)
+
+`AutoFocusEngineW10` still walks every leg at `max_counts_per_burst` = 100 c, one settle per
+burst (~0.5 s), because 700–1500 c bursts lost revolutions in the unwrap (§54, 2026-11-02 and
+11-12). That cap is an unwrap-safety limit and does not scale — but the distances do: a 27k c
+back-off is ~2 min and an 80k c sweep ~6 min per camera at the walking pace. Not flyable until
+the burst cap can be raised, which needs the encoder stream to survive motion.
+
+**Why `$ENC` reads failed while the motor turned** (`Parallax_CLRCR_V2_4.ino`,
+`readEncoderPosition`): it required two consecutive raw reads to be **identical**, up to 4
+tries. A raw read is 4–6 SPI bytes at 500 kHz plus a 10 µs guard each, ~150–200 µs, so the two
+samples are ~175 µs apart. At S3 the shaft averages 85 c/ms (850 c per 10 ms pulse), ~15 c
+between the two samples; at S0 ~8 c/ms, 1–2 c. Equality failed on a moving shaft at any
+strength, all 4 tries, and the report went out as `-1`, which the host drops
+(`EncoderTracker.update_raw` ignores sentinels). The gap between two *good* reports was then
+several report periods, and the shortest-path unwrap folds anything over 2048 c in that gap.
+The function's comment ("safe during a focus move: a fraction of a millisecond apart, far too
+close for real shaft motion to separate them") was wrong by one to two orders of magnitude.
+
+The agreement rule was right for what it was added for — the MSB-dropped read after a relay
+switch (3447 read as 119), which the bench showed is a **per-switch** hazard (every bad sample
+within 500 ms of a `$Cn*`, 0 in 576 static reads) and which shifts a value by a multiple of 256.
+It only needed a tolerance, not equality.
+
+**Second, independent limit:** even with every read succeeding, a 100 ms report period allows
+2048 c per period = 20k c/s before the unwrap can fold, and a continuous S3 train is ~39k c/s
+(850 c per 22 ms on/gap cycle). *(2026-11-25: the real period in M4 was 209 ms, not 100 — see
+§59.5.2. The envelope was 9.8k c/s.)*
+
+**Firmware change (2026-11-24; flashed and bench-verified 2026-11-25, §59.5):**
+
+- `ENC_AGREE_TOL = 128`: the pair agrees when within 128 c **modulo 4096** (a shaft passing
+  4095 → 0 mid-pair is not a disagreement); the later read is returned; a `-1` on either side
+  is never agreement. 128 still rejects every MSB-drop (≥ 256 apart) and passes any real motion
+  (≤ ~30 c at S3 peak). Kept for *all* reads, not only after a switch: we have no data on read
+  integrity during motion, because the equality rule rejected every in-motion read ever taken,
+  and motion is when the H-bridge is switching on the same board. If the bench shows in-motion
+  reads are clean, dropping to a single read outside a ~500 ms post-switch window is a two-line
+  change.
+- `encoderReportFastMs` 100 → 25 ms in M4/M5: 82k c/s unwrap envelope, 2× S3. The host drops
+  `$ENC` lines from the log (`app.py _is_pcb_pulse_noise`), so the traffic costs nothing there;
+  the slow (non-focus) cadence is unchanged at 2 s. *(On its own this changed nothing — §59.5.2.)*
+
+Bench procedure: §59.4 step B. (Not the session log — the app filters `$ENC` lines out of it,
+`app.py _is_pcb_pulse_noise`; the two serial-only tools there see the raw stream.)
+
+The robust long-term option remains unwrapping on the MCU (poll every `loop()`, accumulate a
+32-bit count, report that; `EncoderTracker` then takes the count as-is) — a protocol change on
+both sides, not needed if the above measures clean.
+
+### 59.4 Runbook: flash, verify, install, re-scale, speed up (written for another machine)
+
+**State of the tree (2026-11-25, end of day).** Everything in §58–§59 (incl. §59.5) is
+**committed and pushed** to `origin/main` — see the commit after `9f7725c`. Steps A and B
+below were executed on 2026-11-25 (results in §59.5); they are kept as the procedure for the
+next machine / next firmware change.
+
+Before touching hardware, the no-hardware checks must pass on that machine:
+
+```
+py -3 tools/af_w10_replay.py --self-check      # 4 seeds at k=1, shelf, fail cases, 4 seeds at k=17/1.5
+py -3 tools/test_af_w10_flight.py              # incl. test_scaled_config_scales_lens_travel_only
+py -3 tools/encoder_toggle_smoke.py --self-check
+```
+
+**A. Flash the firmware (safe with the OLD mechanics; do it first — §59.3).**
+
+- Capture app must be closed (it owns the COM port). Close it gracefully (window close /
+  Disconnect), never `taskkill /F` — see `.cursor/rules/app-launch-kill-safety.mdc`.
+- Arduino IDE 2.x with the Teknic ClearCore board package (here: `ClearCore:sam` 1.7.0 under
+  `%LOCALAPPDATA%\Arduino15\packages\ClearCore`). Sketch folder
+  `Parallax_CLRCR_V2_4\`, board **Teknic ClearCore**, port = the one enumerating as
+  `Teknic ClearCore` (COM13 on 2026-11-05, COM38 before; `serial_comm.FocusController`
+  auto-detects by that description). Verify, then Upload.
+- CLI equivalent (the IDE bundles arduino-cli; this is exactly what was compile-checked
+  2026-11-24, 166,472 bytes / 32 %):
+  ```
+  & "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn ClearCore:sam:clearcore Parallax_CLRCR_V2_4
+  & "...\arduino-cli.exe" upload  --fqbn ClearCore:sam:clearcore -p COM13 Parallax_CLRCR_V2_4
+  ```
+- What the build contains vs the flashed 2026-07-30 firmware: `ENC_AGREE_TOL` (tolerance
+  read agreement, mod-4096), `encoderReportFastMs` 100 → 25, `reportEncoder()` inside the
+  trigger busy-waits, the trigger-pulse `delay()` → busy-wait, and the USB TX guard (§59.5).
+  `git diff 9f7725c -- Parallax_CLRCR_V2_4/` shows it in full. **Rollback** = `git checkout
+  9f7725c -- Parallax_CLRCR_V2_4/Parallax_CLRCR_V2_4.ino` and re-upload.
+
+**B. Bench-verify the encoder stream, still on the old mechanics.** Three serial-only tools
+(no KAYA, no Qt; app closed), each a few minutes. The lens barely moves in any of them.
+
+1. Stationary control, one camera, no relay switching:
+   `py -3 tools/encoder_toggle_smoke.py --park <slot> --seconds 60`
+   (`<slot>` = a PCB slot with an encoder wired: a slot without one reads 100 % `-1`, which is
+   "encoder absent", not a firmware fault). Expect **0 outliers, ~0 `-1`**. Also confirm the
+   report rate: it sends `$M4*` first, so `$ENC` should arrive at **~40/s** (was 4.8/s — the
+   frame rate — see §59.5.2).
+2. Relay switching — the regression test for the tolerance:
+   `py -3 tools/encoder_toggle_smoke.py --cycles 4`
+   Expect **0 outliers** (an MSB-dropped read is ≥ 256 c off and must still be rejected; the
+   tool's "outlier" is exactly that case) and `-1`s only inside ~500 ms of a `$Cn*`, at the
+   old ~0.1-per-switch rate. Any outlier here = the tolerance let a corrupt read through →
+   stop and report (lower `ENC_AGREE_TOL`, or revert).
+3. In motion — the thing that was broken:
+   `py -3 tools/serial_af_stress.py COM13 60 <slot>`
+   S0 ping-pong (2 pulses / 200 ms, reverses every 15 steps: ±30 pulses ≈ ±720 c ≈ 0.04 mm,
+   safe anywhere the lens is not against a stop) on PCB slot `<slot>` (firmware default is 1).
+   The DONE line reports `enc_fail` (`$ENC=…,-1` count and % of reports), `max_step` (largest
+   raw jump between consecutive good readings, mod 4096), `max_gap` (longest silence between
+   two `$ENC` lines once the storm is running — the unwrap envelope is 2048 c per `max_gap`)
+   and the mean rate. Old firmware: the majority of in-motion reports were `-1`. Want:
+   **`enc_fail` ≈ 0 %** (the few counted before the `$Cn*` select are the default slot's),
+   **`max_step` ≪ 2048** (at S0 a few tens of counts), **`max_gap` ≤ ~50 ms**, rate ≈ 40/s.
+4. Then launch the app (`$env:QT_QPA_PLATFORM = "windows"; py -3 host/main_capture.py`) and
+   run the **preflight**: motor test (10k c each way at S3) and S0–S3 calibration must pass as
+   on 2026-11-05, return error within `MOTOR_RETURN_TOL_COUNTS` 3000 c. If the stress tool was
+   clean and this passes, the encoder stream is trusted in motion.
+
+**C. Install the new drive, then re-scale the host.**
+
+- Set `LENS_COUNT_SCALE = 17.0 / 1.5` in `host/capture/app.py` (one line; the comment above
+  it says the same). Nothing else in the host changes. Verify:
+  `py -3 -c "import sys; sys.path.insert(0,'host'); import capture.app as a; from capture.af_w10 import W10Config; print(W10Config.scaled(a.LENS_COUNT_SCALE))"`
+  → start_offset ≈ 27267, step_counts ≈ 1133, span_counts ≈ 79333, tol 453/3400,
+  takeup/lash/settle unchanged (1200/2000/60).
+- Preflight again on the new mechanics. The motor test still drives 10k c per direction — now
+  53 µm of glass instead of 0.6 mm — so it is a motor/encoder/relay check, not a stroke
+  check; `MOTOR_RETURN_TOL_COUNTS` 3000 c still covers gear lash + slip (motor-side). Record
+  the return error: with the spring preload it may come in far under the old 1000–1290 c
+  take-up, which is the first measurement of whether the preload loads the gear train.
+- Get the group near infinity **by hand first** if the mechanism allows: the stroke is now
+  ~1.9 M counts and one S3 click is ~850 c ≈ 4.5 µm (0.2 depth), so motoring across 10 mm is
+  ~2,200 clicks. The panel's per-click caps (`focus_panel._MANUAL_MAX_PULSES`) are unwrap-
+  safety and were left alone; they can be raised once B.3 is clean.
+- First AF run (M4, one camera): expect it to **work but be slow** — the burst cap is still
+  100 c (§59.3): ~2 min back-off, up to ~6 min sweep. Expect `depth +-3400..4500 c` in the
+  status line (±18–24 µm), and the park within half a depth. The CSV
+  (`Session logs\Iron661_w10af_*.csv`, next to the app, else
+  `%LOCALAPPDATA%\Iron661Capture\Session logs`) has `encoder` per frame — a jump of ~4096
+  between consecutive frames with no matching `target` is a fold.
+- If the preload has visibly killed the take-up (return error in the preflight ≪ 1200 c, and
+  no flat shelf after the back-off in the CSV), `takeup_counts` / `lash_counts` can come down
+  later — measured, not assumed; they cost only time now (0.26 depth of travel).
+
+**D. Only now: speed the AF back up.**
+
+- `max_counts_per_burst` in `AutoFocusEngineW10.__init__` (`autofocus_w10.py`, default 100.0)
+  is the knob. Raise it in steps — 100 → 400 → 1100 (≈ one scaled sweep step) — and after each
+  step run one AF and check the CSV for 4096 c folds. With B.3 clean, the limit is the 25 ms
+  cadence (82k c/s) against the burst's speed, not the read failures; S0 bursts are far under
+  it, S3 is at 2× margin.
+- Optionally raise the panel's `_MANUAL_MAX_PULSES` for S3 for manual ergonomics (the same
+  half-turn-per-report argument bounds it; keep one click well under 2048 c between reports).
+- Re-time a full "Auto-focus all" and write the numbers here.
+
+**What was NOT changed and why (so nobody "fixes" it):** `preflight.py` constants (motor-side);
+`settle_counts` 60 (also the stall detector's flatness threshold — scaling it would read a slow
+creep as a stall); `lash_counts` 2000 and `takeup_counts` 1200 (gear lash referred to the
+motor, pitch-independent, to be re-measured on the preloaded drive, not scaled);
+`verify_rise_px` 2.5 (now ~3.3 depths; a single lost revolution is ~1 depth and tolerable);
+recorded-flight replays (old counts, use the default config). The `pollAllEncoders`
+between-sweep poll in M1/M2 uses the same `readEncoderPosition()` and so also gets the
+tolerance; watch its tagged `$ENC` lines in the first operational session for anything odd
+right after the relay clicks.
+
+### 59.5 Bench session: the tolerance works, the cadence did not exist, the board wedged once (2026-11-25)
+
+Bench: ClearCore on **COM26**, one camera (**2439007**, the 400 mm, PCB slot 2), and **only slot
+2's encoder wired** — slots 1 and 3 read `-1` on every sample, which the smoke tool reports as
+"encoder never echoed rd_pos" and which is absence, not a fault. Helicoid still installed;
+`LENS_COUNT_SCALE` 1.0 is correct and was not touched. The §59.4 no-hardware checks (replay
+self-check at both scales, `test_af_w10_flight.py`, `encoder_toggle_smoke.py --self-check`) all
+passed first. Four firmware builds were flashed during the session; each is a line below. The
+three §59.4 serial-only tools were run after each, always on slot 2.
+
+#### 59.5.1 Read tolerance (`ENC_AGREE_TOL`): verified
+
+| check | result |
+|---|---|
+| B2 relay switching, 7 cycles total (3 runs) | **0 outliers, 0 `-1`** on slot 2 (61 + 352 + 88 reads) |
+| B3 in motion, S0 ping-pong, 60 s | **0 read failures during motion** (the `enc_fail` the DONE line counts are the ~1 s before `$C2*` while slot 1 — no encoder — was selected); `max_step` 44–109 c |
+| B4 preflight travel test, 10k c out and back at S3 | 37 pulses of 472–572 c, every read plausible, returned to **+64 c** of start |
+
+An MSB-dropped read (≥256 c off) was still rejected every time; a moving shaft was never
+rejected. §59.3's first problem is closed.
+
+#### 59.5.2 The cadence was pinned to the frame rate — three builds to make `encoderReportFastMs` real
+
+After the first flash `$ENC` arrived at **4.8/s** (15 lines per 3 s dwell; 304 lines in 67 s)
+— not the 40/s the 25 ms constant promises and not the "10/s" §59.3 assumed for the old 100 ms.
+`reportEncoder()` was only called from `loop()`, and in M4 `loop()` is almost entirely inside
+`TakePicsInPlace()`'s 209 ms busy-wait (`picsInPlaceDelay = minTimeBetweenFrames`), which
+serviced `serviceFocusPulse()` and nothing else. So the report fired once per frame, whatever
+the constant said, and the real unwrap envelope was 2048 c / 209 ms = **9.8k c/s — a quarter of
+an S3 train**, which makes §54's lost revolutions less of a mystery than §59.3 made them.
+(The app never sends `$X1*`, so lockstep/external trigger is not what flight runs.)
+
+Build 2: `reportEncoder()` added inside the pre-trigger busy-waits of `TakePicsInPlace` (M4),
+`SweepStepM5` (M5) and `testClick` (lockstep). Result: **~30/s, worst gap 94 ms** (the tool
+gained `max_gap`/rate for this). The gap was the trigger pulse itself: `delay(picDelayCurr)`
+(60 ms, `picDelayFast`) + `MoveAbsolutePosition(0,0)` (10 ms + HLFB wait) per frame — blocking.
+
+Build 3: the 60 ms pulse-width `delay()` in `TakePicsInPlace` and `SweepStepM5` became the
+same busy-wait `testClick` already used. Result: **40/s, worst gap 47 ms, `max_step` 48–50 c**.
+47 ms = **43k c/s envelope, above the S3 train's ~39k**; the remainder is the per-frame
+`MoveAbsolutePosition(0,0)` HLFB wait (mirror-motor code, left alone). The same `delay(60)` had
+also been holding any focus pulse that was ON **energised for the whole 60 ms** — the bug the
+`testClick` comment describes as fixed there, still live in `TakePicsInPlace`. Mostly latent,
+because host commands are consumed only once per frame (so bursts start right after a
+trigger); only bursts longer than the ~140 ms wait window (≥6 pulses at S3, ≥9 at S0 — i.e.
+preflight's S0 calibration bursts) could straddle it. Gone now.
+
+Two things measured on the way, both pre-existing and unchanged:
+
+- **Host commands in M4 are consumed once per 209 ms frame** (`CheckMessages()` is in `loop()`,
+  not in the busy-waits). A `+`/`-` burst therefore waits up to one frame before it starts.
+  Visible as: the stress tool sends one burst per 200 ms, the board drains one per 209 ms, and
+  ~4 % back up in the RX buffer and play out after the host disconnects — the smoke tool read
+  that as "66 outliers on a stationary shaft" until the raw log showed `ack: ++` lines.
+- The 2026-11-05 preflight's "back within 319 c" on slot 3 vs today's **+64 c** on slot 2 says
+  nothing about the firmware (different lens, different lash); noted as this lens's number.
+
+#### 59.5.3 The §25.4 wedge fired once, and libClearCore shows how
+
+After build 3's stress run the next tool connect got **zero bytes**: no banner, no `$ENC`, no
+reply to `$M0*`, COM26 still enumerated, nothing else holding the port. §25.4's "stops answering
+serial, power-cycle to recover", previously tied to "~676 pulses". `libClearCore 1.7.0
+UsbManager.cpp` gives a mechanism that fits every symptom:
+
+- `UsbManager::SendChar()` is `while (Connected() && m_portOpen) { if (AvailableForWrite()) {…
+  return true;} }` — it **spins until there is room** in a **64-byte** (`USB_SERIAL_BUFFER_SIZE`)
+  out buffer, for as long as the host has DTR up.
+- The buffer drains only from the `TxComplete` callback → `TxPump()`. `Refresh()` pumps only
+  when `!m_sendActive`.
+- On DTR drop, `CBLineStateChanged` calls `cdcdf_acm_stop_xfer()` and registers the WRITE
+  callback as NULL. If a transfer was in flight, `TxComplete` never runs and **`m_sendActive`
+  stays set**. Nothing in `PortOpen()`/`PortClose()` clears it (`PortClose` even calls
+  `WaitForWriteFinish()`, which would hang too).
+- While the host is away, `SendChar` returns false immediately (not connected) — harmless. On
+  the next connect it fills 64 bytes and then **blocks `loop()` for good**: no triggers, no
+  commands, no output, from the first byte. Which is what was seen.
+
+A 40 Hz `$ENC` stream makes "a transfer in flight at the moment the host closes the port" far
+more likely than 4.8/s did, so the cadence fix raised the odds of a pre-existing bug. The
+sketch cannot clear the private flag; build 4 adds a **USB TX guard** in `TeePrint`, the single
+choke point all 119 `Host.print`s pass through: if `Serial.availableForWrite()` stays 0 for
+more than `USB_TX_STALL_MS` (5 ms; a healthy full buffer frees within one 1 ms IN poll), USB
+output is dropped **through the end of the current line** and resumes only at a line boundary
+with room (so a truncated `$ENC` can never splice onto a later one into a valid wrong count;
+`_ENC_RE` also requires the trailing `*`). `Serial.write(buf, n)` is replaced by byte-wise
+writes because the block form blocks inside. A stuck pump now yields a board that is **mute but
+alive** — triggers, mirrors, pulses and `$M0*` keep working — and "mute" is the diagnosis:
+power-cycle the PCB.
+
+Build 4 then survived four disconnect/reconnect cycles under the 40 Hz stream (two of them
+immediately after a pulse storm) with full output every time, so the wedge is **not yet
+reproduced on demand** and the mechanism above is a strong candidate, not a proof. The real
+fix is one line in Teknic's library — clear `m_sendActive` in the DTR-down branch of
+`CBLineStateChanged` — which would be a local edit to the installed board package
+(`%LOCALAPPDATA%\Arduino15\packages\ClearCore\hardware\sam\1.7.0\Teknic\libClearCore\src\UsbManager.cpp`),
+not portable to another machine; not done. If the mute state is ever observed in the app, that
+confirms it.
+
+#### 59.5.4 Preflight on the new firmware (B4) — PASS
+
+`cam1[2439007]` (one camera online → app numbers it 1; `PCB_FOCUS_CAMERA_SLOT_BY_SERIAL` routes
+it to slot 2, which is why the preflight's `$C2*` landed on the right motor and encoder):
+
+```
+PASS  Prerequisites: cams [1] armed; ClearCore connected; project + drives set
+FAIL  GPS tagging: GPS receiver not connected (rest of the check continues)   <- bench, expected
+PASS  Mirror homing (M4)
+PASS  Focus motor cam1: '+' +10070 c / 19 pulses (+530 c/pulse), '-' -10006 c / 18 pulses,
+      back to +64 c of start; backed off -13468 c off the '+' end stop first
+PASS  Focus calibration cam1: S3 548 (535-570), S2 270 (266-279), S1 121 (112-122), S0 13 (12-18)
+PASS  Cameras alive (M4): cam1 +363 frames
+PASS  Mirror homing (M0)
+PASS  Sweep images: cam1 acq 13 wr 13 drop 0
+PASS  ClearCore motors: no fault lines during the run
+```
+
+The lens had been left near its '+' stop; the §55.9 back-off-and-retry did its job. This lens
+runs **548 c/pulse at S3** (§55.9's "under load" 518–631 for the same slot) and **13 c per S0
+pulse — below `settle_counts` 60**, so one S0 pulse is invisible to the encoder; the AF's 100 c
+bursts are ~8 S0 pulses and are fine, and the AF now uses these measured numbers (§55.3). Only
+warning in the app log: "asked for 3 cameras, grabber sees 1". With the stress tool clean and
+this passing, **the encoder stream is trusted in motion** (B4's criterion). App closed
+gracefully from the window.
+
+#### 59.5.5 What is left of §59.4
+
+- **C** (install the 1.5 mm drive, `LENS_COUNT_SCALE = 17.0 / 1.5`): hardware, not started.
+- **D** (`max_counts_per_burst` 100 → 400 → 1100): needs an AF run on real content to check the
+  CSV for folds; nothing was in front of the camera today. The serial-side numbers (47 ms worst
+  gap → 43k c/s vs S3's 39k) say the step to 400 should be safe when there is a scene.
+- The `$ENC` rate is now bounded by `MoveAbsolutePosition(0,0)`'s HLFB wait once per frame. If
+  more margin is ever needed, that call (re-centring servos that are already centred) is the
+  place to look — but it is mirror-motor code and the trigger cadence depends on it; measure
+  before touching.
+
+Tools: `tools/serial_af_stress.py` takes `[camera]` as a third argument, waits out the `$M4*`
+homing (6 s) and reports `max_gap`/rate. Checks: `py -3 tools/encoder_toggle_smoke.py
+--self-check`, `py -3 tools/af_w10_replay.py --self-check`, `py -3 tools/test_af_w10_flight.py`.
 

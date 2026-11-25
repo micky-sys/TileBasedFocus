@@ -40,6 +40,9 @@ import numpy as np
 from .psf_w10 import frame_ok
 
 FRAME_S = 0.209          # PCB trigger period at the delivered 4.8 fps (sec.42)
+CEILING_PX = 11.0        # where w10 saturates far from focus (sec.52): frames up there are a flat noisy
+                         # shelf, and a V fitted to them has a vertex that means nothing (2026-11-12 11:30,
+                         # second pass: 2000 c of 9-11 px readings fitted a "bowl" at -6272)
 
 
 # ---------------------------------------------------------------------------------------------- the V fit
@@ -122,6 +125,9 @@ def fit_v_local(e, w, rise_px: float, window_depths: float, min_frames: int = 8,
             fit, keep = fit_v(e[seed], w[seed], trim), seed
     if fit is None or window_depths <= 0:
         return fit, keep
+    # ONE round only. Iterating the window (re-sizing it from each refit's depth) was tried on the 2026-11-12
+    # 11:30 data and reverted: on a one-sided descent the window shrinks around an under-read depth, the
+    # refit sees 17 correlated frames, and FlightLens seed 3 parked 600 c off with CI +-104.
     win_c = window_depths * depth_counts(fit, rise_px)
     win = np.abs(e - fit.e0) <= win_c
     if min_frames <= win.sum() < len(e):
@@ -130,7 +136,7 @@ def fit_v_local(e, w, rise_px: float, window_depths: float, min_frames: int = 8,
         # window sat at the end of a one-sided sweep): a near-flat parabola with its vertex 10^5 c away
         # replaced a sound global fit on a dwell run (seed 21 of the 2026-11-09 check). Keep the global one.
         if local is not None and abs(local.e0 - fit.e0) <= win_c:
-            return local, win
+            fit, keep = local, win
     return fit, keep
 
 
@@ -163,6 +169,10 @@ def flank_seen(e, w, fit: Optional[Vfit], rise_px: float, side: int, min_far: in
     near = np.abs(e - fit.e0) < dep
     if near.sum() < min_far:
         return False
+    # Counting every sample beyond ONE depth (with the 2-depth rise threshold) was tried on the 2026-11-12
+    # 11:30 data and reverted: a fit from the bottom of a one-sided descent under-reads the depth (252 c for
+    # a 400 c lens, FlightLens seed 3), and bracketing on that parked 600 c off. The 11:30 run is rescued
+    # instead by the engine not failing a sweep whose far flank is being finished (``_finishing_far_flank``).
     far = side * (e - fit.e0) >= far_depths * dep
     rise_far = math.sqrt(fit.w0 ** 2 + far_depths ** 2 * ((fit.w0 + rise_px) ** 2 - fit.w0 ** 2)) - fit.w0
     return far.sum() >= min_far and float(np.median(w[far]) - np.median(w[near])) >= rise_far / 2
@@ -202,6 +212,7 @@ class AFW10State(Enum):
     SWEEP = "sweep"
     REFINE = "refine"
     PARK = "park"
+    VERIFY = "verify"            # at the vertex: a few gated frames must read the bowl before DONE
     DONE = "done"
     FAIL = "fail"
 
@@ -247,9 +258,18 @@ class W10Config:
     tol_max: float = 300.0
     min_frames: int = 8          # frames before the first fit is believed
     max_refine_frames: int = 40  # REFINE gives up waiting for the CI and parks on what it has
-    lash_counts: float = 1500.0  # return this far past the vertex (start side) before re-approaching
-                                 # (> takeup_counts, so the final approach moves the lens, not just the motor)
+    lash_counts: float = 2000.0  # return this far past the vertex (start side) before re-approaching
+                                 # (> takeup_counts ~1200, so the final approach moves the lens, not just the
+                                 # motor; 2000 leaves ~800 c of lens travel after the take-up -- 1500 left 300,
+                                 # one take-up mis-estimate from a park that never moved the glass, 2026-11-15)
     settle_counts: float = 60.0  # encoder within this of a commanded target counts as "arrived"
+    verify_frames: int = 10      # gated frames read at the parked position before DONE (~2.5 s); their median
+    verify_rise_px: float = 2.5  # must sit within this of what the sweep read at the bottom, else FAIL "parked
+                                 # off the bowl" (2026-11-12 13:00 cam2: DONE at the vertex count reading
+                                 # 11.5 px against a 5.9 px bowl -- the count had slipped, the lens revolutions
+                                 # out). 2.5 px is the rise at ~3.3 depths: this catches slips and lash misses,
+                                 # not a one-depth error. The flight's correlated content noise puts ~0.7 px sd
+                                 # on (10-frame median - sweep bottom); 1.5 px false-failed 1 FlightLens seed in 20.
     stall_frames: int = 25       # a commanded move that leaves the encoder flat for this many frames has hit a
                                  # limit (or the drive is dead): FAIL in SWEEP, proceed in PARK, re-base at START
     max_bad_frames: int = 60     # consecutive gated-out frames before FAIL (cloud, sea, stale encoder)
@@ -257,6 +277,30 @@ class W10Config:
                                  # high (sec.54.3 c), so raise this when time is cheap and skip the frame instead
     min_roi: int = 1             # frame gate: ROIs that contributed
     n_boot: int = 60
+
+    # The count-valued defaults above were tuned on the 2026 rig: 4096 c/motor rev x 69.4:1 to the
+    # focus ring, 17 mm of group travel per ring turn, ~60 nm/count. They come in two families:
+    #  * LENS TRAVEL -- a distance the glass moves (a sweep step, the budget, the park tolerance,
+    #    the back-off beyond the take-up). These scale with counts-per-mm when the lens's pitch
+    #    changes.
+    #  * MOTOR SIDE -- angular lash in the gear train referred to the motor (``takeup_counts``,
+    #    ``backoff_stall_counts``, ``lash_counts``) and encoder noise (``settle_counts``, also the
+    #    stall detector's flatness threshold). Pitch-independent: the motor turns the same counts
+    #    through the same lash whatever the glass does with it.
+    LENS_TRAVEL_FIELDS = ("step_counts", "refine_step", "span_counts", "tol_min", "tol_max")
+
+    @classmethod
+    def scaled(cls, k: float, **overrides) -> "W10Config":
+        """The tuned defaults for a lens whose counts-per-mm is ``k`` times the tuning rig's (k = 1 is the
+        rig as tuned; the 1.5 mm-pitch focus drive of 2026-11-24 is k = 17 / 1.5). Lens-travel fields are
+        multiplied by ``k``; ``start_offset`` scales only beyond the take-up (it is take-up + lens travel);
+        motor-side fields are untouched. ``overrides`` are applied verbatim afterwards."""
+        k = float(k)
+        base = cls()
+        vals = {f: getattr(base, f) * k for f in cls.LENS_TRAVEL_FIELDS}
+        vals["start_offset"] = base.takeup_counts + k * (base.start_offset - base.takeup_counts)
+        vals.update(overrides)
+        return cls(**vals)
 
 
 @dataclass
@@ -279,6 +323,7 @@ class W10Focus:
     backoff_from: Optional[float] = None   # encoder when the latest back-off was commanded
     span_extended: bool = False  # the one-time span extension has been spent
     far_target: Optional[float] = None
+    verify_w10: list = field(default_factory=list)   # gated w10 readings taken at the parked position
     station_n: int = 0           # gated samples taken since the last move (dwell bookkeeping)
     station_id: int = 0          # moves commanded so far; ``station`` labels each sample with it
     station: list = field(default_factory=list)
@@ -355,10 +400,22 @@ class W10Focus:
         return (self.ci[1] - self.ci[0]) / 2
 
     def _bracketed(self) -> bool:
-        return bracketed(self.enc, self.w10, self.fit, self.cfg.rise_px, self.cfg.min_far, self.cfg.far_depths)
+        """Strict (2 depths, 5 stations) on the FAR flank -- the one the sweep can extend by walking on, and
+        the one that was missing in every one-sided park (2026-11-02). Lenient (1 depth, 3 stations, the
+        pre-11-09 rule) on the START-side flank: extending that one costs a 3500 c back-off and a second
+        7000 c sweep, and on 2026-11-12 the strict test sent two cam1 runs back for a flank that the
+        first pass had already sampled 1800-2500 c of (runs 11:30, 11:33: 300 and 247 frames, no park)."""
+        d = self.cfg.direction
+        if self._bottom_px() > CEILING_PX - 3.0:
+            return False   # a "bowl" whose bottom is on the saturated shelf is noise
+        return self._flank_seen(-d, lenient=True) and self._flank_seen(d)
 
-    def _flank_seen(self, side: int) -> bool:
-        return flank_seen(self.enc, self.w10, self.fit, self.cfg.rise_px, side, self.cfg.min_far, self.cfg.far_depths)
+    def _flank_seen(self, side: int, lenient: bool = False) -> bool:
+        far_depths, min_far = (1.0, 3) if lenient else (self.cfg.far_depths, self.cfg.min_far)
+        # min_far counts STATIONS: with dwell, 5 frames were under two stations (11:30 run, "bracketed"
+        # from stale first-pass samples with the lens 4000 c away)
+        return flank_seen(self.enc, self.w10, self.fit, self.cfg.rise_px, side,
+                          min_far * self.cfg.dwell_frames, far_depths)
 
     def _span_budget(self) -> float:
         return self.cfg.span_counts * (1.0 + self.cfg.span_extend if self.span_extended else 1.0)
@@ -381,10 +438,19 @@ class W10Focus:
                 and float(np.median(last)) <= float(np.median(prev)) - self.cfg.rise_px)
 
     def _back_off(self, from_enc: float, encoder: Optional[float] = None) -> Action:
-        """Command the start point ``start_offset`` against the sweep direction from ``from_enc``; samples taken
-        so far stay (they were approached in the sweep direction too), the take-up after the reversal is skipped.
+        """Command the start point ``start_offset`` against the sweep direction from ``from_enc``; samples of an
+        earlier pass are dropped (see below), the take-up after the reversal is skipped.
         ``encoder`` is where the lens actually is now (defaults to ``from_enc``): the stall rule measures from it."""
         self.backoffs += 1
+        if self.enc:
+            # A SECOND back-off: the pass so far started inside the lash take-up or past the vertex, and
+            # its samples do not sit on the same curve as the next pass's -- on 2026-11-12 11:30 the first
+            # pass read 5.2 px at -10000 where the second read 7 px, the mixed fit put the vertex 1000 c
+            # off and then blew up (CI +-24000) as the real bowl came in. The next pass re-covers all of
+            # this ground anyway: start clean.
+            self._say(f"dropping the {len(self.enc)} samples of the previous pass")
+            self.enc.clear(); self.w10.clear(); self.station.clear()
+            self.fit = None; self.ci = (-math.inf, math.inf)
         self.start_enc = float(from_enc) - self.cfg.direction * self.cfg.start_offset
         self.taking_up = True
         self.landed = False
@@ -393,6 +459,34 @@ class W10Focus:
         self._say(f"backing off to {self.start_enc:.0f}")
         return self._move(self.start_enc)
 
+    def _finishing_far_flank(self, encoder: float) -> bool:
+        """Budget spent, but the fitted vertex lies inside the travelled range and the lens is still within
+        the stretch the strict far-flank test needs (``far_depths`` depths, then ``min_far`` stations at the
+        depth/3 refine step: ~4.3 depths past the vertex): let the sweep run them out instead of failing with
+        the bowl in hand (2026-11-12 11:30: FAIL "swept 7024 c" on the frame after the 4.86 px minimum; the
+        replay's default lens, vertex 6000 c below the start, failed the 7000 c budget the same way). Bounded
+        by the depth, so a soft fit cannot run away."""
+        if self.fit is None or not math.isfinite(self.depth):
+            return False
+        e = np.asarray(self.enc); d = self.cfg.direction
+        if not (e.min() < self.fit.e0 < e.max()):
+            return False
+        return 0 < d * (encoder - self.fit.e0) < self._far_stretch()
+
+    def _far_stretch(self) -> float:
+        """Counts past the vertex the strict far-flank test needs: ``far_depths`` depths, then ``min_far``
+        stations at the depth/3 refine step (~4.3 depths with the defaults)."""
+        return (self.cfg.far_depths + (self.cfg.min_far + 2) / 3.0) * self.depth
+
+    def _bottom_px(self) -> float:
+        """The sharpest the sweep has read so far, as the minimum of the 3-sample running median in encoder
+        order (one lucky frame on the 11 px shelf reads 8.6; three in a row do not)."""
+        e = np.asarray(self.enc); w = np.asarray(self.w10)
+        if len(w) < 3:
+            return math.inf
+        ws = w[np.argsort(e)]
+        return float(min(np.median(ws[i:i + 3]) for i in range(len(ws) - 2)))
+
     def _started_past_vertex(self) -> bool:
         """Is the start-side flank unobservable from the current start point? Either the fit puts the vertex
         within one depth of the start (or behind it), or there is no convex fit and w10 only rises with travel."""
@@ -400,8 +494,10 @@ class W10Focus:
         e = np.asarray(self.enc); w = np.asarray(self.w10)
         if len(e) - self.n_at_backoff < self.min_samples:
             return False   # the verdict on a start point needs samples taken from it
+        if self._bottom_px() > CEILING_PX - 3.0:
+            return False   # still on the saturated shelf: nothing here says where the vertex is
         if (self.fit is not None and e.min() < self.fit.e0 < e.max()
-                and self._flank_seen(d) and not self._flank_seen(-d)):
+                and self._flank_seen(d, lenient=True) and not self._flank_seen(-d, lenient=True)):
             # the vertex was passed and the end flank is in (same test as ``bracketed``), yet the start-side
             # flank is not: it never will be from this start point. (An early fit whose vertex falls outside
             # the travelled range is extrapolation and is not trusted here.)
@@ -413,8 +509,12 @@ class W10Focus:
         # noise. (Rising alone is also what the far flank does, hence both conditions.)
         travel = d * (e - self.start_enc)
         q = travel.max() / 3
-        first, last = w[travel < q], w[travel > 2 * q]
+        first, mid, last = w[travel < q], w[(travel >= q) & (travel <= 2 * q)], w[travel > 2 * q]
         if len(first) < 2 or len(last) < 2:
+            return False
+        if len(mid) >= 2 and float(np.median(mid)) < float(np.median(first)) - self.cfg.rise_px / 2:
+            # the middle is sharper than the start: the bowl is INSIDE the travel, not behind the start point
+            # (a sweep that ran on past the bowl rises overall too; it sent a 2026-11-12 replay back 3700 c)
             return False
         rises = float(np.median(last) - np.median(first)) >= self.cfg.rise_px / 2
         return rises and float(np.corrcoef(travel, w)[0, 1]) > 0.6
@@ -441,6 +541,8 @@ class W10Focus:
 
         if self.state == AFW10State.PARK:
             return self._park_tick(encoder, stalled)
+        if self.state == AFW10State.VERIFY:
+            return self._verify_tick(encoder, stats)
 
         travelled = d * (encoder - self.start_enc)
         if self.state == AFW10State.SWEEP and self.taking_up:
@@ -501,8 +603,16 @@ class W10Focus:
                     return self._fail(f"start-side flank still missing after {self.backoffs} back-offs")
                 self._say(f"start-side flank missing (vertex {self.fit.e0 if self.fit else float('nan'):.0f} vs "
                           f"start {self.start_enc:.0f}): backing off again")
+                e_arr = np.asarray(self.enc)
+                if (self.fit is not None and math.isfinite(self.depth)
+                        and e_arr.min() < self.fit.e0 < e_arr.max()):
+                    # Back off only as far as the flank needs: take-up + far_depths + a margin before the
+                    # vertex, not a full start_offset from the OLD start (2026-11-12 11:30: that put the second
+                    # start 5300 c from the vertex and the 7000 c budget ran out on the bowl).
+                    need = cfg.takeup_counts + cfg.far_depths * self.depth + 3 * cfg.step_counts
+                    return self._back_off(self.fit.e0 - d * (need - cfg.start_offset), encoder)
                 return self._back_off(self.start_enc, encoder)
-            elif travelled > self._span_budget():
+            elif travelled > self._span_budget() and not self._finishing_far_flank(encoder):
                 if not self.span_extended and self._still_falling():
                     # Out of budget while w10 is still dropping: the lens is on its way DOWN the far
                     # flank and the vertex is ahead. Stopping here is the one wrong move -- it is how
@@ -526,11 +636,24 @@ class W10Focus:
             if (self.ci_half <= self.tol or self.refine_frames > cfg.max_refine_frames * cfg.dwell_frames
                     or travelled > self._span_budget()):
                 return self._begin_park()
-            # keep collecting: fine steps through the bowl, then normal steps out along the far flank (more
-            # lever arm on the curvature); standing still would only re-sample one patch of ground
-            # (unless dwelling, which trades that for averaging the per-frame blur)
-            past = d * (encoder - self.fit.e0) > self.depth
-            return self._dwelling() or self._step(encoder, cfg.step_counts if past else cfg.refine_step)
+            if d * (encoder - self.fit.e0) > self._far_stretch():
+                # Far enough up the far flank: beyond this the metric saturates (11 px ceiling) and the V fit
+                # bends until the bracket is "lost" and the run goes looking for a flank it already has
+                # (2026-11-12 replay: bracketed at f35, swept on to 7600, re-backed-off 3700 c). Park.
+                self._say(f"far flank sampled to {d * (encoder - self.fit.e0):.0f} c: parking on what was measured")
+                return self._begin_park()
+            # keep collecting: fine steps through the bowl, normal steps outside it (more lever arm on the
+            # curvature); standing still would only re-sample one patch of ground (unless dwelling, which
+            # trades that for averaging the per-frame blur)
+            off = d * (self.fit.e0 - encoder)          # > 0: the vertex is still ahead in the sweep direction
+            if off > 3 * self.depth:
+                # Bracketed on samples from before a back-off while the lens is far up the start side (the
+                # 11:30 run on 2026-11-12: 4000 c out, 150 frames of 50 c refine steps at 10 px, no park).
+                # Drive to two depths before the vertex, in the sweep direction, and creep from there.
+                self._say(f"refining from {off:.0f} c up the start flank: moving to two depths before the vertex")
+                return self._move(self.fit.e0 - d * 2 * self.depth)
+            inside = abs(off) <= self.depth
+            return self._dwelling() or self._step(encoder, cfg.refine_step if inside else cfg.step_counts)
         return Action("hold")
 
     def _begin_park(self) -> Action:
@@ -550,11 +673,46 @@ class W10Focus:
                 return self._move(e0)
             return Action("hold", reason="returning")
         if abs(encoder - e0) <= cfg.settle_counts or cfg.direction * (encoder - e0) > 0 or stalled:
-            self.state = AFW10State.DONE
-            self._say(f"DONE at {encoder:.0f}{' (stopped short)' if stalled else ''} "
-                      f"(vertex {e0:.0f}, w0 {self.fit.w0:.2f} px, {len(self.enc)} samples)")
-            return Action("done", e0)
+            self.state = AFW10State.VERIFY
+            self.bad_run = 0
+            self._say(f"at {encoder:.0f}{' (stopped short)' if stalled else ''}: reading {cfg.verify_frames} frames "
+                      f"against the bowl (w0 {self.fit.w0:.2f} px)")
+            return Action("hold", reason="verifying the park")
         return Action("hold", reason="approaching the vertex")
+
+    def _verify_tick(self, encoder: float, stats: Optional[dict]) -> Action:
+        """The lens is at the vertex COUNT; make sure it is at the vertex. The count is a motor-side encoder
+        behind lash and a 12-bit unwrap that can lose revolutions in a burst, so the only proof is the image."""
+        cfg, e0 = self.cfg, self.fit.e0
+        if stats is None or not frame_ok(stats, min_edges=cfg.min_edges, min_roi=cfg.min_roi):
+            self.bad_run += 1
+            if self.bad_run > cfg.max_bad_frames:
+                # nothing to verify with (cloud, sea): the park stands on the fit alone, say so
+                self.state = AFW10State.DONE
+                self._say(f"DONE at {encoder:.0f} UNVERIFIED ({self.bad_run} gated-out frames at the park) "
+                          f"(vertex {e0:.0f}, w0 {self.fit.w0:.2f} px, {len(self.enc)} samples)")
+                return Action("done", e0)
+            return Action("hold", reason="verifying: frame gated out")
+        self.verify_w10.append(float(stats["w10"]))
+        if len(self.verify_w10) < cfg.verify_frames:
+            return Action("hold", reason=f"verifying {len(self.verify_w10)}/{cfg.verify_frames}")
+        med = float(np.median(self.verify_w10))
+        floor = self._bowl_floor()
+        if med > floor + cfg.verify_rise_px:
+            return self._fail(f"parked at {encoder:.0f} but w10 reads {med:.2f} px against a {floor:.2f} px bowl: "
+                              f"the lens is not where the count says (slip / lash) -- hand-focus or re-run")
+        self.state = AFW10State.DONE
+        self._say(f"DONE at {encoder:.0f} reading {med:.2f} px (vertex {e0:.0f}, bowl {floor:.2f} px, "
+                  f"{len(self.enc)} samples)")
+        return Action("done", e0)
+
+    def _bowl_floor(self) -> float:
+        """What the bowl actually read: the median of the sweep's gated samples within one depth of the vertex.
+        The fitted w0 is not used -- the V's minimum rides the noise down (FlightLens: fitted 4.3 against a true
+        5.0 px) and would fail honest parks."""
+        e = np.asarray(self.enc); w = np.asarray(self.w10)
+        near = w[np.abs(e - self.fit.e0) <= self.depth]
+        return float(np.median(near)) if len(near) >= 3 else float(self.fit.w0)
 
     def report(self) -> dict:
         return dict(state=self.state.value, frames=self.frames, samples=len(self.enc),

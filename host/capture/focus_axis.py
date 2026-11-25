@@ -41,8 +41,10 @@ class EncoderTracker:
     :attr:`position`) from the AF/GUI thread -- a lock guards the two ints.
 
     ponytail: the shortest-path unwrap assumes the shaft moves < half a rev
-    between samples (true at the ~10 Hz stream and real focus slew rates). A
-    faster slew than that would alias; the fix is a faster ``$ENC`` cadence.
+    between samples the host RECEIVES. At the firmware's 25 ms M4/M5 cadence
+    (2026-11-24; was 100 ms) that is 82k c/s, 2x a continuous S3 train. A dropped
+    report (``-1`` is skipped below) widens the gap; the firmware's tolerance-based
+    read agreement is what keeps in-motion reports from dropping.
     """
 
     def __init__(self, counts_per_rev: int = 4096) -> None:

@@ -24,15 +24,49 @@
 // gets this chatter -- it only ever sees the $Done*/$Ready* it already knows.
 bool hostOnSerial0 = false;
 
+// USB TX GUARD. libClearCore's UsbManager::SendChar() spins until there is room in
+// its 64-byte out buffer, for as long as the host has DTR up. That buffer only
+// drains from the TxComplete callback; when the host drops DTR while a transfer is
+// in flight (the port is closed under a 40 Hz $ENC stream), CBLineStateChanged
+// stops the transfer and deregisters the callback with m_sendActive left set, so
+// nothing ever pumps again. The next Host.print after the host reconnects fills the
+// 64 bytes and then blocks loop() for good: no triggers, no commands, no $ENC
+// (bench 2026-11-25: board enumerated, dead silent, power-cycle to recover; the
+// "wedges after N pulses" of HANDOFF sec.25.4 fits the same shape). The sketch
+// cannot clear the flag (private), so it bounds the wait instead: once the buffer
+// has stayed full for USB_TX_STALL_MS -- a healthy full buffer frees within one
+// 1 ms IN poll -- USB output is dropped until the buffer drains on its own. A mute
+// board that still triggers, moves and takes $M0* beats a dead one, and the
+// mute state is the diagnosis: power-cycle the PCB.
+const uint32_t USB_TX_STALL_MS = 5;
+bool usbTxStalled = false;
+
+static void usbWrite(uint8_t c) {
+  if (usbTxStalled) {
+    // Drop through the end of the current line, and only resume once there is room
+    // again: resuming mid-line could splice the head of one $ENC onto the tail of a
+    // later one into a syntactically valid, wrong count.
+    if (c == '\n' && Serial.availableForWrite() > 0) { usbTxStalled = false; }
+    return;
+  }
+  if (Serial.availableForWrite() == 0) {
+    uint32_t t0 = millis();
+    while (Serial.availableForWrite() == 0) {
+      if (millis() - t0 > USB_TX_STALL_MS) { usbTxStalled = true; return; }
+    }
+  }
+  Serial.write(c);
+}
+
 class TeePrint : public Print {
  public:
   size_t write(uint8_t c) override {
-    Serial.write(c);
+    usbWrite(c);
     if (hostOnSerial0) { Serial0.write(c); }
     return 1;
   }
   size_t write(const uint8_t *buf, size_t n) override {
-    Serial.write(buf, n);
+    for (size_t i = 0; i < n; i++) { usbWrite(buf[i]); }  // byte-wise: Serial.write(buf,n) blocks inside
     if (hostOnSerial0) { Serial0.write(buf, n); }
     return n;
   }
@@ -74,6 +108,13 @@ const int ENC_READ_FAILED = -1;    // sentinel the host treats as "encoder absen
 // 4 gives three chances to find a matching pair, which covers the observed
 // worst case of two consecutive corrupted samples after a switch.
 const int ENC_AGREE_TRIES = 4;
+// Two raw reads "agree" when they are within this many counts (mod 4096) of
+// each other. The corruption this guards against (MSB byte dropped after a
+// relay switch) moves a reading by a multiple of 256, so 128 still catches every
+// case of it, while a shaft turning at full S3 speed (~85 c/ms) moves ~15 c
+// between the two samples and passes. Exact equality did not: it failed every
+// read taken while the motor turned, at any strength (2026-11-24).
+const int ENC_AGREE_TOL = 128;
 
 // THREE ENCODERS, ONE BUS. MISO/MOSI/CLK stay on COM-1; COM-1's SS is fanned out
 // by that camera's own motor-selection relay, so "which encoder is on the bus" is
@@ -88,11 +129,20 @@ uint32_t lastCameraSelectMs = 0;     // when the relays last moved
 bool encoderDiscardNextRead = true;  // first read after a switch is thrown away
 
 // Encoder USB report cadence, gated by mode: the closed-loop AF (M4/M5) needs a
-// fresh shaft position every ~100 ms, but streaming that fast in the operational
+// fresh shaft position often, but streaming that fast in the operational
 // modes (M0/M1/...) just floods the host log and USB link for no benefit. So poll
 // fast only in the focus modes and merely "every once in a while" elsewhere (a
 // liveness heartbeat -- enough for the host to know the encoder is alive).
-const uint32_t encoderReportFastMs = 100;   // M4/M5: closed-loop AF position feed
+//
+// The fast period bounds how fast the shaft may turn: the host unwraps the 12-bit
+// angle by shortest path, so more than half a turn (2048 c) between two reports
+// it RECEIVES folds a revolution. At 100 ms that was 20k c/s, and a continuous
+// S3 train is ~39k c/s (850 c per 10 ms pulse + 12 ms gap) -- which, together
+// with the equality rule above rejecting every in-motion read, is how the host
+// lost whole turns on the 2026-11-02 / 11-12 legs. 25 ms allows 82k c/s, a 2x
+// margin over S3. The host drops $ENC lines from its log, so the extra traffic
+// (~15 bytes x 40 Hz) costs nothing there.
+const uint32_t encoderReportFastMs = 25;    // M4/M5: closed-loop AF position feed
 const uint32_t encoderReportSlowMs = 2000;  // other modes: liveness only
 uint32_t lastEncoderReport = 0;
 
@@ -815,7 +865,8 @@ int readEncoderRaw() {
   return pos;
 }
 
-// Position confirmed by two consecutive identical raw reads, or ENC_READ_FAILED.
+// Position confirmed by two consecutive raw reads within ENC_AGREE_TOL counts of
+// each other (the later one is returned), or ENC_READ_FAILED.
 //
 // Changing the chip-select over leaves the newly selected encoder's command
 // state machine mid-sequence, and its first sample or two come back corrupted:
@@ -831,16 +882,25 @@ int readEncoderRaw() {
 // pollAllEncoders' three-camera sweep, against an inter-sweep pause of ~300 ms;
 // requiring agreement costs one extra read (~0.3 ms) when the bus is healthy.
 //
-// Safe during a focus move: the two samples are a fraction of a millisecond
-// apart, far too close for real shaft motion to separate them.
+// During a focus move the two samples are ~0.2 ms apart (4-6 SPI bytes at 500 kHz
+// plus the 10 us guards each), and the shaft moves 1-15 counts in that time
+// depending on strength. So the pair is compared with a tolerance, modulo the
+// 12-bit wrap (a shaft passing 4095 -> 0 mid-pair is not a disagreement). Exact
+// equality, the rule until 2026-11-24, failed all four tries on every in-motion
+// read, reported -1, and the host's unwrap then had to bridge several report
+// periods of silence -- the mechanism behind the lost revolutions of sec.54.
 int readEncoderPosition() {
   int prev = readEncoderRaw();
   for (int i = 1; i < ENC_AGREE_TRIES; i++) {
     int cur = readEncoderRaw();
     // ENC_READ_FAILED twice is agreement on "no encoder", not on a position --
     // keep trying, and fall through to the failure return if it never settles.
-    if (cur == prev && cur != ENC_READ_FAILED) {
-      return cur;
+    if (cur != ENC_READ_FAILED && prev != ENC_READ_FAILED) {
+      int d = abs(cur - prev);
+      if (d > 2048) { d = 4096 - d; }   // shortest way round the single-turn wrap
+      if (d <= ENC_AGREE_TOL) {
+        return cur;
+      }
     }
     prev = cur;
   }
@@ -1052,11 +1112,15 @@ void SweepStepM5(){
   delay(mechDelayCurr);
   while ((millis()-lastFrameTime)<minTimeBetweenFrames){
     serviceFocusPulse();  // stop a finished focus pulse without waiting for next loop()
+    reportEncoder();      // keep the M5 $ENC cadence at encoderReportFastMs (see TakePicsInPlace)
   }
   digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
   digitalWrite(eventPin, false);
   lastFrameTime = millis();
-  delay (picDelayCurr);
+  while ((millis()-lastFrameTime) < (uint32_t)picDelayCurr){  // see TakePicsInPlace: not delay()
+    serviceFocusPulse();
+    reportEncoder();
+  }
   digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
   digitalWrite(eventPin, true);
 
@@ -1076,10 +1140,20 @@ void TakePicsInPlace(){
     //delay on top of the trigger pulse.
     while ((millis()-lastFrameTime)<picsInPlaceDelay){
       serviceFocusPulse();  // stop a finished focus pulse without waiting for next loop()
+      reportEncoder();      // this wait IS the M4 loop: without it $ENC is pinned to the
+                            // frame period (~209 ms, 4.8/s), not encoderReportFastMs
     }
     digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
     lastFrameTime = millis();
-    delay (picDelayCurr);
+    //Busy-wait, not delay(): a plain delay(60) here held a focus pulse that was ON energised
+    //for the whole 60 ms (testClick had the same bug, fixed the same way), and silenced $ENC
+    //for 60 ms per frame -- measured 94 ms max gap on the bench 2026-11-25, i.e. a 22k c/s
+    //unwrap envelope against S3's ~39k c/s. The camera triggers on the edge; ~1 ms of
+    //pulse-width jitter from the encoder read is irrelevant.
+    while ((millis()-lastFrameTime) < (uint32_t)picDelayCurr){
+      serviceFocusPulse();
+      reportEncoder();
+    }
     digitalWrite(camTrigPin, true); //optocoupler outputs are reversed so it puts the camera trigger signal to low (0V)
     MoveAbsolutePosition(0, 0);
 }
@@ -1121,6 +1195,7 @@ void testClick(){
     //and the host is never left waiting on the MCU after the frame it asked for.
     while ((millis()-lastFrameTime) < (uint32_t)minTimeBetweenFrames){
       serviceFocusPulse();
+      reportEncoder();  // lockstep M4 ($X1*) spends its time here too
     }
     digitalWrite(camTrigPin, false); //optocoupler outputs are reversed so it puts the camera trigger signal to high (3.3V)
     lastFrameTime = millis();

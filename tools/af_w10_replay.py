@@ -9,7 +9,11 @@ of focus of it from several random start positions.
 
     py -3 tools/af_w10_replay.py <edges.csv>... [--starts 5] [--window 120] [--tol-frac 0.5] [--verbose]
                                  [--from ENC] [--trace] [--min-edges 300] [--min-roi 1] [--all]
-    py -3 tools/af_w10_replay.py --self-check       synthetic V, 0.6 px noise, content bias, 1000-count lash
+    py -3 tools/af_w10_replay.py --self-check       synthetic V, 0.6 px noise, content bias, 1000-count lash,
+                                                    at the tuned rig's pitch and at the 1.5 mm drive's
+
+Recorded flights are in the TUNED rig's counts (17 mm per ring turn); replay them with the default ``W10Config``,
+not ``W10Config.scaled`` -- the scale belongs to the app, which knows what is bolted to the lens today.
 """
 from __future__ import annotations
 
@@ -166,11 +170,13 @@ class SyntheticLens:
     moving; the lens only follows once the motor takes up the slack (sec.49/53.5). Scenes change every 8 frames
     (content bias), frames carry 0.6 px noise, a few are cloud."""
 
-    def __init__(self, e0_lens=12000.0, w0=5.0, depth=400.0, lash=1000.0, seed=0):
-        self.e0, self.w0, self.lash = e0_lens, w0, lash
-        self.c = ((w0 + 0.3) ** 2 - w0 ** 2) / depth ** 2
+    def __init__(self, e0_lens=12000.0, w0=5.0, depth=400.0, lash=1000.0, seed=0, scale=1.0):
+        # ``scale`` is counts-per-mm relative to the tuned rig (W10Config.scaled): the vertex, the depth
+        # and the start are lens travel and scale with it; the lash is motor-side and does not.
+        self.e0, self.w0, self.lash = e0_lens * scale, w0, lash
+        self.c = ((w0 + 0.3) ** 2 - w0 ** 2) / (depth * scale) ** 2
         self.rng = np.random.default_rng(seed)
-        self.pos = 14000.0; self.lens = self.pos + lash / 2; self.n = 0; self.bias = 0.0   # as if last moved down
+        self.pos = 14000.0 * scale; self.lens = self.pos + lash / 2; self.n = 0; self.bias = 0.0   # as if last moved down
 
     def move(self, target):
         self.pos = float(target)
@@ -212,7 +218,7 @@ class FlightLens(SyntheticLens):
 def self_check():
     for seed in range(4):
         lens = SyntheticLens(seed=seed)
-        cfg = W10Config(direction=-1, start_offset=2500, span_counts=7000, lash_counts=1500)
+        cfg = W10Config(direction=-1, start_offset=2500, span_counts=7000, lash_counts=2000)
         af = run_engine(lens, cfg)
         rep = af.report()
         assert rep["state"] == "done", (seed, rep, af.log[-3:])
@@ -227,7 +233,7 @@ def self_check():
         def frame(self):
             e, s = super().frame(); s["w10"] = min(s["w10"], 11.0); return e, s
     lens = Shelf(seed=0); lens.pos = 15500.0; lens.lens = lens.pos + lens.lash / 2   # back-off lands 6000 c out
-    af = run_engine(lens, W10Config(direction=-1, start_offset=2500, span_counts=9000, lash_counts=1500))
+    af = run_engine(lens, W10Config(direction=-1, start_offset=2500, span_counts=9000, lash_counts=2000))
     rep = af.report(); lens_err = lens.lens_pos() - lens.e0
     assert rep["state"] == "done" and abs(lens_err) < 200, (rep, lens_err, af.log[-3:])
     print(f"shelf: done in {rep['frames']} frames, lens error {lens_err:+.0f} c, CI +-{rep['ci_half']:.0f}")
@@ -241,6 +247,20 @@ def self_check():
             e, s = super().frame(); s["n_edges"] = 0; return e, s
     af = run_engine(Cloud(), W10Config(direction=-1))
     assert af.state.value == "fail" and "gate" in af.log[-1], af.log[-1]
+    # the 1.5 mm-pitch drive (2026-11-24): 11.3x the counts per mm of glass, same motor-side lash. The scaled
+    # config must park the scaled lens in about the same number of STATIONS as the tuned rig did -- the engine
+    # works in depths, and a depth is now ~4500 c instead of 400
+    k = 17.0 / 1.5
+    for seed in range(4):
+        lens = SyntheticLens(seed=seed, scale=k)
+        af = run_engine(lens, W10Config.scaled(k, direction=-1), max_frames=600)
+        rep = af.report(); lens_err = lens.lens_pos() - lens.e0
+        assert rep["state"] == "done", (seed, rep, af.log[-3:])
+        # the park spec is a 95% CI of half a depth, so the tail reaches ~0.65 depth at EITHER scale (30 seeds:
+        # rms 0.29 vs 0.30 depth, 4 vs 3 seeds past 0.5); seed 2 here is one of them
+        assert abs(lens_err) < 0.75 * rep["depth"], (seed, lens_err, rep["depth"], af.log[-3:])
+        print(f"pitch 1.5 mm, seed {seed}: done in {rep['frames']} frames, lens error {lens_err:+.0f} c "
+              f"({lens_err * 5.3e-3:+.1f} um), depth +-{rep['depth']:.0f} c")
     print("ok"); return 0
 
 
