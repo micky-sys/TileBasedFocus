@@ -143,6 +143,16 @@ DEFAULT_CAMERA_CONFIG: dict[str, Any] = {
 }
 
 
+# Exposure-active strobe for the vibration hub: camera I/O pin 7 (OUT1, 5 V TTL,
+# Iron661 datasheet) -> hub CAM1..3. Bench 2026-11-26: the camera reports
+# Line2 LineFormat=TTL (OUT1, pin 7) and Line3 LineFormat=OptoCoupled (OUT2, pin
+# 12); Line2 driven from UserOutput0 was seen at pin 7 and at the hub's GPIO35.
+# IRON661_STROBE_LINE / IRON661_STROBE_SOURCE override for bench work. Only the
+# LineSource is written; LineMode is left as the camera reports it.
+STROBE_LINE = os.environ.get("IRON661_STROBE_LINE", "Line2").strip() or "Line2"
+STROBE_SOURCE = os.environ.get("IRON661_STROBE_SOURCE", "ExposureActive").strip() or "ExposureActive"
+
+
 # SFNC ``GainSelector`` entries that select analog amplification before the ADC.
 # Applied (in order) before GUI read/write of ``Gain`` when the camera exposes
 # ``GainSelector``. If none stick — many devices map ``Gain`` to analog only —
@@ -878,10 +888,89 @@ class KyfgCamera:
                 )
             ok, detail = self._set_param(param, value)
             lines.append(f"{param}={value}: {'OK' if ok else 'FAIL'} ({detail})")
+        lines.extend(self._configure_strobe_outputs())
         # Read back canonical Width/Height/PixelFormat for callback math
         self._read_camera_format()
         self._configured = True
         return lines
+
+    def _configure_strobe_outputs(self) -> list[str]:
+        """Route ExposureActive to ``STROBE_LINE`` (OUT1 TTL, I/O pin 7).
+
+        Logs LineMode/LineSource/LineStatus for Line0..Line3 so the session
+        log shows the camera's view of every I/O line. ``LineMode`` is never
+        written here: the camera reports Line3 (IN2, pin 9) as Output too,
+        and the trigger input must stay untouched.
+        """
+        lines: list[str] = []
+        output_lines: list[str] = []
+        for name in ("Line0", "Line1", "Line2", "Line3"):
+            ok, _ = self._set_param("LineSelector", name)
+            if not ok:
+                continue
+            mode = self._read_param("LineMode", "")
+            source = self._read_param("LineSource", "")
+            status = self._read_param("LineStatus", True)
+            inverter = self._read_param("LineInverter", True)
+            # LineFormat (manual §7.14.2): TTL = OUT1/pin 7, OptoCoupled = OUT2/pin 12,
+            # TriState = output driver disabled (LineStatus toggles, pin stays 0 V).
+            fmt = self._read_param("LineFormat", "")
+            lines.append(f"{name}: LineMode={mode} LineSource={source} LineStatus={status} "
+                         f"LineInverter={inverter} LineFormat={fmt}")
+            if str(mode).strip() == "Output":
+                output_lines.append(name)
+        # Bench aid: IRON661_STROBE_ALL_OUTPUTS=1 drives EVERY line the camera
+        # reports as Output (re-asserting LineMode=Output and LineInverter=False)
+        # so one relaunch identifies pins with a meter. Never touches Input lines.
+        if os.environ.get("IRON661_STROBE_ALL_OUTPUTS", "").strip() == "1":
+            self._blink_lines = tuple(n for n in output_lines if n != DEFAULT_CAMERA_CONFIG.get("TriggerSource"))
+            for name in self._blink_lines:
+                self._set_param("LineSelector", name)
+                lines.append(f"{name}: LineMode=Output: {self._set_param('LineMode', 'Output')}")
+                lines.append(f"{name}: LineInverter=False: {self._set_param('LineInverter', False)}")
+                if str(self._read_param("LineFormat", "")).strip() in ("TriState", "NoConnect"):
+                    lines.append(f"{name}: LineFormat=TTL: {self._set_param('LineFormat', 'TTL')}")
+                lines.append(f"{name}: LineSource=UserOutput0: {self._set_param('LineSource', 'UserOutput0')}")
+        else:
+            self._blink_lines = (STROBE_LINE,)
+        # Bench aid: IRON661_STROBE_BLINK_S=<seconds> drives the strobe line from
+        # UserOutput0 and toggles it at that half-period, so a multimeter can
+        # confirm which I/O pin the line is and that it reaches the hub.
+        blink_s = os.environ.get("IRON661_STROBE_BLINK_S", "").strip()
+        source = STROBE_SOURCE
+        if blink_s:
+            try:
+                self._blink_half_s = max(0.2, float(blink_s))
+                source = "UserOutput0"
+            except ValueError:
+                lines.append(f"IRON661_STROBE_BLINK_S={blink_s!r} ignored (not a number)")
+        ok, detail = self._set_param("LineSelector", STROBE_LINE)
+        if ok:
+            ok, detail = self._set_param("LineSource", source)
+        lines.append(f"{STROBE_LINE}: LineSource={source}: {'OK' if ok else 'FAIL'} ({detail})")
+        if ok and source == "UserOutput0":
+            self._set_param("UserOutputSelector", "UserOutput0")
+            self._blink_stop = threading.Event()
+            threading.Thread(target=self._blink_loop, name=f"{self.label}-strobe-blink", daemon=True).start()
+            lines.append(f"{STROBE_LINE}: BLINK via UserOutput0, {self._blink_half_s:.1f} s high / {self._blink_half_s:.1f} s low")
+        return lines
+
+    def _blink_loop(self) -> None:
+        level = False
+        while not self._blink_stop.wait(self._blink_half_s):
+            level = not level
+            ok, detail = self._set_param("UserOutputValue", level)
+            status = []
+            for name in self._blink_lines:
+                self._set_param("LineSelector", name)
+                status.append(f"{name}={self._read_param('LineStatus', True)}")
+            log.info("%s strobe blink: UserOutputValue=%s %s LineStatus %s", self.label, level,
+                     "ok" if ok else detail, " ".join(status))
+
+    def _stop_blink(self) -> None:
+        stop = getattr(self, "_blink_stop", None)
+        if stop is not None:
+            stop.set()
 
     def arm(self, on_frame: FrameCallback) -> None:
         """Create the stream, register the callback, and call
@@ -952,6 +1041,10 @@ class KyfgCamera:
             self._row_stride_bytes, start_status,
         )
         self._armed = True
+        # Confirm CameraStart did not reset the strobe routing.
+        if self._set_param("LineSelector", STROBE_LINE)[0]:
+            log.info("%s after arm: %s LineSource=%s LineStatus=%s", self.label, STROBE_LINE,
+                     self._read_param("LineSource", ""), self._read_param("LineStatus", True))
 
     def disarm(self) -> None:
         """Stop acquisition and tear down the stream. Idempotent."""
@@ -988,6 +1081,7 @@ class KyfgCamera:
 
     def close(self) -> None:
         """Disarm if needed, then close the camera handle."""
+        self._stop_blink()
         if self._armed:
             self.disarm()
         if not self._opened:

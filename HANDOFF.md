@@ -13,8 +13,19 @@
 >   Anything keyed on the mode label rather than on what the scene does is WRONG (M4 in
 >   flight is moving).
 
-_Last updated: 2026-11-25 — **Encoder stream verified in motion on the bench; the 25 ms
-cadence needed three more firmware fixes to exist** (§59.5). The §59.3 firmware (read tolerance
+_Last updated: 2026-11-26 — **Camera exposure windows are now in the vibration hub's recording**
+(§60). Camera 2439007 pin 7 (OUT1, `Line2`, `LineFormat=TTL`) carries `ExposureActive`, set by
+`configure()` in `kyfg_backend.py`; the Teensy 4.1 hub (DualCsvLogger **2.3**) timestamps both
+edges on GPIO35 and writes `# STROBE cam=1 level=0 mcu_us=… width_us=…` rows on the same 64-bit
+clock as the FSYNC anchors. Bench: **118 exposures, width 250/262/295 µs (min/median/max) for
+`ExposureTime=250`, rise-to-rise 209.0 ms** = the M4 period. Getting there cost a day: a broken
+pin-7 wire in the camera cable, a wrong line default of mine (§60.4), and a camera quirk that is
+still open — **after `Line2=ExposureActive` is written the camera stops accepting Line1 triggers
+until it is power-cycled** (3/3 today, §60.5). Also in 2.3: a missing IMU (J3 failed WHO_AM_I) is
+skipped instead of aborting the run, and the IMU INT1 data-ready pulses are disabled (they were
+tagging the FSYNC path as `UNEXPECTED_FSYNC`). Previous (2026-11-25): **Encoder stream verified in
+motion on the bench; the 25 ms cadence needed three more firmware fixes to exist** (§59.5). The
+§59.3 firmware (read tolerance
 128 c mod 4096) is flashed and clean: 0 outliers over 7 relay cycles, 0 in-motion read failures,
 and the preflight's ±10k c S3 travel test returned to **+64 c** of start. But `$ENC` was running at
 **4.8/s, not 10/s and not 40/s**: in M4 `loop()` spends its whole life inside `TakePicsInPlace()`'s
@@ -7632,4 +7643,134 @@ gracefully from the window.
 Tools: `tools/serial_af_stress.py` takes `[camera]` as a third argument, waits out the `$M4*`
 homing (6 s) and reports `max_gap`/rate. Checks: `py -3 tools/encoder_toggle_smoke.py
 --self-check`, `py -3 tools/af_w10_replay.py --self-check`, `py -3 tools/test_af_w10_flight.py`.
+
+## 60. Camera exposure strobe into the vibration hub (2026-11-26)
+
+The vibration test (`Vibration testing/`, Teensy 4.1 sensor hub with ICM-42688-P IMUs, moved
+into this repo in `eb6e1f6`) needs to know *when the camera exposed* relative to the IMU samples.
+Until today nothing produced or recorded that signal: the hub's DualCsvLogger 2.2 had "No camera
+strobe/trigger capture in this sketch" in its header and the capture app never touched the
+camera's I/O lines. Both ends now exist and were verified together on the bench.
+
+#### 60.1 Toolchain (done once, 2026-11-26 morning)
+
+arduino-cli is the Arduino IDE's bundled binary (`C:\Program Files\Arduino IDE\resources\app\lib\
+backend\resources\arduino-cli.exe`); `teensy:avr` 1.62.0 was added through
+`https://www.pjrc.com/teensy/package_teensy_index.json` in `%USERPROFILE%\.arduinoIDE\arduino-cli.yaml`.
+`Vibration testing/firmware/arduino-cli.yaml` now points at the global `Arduino15` (the local
+`.toolchain` it used to reference was empty on this machine). All four sketches compile; the
+DualCsvLogger 2.2 build reproduced the release hex byte-for-byte. Build + flash:
+
+```powershell
+cd "Vibration testing\firmware"
+& $cli --config-file .\arduino-cli.yaml compile --fqbn teensy:avr:teensy41 --build-path .\build-dualcsvlogger .\DualCsvLogger
+& $cli --config-file .\arduino-cli.yaml upload  --fqbn teensy:avr:teensy41 -p usb:0/140000/0/8 --input-dir .\build-dualcsvlogger .\DualCsvLogger
+```
+
+The Teensy enumerates as **COM9** (115200); the ClearCore is COM26. VibrationMonitor runs with the
+repo's PySide6 after `pip install pyqtgraph`. `g++` is not installed, so `firmware/test.ps1`'s
+native tests were skipped (host-side pytest passes: decoder 8, Monitor 20, FlightBridge 16).
+
+#### 60.2 DualCsvLogger 2.3 (hub firmware)
+
+`Vibration testing/firmware/DualCsvLogger/DualCsvLogger.ino`, `LoggerCore.h`:
+
+- **Strobe edge capture.** `STROBE_PIN[3] = {35, 34, 33}` (CAM1/J7, CAM2/J11, CAM3/J12, after
+  the hub's SN74LVC1G17 buffers), `STROBE_ENABLED = {true, false, false}` — only wired cameras;
+  the buffers held a clean 0 when floating on this hub, but the README's warning stands.
+  `attachInterrupt(..., CHANGE)`; the ISR stores only `micros()`, a running edge count, cam and
+  level into a 256-entry `csvlog::Ring<StrobeEdge>` and counts drops instead of faulting the run
+  (a chattering strobe line must not kill an IMU recording). The main loop extends the raw 32-bit
+  stamp to the common 64-bit clock with a brief `noInterrupts()` snapshot of
+  `extendedMicros/previousMicros` and writes
+  `# STROBE cam=1 level=1 mcu_us=<t> edge=<n>` on the rising edge and
+  `# STROBE cam=1 level=0 mcu_us=<t> edge=<n> width_us=<w>` on the falling edge (`width_us` =
+  exposure-active high time). `STATUS` adds `STROBE_STATUS cam=1 edges= pulses= last_width_us=
+  level= dropped=`; the `# END` footer adds `strobe_edges_cam1 strobe_pulses_cam1 strobe_dropped`.
+  VibrationMonitor stores `#` lines it does not know as comments (≤200) and `synchronization.py`
+  only parses `# FSYNC`, so the new rows are harmless to the existing app; nothing *displays* them
+  yet.
+- **Missing sensor tolerated.** J3 failed `WHO_AM_I` all day (only J1 is populated on this bench)
+  and 2.2 refused to record. `startImu()` now marks a connector that fails WHO_AM_I as absent
+  (`sensorPresent[]`), skips it in `collect()` and in the FSYNC pulse/expectation, writes
+  `# SENSOR_ABSENT id=3 …` into the file and says `SENSOR_ABSENT id=3 (J3) -- recording without it`.
+  Any other bring-up failure still faults as before; no sensors at all → `NO_SENSORS`.
+- **INT1 data-ready pulses off** (`INT_SOURCE0 = 0`). With J1 alone, every run died within
+  40 ms with `UNEXPECTED_FSYNC`: the sensor returned FSYNC-tagged FIFO packets without a pulse
+  from the Teensy. INT1 (pin 2) was only an edge counter (`INT1_edges_J1`), the FIFO is polled by
+  timer, and its 16 kHz pulses were the only thing toggling next to the FSYNC wire; with them off
+  the same hardware recorded 400 k rows clean, `SYNC sent == received` throughout. Mechanism not
+  proven (crosstalk vs. a sensor-side interaction), but the counter it fed is now always 0.
+- Header is `# DualCsvLogger 2.3; …; strobe_cams=1` with the strobe-row legend; HELP/banner say
+  2.3. `README.md` in that folder still describes 2.2 and should be updated with this section.
+
+#### 60.3 Camera side: `ExposureActive` on OUT1 (`host/capture/kyfg_backend.py`)
+
+The Iron661 I/O connector (12-pin Hirose HR10A-10R-12PB): pin 7 **OUT1 TTL**, pin 11 its return,
+pin 8 IN1 opto, pin 9 IN2 TTL, pin 12 OUT2 opto (needs an external pull-up), pin 5 its return.
+GenICam names are not in the manual ("GPIO output depends on camera model"); the camera itself
+tells you through `LineFormat`:
+
+| Line  | LineMode | LineFormat   | physical                 |
+|-------|----------|--------------|--------------------------|
+| Line0 | Input    | OptoCoupled  | IN1, pin 8               |
+| Line1 | Input    | TTL          | IN2, pin 9 — the PCB trigger (`TriggerSource=Line1`) |
+| Line2 | Output   | TTL          | **OUT1, pin 7 — strobe** |
+| Line3 | Output   | OptoCoupled  | OUT2, pin 12             |
+
+`configure()` now ends with `_configure_strobe_outputs()`: logs
+`LineMode/LineSource/LineStatus/LineInverter/LineFormat` for Line0–3, then writes
+`LineSource=ExposureActive` on `STROBE_LINE` (default `Line2`). `LineMode` is never written in
+normal mode (Line1 is the trigger). `arm()` re-reads the line after `KYFG_CameraStart` and logs
+`after arm: Line2 LineSource=… LineStatus=…`. Bench overrides, all env vars, none set in normal use:
+`IRON661_STROBE_LINE`, `IRON661_STROBE_SOURCE`, `IRON661_STROBE_BLINK_S=<s>` (drive the line from
+`UserOutput0` and toggle it every *s* seconds on a daemon thread, logging the camera's
+`LineStatus` — for a multimeter), `IRON661_STROBE_ALL_OUTPUTS=1` (blink every line the camera
+reports as Output, re-asserting `LineMode=Output`, `LineInverter=False`, and `LineFormat=TTL` if it
+reads TriState). `close()` stops the blink thread.
+
+#### 60.4 How the day went (so nobody repeats it)
+
+1. First hub run with the camera exposing: 0 edges. Then every variant for two hours: 0 edges,
+   `level=0`. Five app relaunches bisecting Line2/Line3/UserOutput — confounded by §60.5, and one
+   of them (13:10) started **a second app instance while the first was still up** because the
+   harness reported my launch as failed. It got neither the grabber nor COM26 and closed cleanly,
+   but: **always check the process table before launching**, never trust the launcher's status.
+2. Multimeter on pin 7 with the line driven high from `UserOutput0`: 0 V. I concluded "Line2 is
+   not pin 7" and changed the default to `Line3`. Wrong — `LineFormat` later proved Line2 = TTL =
+   pin 7. The 0 V was a **broken pin-7 wire in the camera cable** (found by continuity). Vision
+   Point toggling `UserOutputValue` on "TTL Output 0" (= Line2) read 0 V too, same cable.
+3. With the cable fixed, the app's blink was visible on the Teensy (`cam1 level` following the
+   2 s toggle) and a 20 s hub recording during the blink gave 5 pulses of `width_us ≈ 2,007,xxx`
+   (2.0 s + Python loop latency), rise-to-rise 4015 ms: the whole chain pin 7 → cable → J7 →
+   U2 → GPIO35 → ISR → CSV proven.
+4. The "normal" run right after still gave 0 edges — because of (2): `ExposureActive` was going
+   to Line3/pin 12. Default back to `Line2`; next run: **237 edges, 118 pulses, 250/262/295 µs,
+   209.0 ms**. Recording: `data/recordings/vibration_20261126_153910_836675_f53c32.csv`.
+   Width jitter (250 → 295 µs) is strobe-ISR latency behind the 250 µs IMU service interrupt
+   (same NVIC priority, service up to 184 µs); raising the GPIO IRQ priority above the
+   IntervalTimer would bring it to a few µs. Not done.
+
+#### 60.5 Open: triggers stop after writing `Line2=ExposureActive`, until a camera power-cycle
+
+Reproduced 3/3 (13:04, 13:13, 15:37): a session whose `configure()` writes
+`Line2 LineSource=ExposureActive` arms fine, `after arm` readback is correct, the PCB fires in M4
+(`$ENC` streams, `Mode 4:` banner) and **no frame arrives** ("Camera armed but not streaming").
+Power-cycling the camera while the app stays up, then re-entering M4, gives frames at 4.8 fps
+*with the strobe working* — so the routing itself is not what blocks triggers; something about
+writing it in that session is. Sessions that routed `UserOutput0` or left Line2 `Off`, or routed
+`ExposureActive` to Line3, all had frames immediately. Not investigated further. Candidates: write
+`LineSource` before `TriggerMode`/`TriggerSource` in `DEFAULT_CAMERA_CONFIG` order; an
+`AcquisitionStop/AcquisitionStart` after the I/O write; or saving the I/O setup to the camera's
+UserSet once so `configure()` never has to write it. Until resolved: **after the first bring-up of
+the day, expect to power-cycle the camera once**; preflight's "Cameras alive (M4)" check is where
+this will show.
+
+#### 60.6 Bench procedure that worked
+
+Hub firmware flashed (§60.1), hub on COM9, only J1 populated. `NEW` on the hub (it dumps the old
+log over USB, waits for `ACK_LOG <bytes> <crc>` — reuse `VibrationMonitor/transfer.py`'s
+`LogReceiver` for that — erases, and records). App launched normally, M4 from the Focus panel,
+hub `STOP` + `DUMP` after ~20 s; grep the saved CSV for `# STROBE cam=1 level=0` and read
+`width_us`. Never force-kill the app (rule file); the hub tolerates anything.
 

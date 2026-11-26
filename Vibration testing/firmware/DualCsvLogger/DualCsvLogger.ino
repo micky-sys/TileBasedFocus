@@ -13,6 +13,13 @@
 
 constexpr uint8_t CS[2]={10,38},INT1_PIN[2]={2,23},SENSOR_ID[2]={1,3};
 constexpr uint8_t FSYNC_PIN[2]={6,21}; // Existing INT2 wires, sensor connector pin 4.
+// Camera strobe (exposure-active) inputs after the hub's SN74LVC1G17 buffers:
+// CAM1/J7 -> 35, CAM2/J11 -> 34, CAM3/J12 -> 33 (VibrationLogger/Config.h mapping).
+// Only wired cameras may be enabled: a buffer with a floating input chatters, and
+// a pull-down at the Teensy cannot hold it. Both edges are logged; width is the
+// time the line was active (high), i.e. the camera's exposure window as it sees it.
+constexpr uint8_t STROBE_PIN[3]={35,34,33};
+constexpr bool STROBE_ENABLED[3]={true,false,false};
 static SPIClass *const buses[2]={&SPI,&SPI1};
 constexpr uint32_t SPI_HZ=8000000,QUEUE_SIZE=8192;
 static uint32_t spiHz[2]={1000000,1000000};
@@ -21,6 +28,11 @@ static FsFile logfile;
 static IntervalTimer acquisition;
 DMAMEM static csvlog::Ring<csvlog::Record,QUEUE_SIZE> records;
 static csvlog::Ring<csvlog::SyncEvent,128> syncEvents;
+static csvlog::Ring<csvlog::StrobeEdge,256> strobeEdges;
+static volatile uint32_t strobeCount[3]={},strobeDropped=0;
+static uint32_t strobePulses[3]={},strobeLastWidth[3]={},strobeRiseUs[3]={};
+static bool strobeRisen[3]={};
+static bool sensorPresent[2]={true,true}; // Cleared per run by startImu() for a connector that fails WHO_AM_I.
 static uint32_t syncId=0,lastSyncLow=0;
 static uint32_t pendingSync[2]={};
 static volatile uint32_t syncReceived[2]={};
@@ -76,6 +88,18 @@ static bool checked(unsigned sensor,uint8_t reg,uint8_t value) {
 }
 static void drdy1(){++irqCount[0];}
 static void drdy3(){++irqCount[1];}
+// Strobe edge ISR: only the raw micros() and the level. The 64-bit extension and
+// the CSV line are done in the main loop (never SD/Serial in an ISR).
+// ponytail: a full queue drops the edge and counts it instead of faulting the run
+// -- a chattering strobe line must not be able to kill an IMU recording.
+static void strobeEdge(uint8_t cam) {
+  if(!running)return;
+  csvlog::StrobeEdge e{micros(),++strobeCount[cam],cam,uint8_t(digitalReadFast(STROBE_PIN[cam]))};
+  if(!strobeEdges.push(e))++strobeDropped;
+}
+static void strobe1(){strobeEdge(0);}
+static void strobe2(){strobeEdge(1);}
+static void strobe3(){strobeEdge(2);}
 static void sensorFault(unsigned sensor,const char *reason){faultSensor=SENSOR_ID[sensor];fault=reason;}
 // One sensor per 250 us interrupt; each sensor is serviced every 500 us.
 // Separate SPI peripherals, sequential CPU service. Never SD/CSV/Serial in ISR.
@@ -94,6 +118,7 @@ static void collect() {
     // Timestamp each wire separately. They need not rise in the same CPU cycle:
     // both edge brackets refer to the same extended Teensy micros() clock.
     for(unsigned s=0;s<2;++s){
+      if(!sensorPresent[s])continue;
       csvlog::SyncEvent e{};e.id=syncId;e.sensorId=SENSOR_ID[s];
       uint32_t before=micros();digitalWrite(FSYNC_PIN[s],HIGH);uint32_t after=micros();
       e.beforeUs=extendedMicros+uint32_t(before-begin);e.bracketUs=uint16_t(after-before);
@@ -102,6 +127,7 @@ static void collect() {
     }
     syncHigh=true; // Hold until the next service interrupt (~250 us).
   }
+  if(!sensorPresent[sensor])return;
   uint8_t state=getReg(sensor,0x2d);
   if(state==0xff){sensorFault(sensor,"INVALID_STATUS");return;}
   if(state&0x02){sensorFault(sensor,"FIFO_FULL");return;}
@@ -142,7 +168,10 @@ static bool configureImu(unsigned sensor) {
   if(getReg(sensor,0x75)!=0x47 || !(getReg(sensor,0x2d)&0x10)){sensorFault(sensor,"RESET_NOT_CONFIRMED");return false;}
   const uint8_t config[][2]={{0x4e,0},{0x4c,0x33},{0x16,0},
     {0x4f,2},{0x50,2},{0x51,0x16},{0x52,0x11},{0x53,0x0d},
-    {0x54,0x23},{0x5f,0x0f},{0x62,0x10},{0x14,3},{0x63,0},{0x64,0x60},{0x65,8},{0x68,0}};
+    // INT_SOURCE0 (0x65)=0: no data-ready pulses on INT1. The FIFO is polled by
+    // timer, INT1 was only an edge counter, and on the bench (J1 alone, 2.3)
+    // its 16 kHz pulses on the pin next to FSYNC produced UNEXPECTED_FSYNC tags.
+    {0x54,0x23},{0x5f,0x0f},{0x62,0x10},{0x14,3},{0x63,0},{0x64,0x60},{0x65,0},{0x68,0}};
   for(const auto &pair:config)if(!checked(sensor,pair[0],pair[1])){sensorFault(sensor,"CONFIG_READBACK");return false;}
   setReg(sensor,0x76,1);
   bool fsyncInput=checked(sensor,0x7b,2); // PIN9_FUNCTION=01, FSYNC input.
@@ -157,13 +186,23 @@ static bool configureImu(unsigned sensor) {
   return true;
 }
 static bool startImu() {
-  if(!configureImu(0) || !configureImu(1))return false;
+  // A connector with no sensor answering WHO_AM_I is skipped, not fatal: the
+  // strobe/FSYNC bench runs with J1 only. Any other bring-up failure still faults.
+  unsigned present=0;
   for(unsigned sensor=0;sensor<2;++sensor){
+    sensorPresent[sensor]=configureImu(sensor);
+    if(sensorPresent[sensor]){++present;continue;}
+    if(fault && strcmp(fault,"WHO_AM_I"))return false;
+    fault=nullptr;faultSensor=0;
+  }
+  if(!present){sensorFault(0,"NO_SENSORS");return false;}
+  for(unsigned sensor=0;sensor<2;++sensor){
+    if(!sensorPresent[sensor])continue;
     setReg(sensor,0x4b,2);delayMicroseconds(100);getReg(sensor,0x2d);
     if(!checked(sensor,0x16,0x80)){sensorFault(sensor,"FIFO_START");return false;}
   }
-  attachInterrupt(digitalPinToInterrupt(INT1_PIN[0]),drdy1,RISING);
-  attachInterrupt(digitalPinToInterrupt(INT1_PIN[1]),drdy3,RISING);
+  if(sensorPresent[0])attachInterrupt(digitalPinToInterrupt(INT1_PIN[0]),drdy1,RISING);
+  if(sensorPresent[1])attachInterrupt(digitalPinToInterrupt(INT1_PIN[1]),drdy3,RISING);
   lastPoll=lastData[0]=lastData[1]=previousMicros=micros();extendedMicros=previousMicros;
   captureStartUs=lastCapturedUs=extendedMicros;
   lastSyncLow=previousMicros;
@@ -241,13 +280,14 @@ struct BootOperations {
     if(!logfile.open("/log.csv",O_WRONLY|O_CREAT|O_EXCL))return false;
     fileOpen=true;
     const char *header=
-      "# DualCsvLogger 2.2; sensors=1,3; nominal_odr_hz=16000; spi_hz=8000000\n"
+      "# DualCsvLogger 2.3; sensors=1,3; nominal_odr_hz=16000; spi_hz=8000000; strobe_cams=1\n"
       "# valid and invalid count refer to motion axes only; temperature_valid is independent; temp_raw=-128 is unavailable\n"
       "# accel_g=raw/2048; gyro_dps=raw*2000/32768; temp_C=raw/2.07+25\n"
       "# sync_id=0: ordinary timestamp; sync_id>0: timestamp_raw is FSYNC->ODR delta, sensor_ticks is preceding ODR counter\n"
       "# FSYNC metadata brackets each GPIO rising edge in common MCU time; interval_us=10000; pins_J1_J3=6,21\n"
       "# Independent sample clocks; app reconstructs marked sample ticks and interpolates between FSYNC anchors, without extrapolation\n"
-      "# mcu_read_us is batch time, NOT sample time. No camera strobe/trigger capture in this sketch; filter delay not corrected\n"
+      "# mcu_read_us is batch time, NOT sample time. Filter delay not corrected. No trigger capture in this sketch\n"
+      "# STROBE records: camera exposure-active edges on the common MCU clock (same as FSYNC before_us); level=1 rising, level=0 falling with width_us of the high window\n"
       "# Missing END means reset/interruption; last unsynced data may be absent\n"
       "sample_index,mcu_read_us,sensor_ticks,timestamp_raw,ax_raw,ay_raw,az_raw,gx_raw,gy_raw,gz_raw,temp_raw,valid,timestamp_anomaly,temperature_valid,sensor_id,sync_id\n";
     return logfile.write(header,strlen(header))==strlen(header) && logfile.sync();
@@ -281,6 +321,33 @@ static bool saveSyncEvents() {
   }
   return true;
 }
+// Extend each edge's raw micros() to the same 64-bit clock as mcu_read_us and the
+// FSYNC anchors. collect() updates (extendedMicros, previousMicros) in its ISR, so
+// snapshot both with interrupts off; the queue is drained within milliseconds, far
+// inside the 71-minute 32-bit wrap, so the signed 32-bit difference is exact.
+static bool saveStrobeEdges() {
+  csvlog::StrobeEdge e;
+  while(strobeEdges.pop(e)){
+    noInterrupts();uint64_t ext=extendedMicros;uint32_t prev=previousMicros;interrupts();
+    uint64_t us=ext+int64_t(int32_t(e.rawUs-prev));
+    char line[160];int n;
+    if(e.level){
+      strobeRiseUs[e.cam]=e.rawUs;strobeRisen[e.cam]=true;
+      n=snprintf(line,sizeof(line),"# STROBE cam=%u level=1 mcu_us=%llu edge=%lu\n",
+        unsigned(e.cam+1),(unsigned long long)us,(unsigned long)e.edge);
+    }else if(strobeRisen[e.cam]){
+      uint32_t width=e.rawUs-strobeRiseUs[e.cam];strobeRisen[e.cam]=false;
+      strobeLastWidth[e.cam]=width;++strobePulses[e.cam];
+      n=snprintf(line,sizeof(line),"# STROBE cam=%u level=0 mcu_us=%llu edge=%lu width_us=%lu\n",
+        unsigned(e.cam+1),(unsigned long long)us,(unsigned long)e.edge,(unsigned long)width);
+    }else{ // Falling edge with no rising edge seen: line was already high at start.
+      n=snprintf(line,sizeof(line),"# STROBE cam=%u level=0 mcu_us=%llu edge=%lu\n",
+        unsigned(e.cam+1),(unsigned long long)us,(unsigned long)e.edge);
+    }
+    if(n<=0 || size_t(n)>=sizeof(line) || !append(line,size_t(n)))return false;
+  }
+  return true;
+}
 static bool syncFile() {
   if(!flushBuffer())return false;
   uint32_t start=micros();bool ok=logfile.sync();
@@ -300,6 +367,10 @@ static void status() {
   say("SYNC_STATUS sent=%lu received_J1=%lu received_J3=%lu pending_J1=%lu pending_J3=%lu",
     (unsigned long)syncId,(unsigned long)syncReceived[0],(unsigned long)syncReceived[1],
     (unsigned long)pendingSync[0],(unsigned long)pendingSync[1]);
+  for(unsigned c=0;c<3;++c)if(STROBE_ENABLED[c])
+    say("STROBE_STATUS cam=%u edges=%lu pulses=%lu last_width_us=%lu level=%u dropped=%lu",
+      c+1,(unsigned long)strobeCount[c],(unsigned long)strobePulses[c],(unsigned long)strobeLastWidth[c],
+      unsigned(digitalReadFast(STROBE_PIN[c])),(unsigned long)strobeDropped);
 }
 static void finish() {
   if(finished)return;
@@ -309,13 +380,15 @@ static void finish() {
     setReg(s,0x4e,0);delayMicroseconds(250);setReg(s,0x16,0);}
   if(fileOpen){
     if(!saveSyncEvents()){sdHealthy=false;fault="FSYNC_SAVE_FAILED";}
+    if(sdHealthy && !saveStrobeEdges()){sdHealthy=false;fault="STROBE_SAVE_FAILED";}
     csvlog::Record r;
     while(sdHealthy && records.pop(r)){if(!saveRecord(r))break;pump();}
     if(sdHealthy){
       char footer[320];
-      int n=snprintf(footer,sizeof(footer),"# END reason=%s samples=%lu csv_rows=%lu invalid=%lu temp_missing=%lu timestamp_anomalies=%lu elapsed_ms=%lu fifo_peak_bytes=%lu queue_peak=%lu\n",
+      int n=snprintf(footer,sizeof(footer),"# END reason=%s samples=%lu csv_rows=%lu invalid=%lu temp_missing=%lu timestamp_anomalies=%lu elapsed_ms=%lu fifo_peak_bytes=%lu queue_peak=%lu strobe_edges_cam1=%lu strobe_pulses_cam1=%lu strobe_dropped=%lu\n",
         fault?fault:"STOP",(unsigned long)samples,(unsigned long)written,(unsigned long)invalid,
-        (unsigned long)tempMissing,(unsigned long)anomalies,(unsigned long)(millis()-startMs),(unsigned long)fifoPeak,(unsigned long)queuePeak);
+        (unsigned long)tempMissing,(unsigned long)anomalies,(unsigned long)(millis()-startMs),(unsigned long)fifoPeak,(unsigned long)queuePeak,
+        (unsigned long)strobeCount[0],(unsigned long)strobePulses[0],(unsigned long)strobeDropped);
       if(n>0 && size_t(n)<sizeof(footer) && append(footer,size_t(n))){
         n=snprintf(footer,sizeof(footer),"# TIMING capture_us=%llu service_max_us=%lu gap_max_us=%lu sd_write_max_us=%lu sd_sync_max_us=%lu fault_sensor=%u\n",
           (unsigned long long)(lastCapturedUs-captureStartUs),(unsigned long)serviceMax,
@@ -331,6 +404,8 @@ static void finish() {
 }
 static void resetRunCounters() {
   syncEvents.clear();syncId=0;syncHigh=false;
+  strobeEdges.clear();strobeDropped=0;
+  for(unsigned c=0;c<3;++c){strobeCount[c]=strobePulses[c]=strobeLastWidth[c]=strobeRiseUs[c]=0;strobeRisen[c]=false;}
   for(unsigned s=0;s<2;++s){pendingSync[s]=0;syncReceived[s]=0;}
   records.clear();samples=invalid=anomalies=tempMissing=0;
   for(unsigned s=0;s<2;++s){sensorSamples[s]=sensorInvalid[s]=sensorAnomalies[s]=irqCount[s]=0;sensorClock[s]={};}
@@ -352,6 +427,11 @@ static void newRecording() {
   }
   resetRunCounters();
   if(!startImu()){finish();return;}
+  for(unsigned s=0;s<2;++s)if(!sensorPresent[s]){
+    char line[64];int n=snprintf(line,sizeof(line),"# SENSOR_ABSENT id=%u no WHO_AM_I; skipped this run\n",SENSOR_ID[s]);
+    if(n>0 && size_t(n)<sizeof(line))append(line,size_t(n));
+    say("SENSOR_ABSENT id=%u (J%u) -- recording without it",SENSOR_ID[s],SENSOR_ID[s]);
+  }
   say("RECORDING log.csv; SEN1/J1 SPI0 + SEN3/J3 SPI1; nominal 16000 samples/s EACH; DUMP or STOP to finish");
 }
 static void command(const char *line) {
@@ -365,7 +445,7 @@ static void command(const char *line) {
     if(fileOpen || running)finish();
     uint32_t start=millis();while(millis()-start<100){pump();yield();}
     SCB_AIRCR=0x05FA0004;while(true){}
-  }else if(!strcmp(line,"HELP"))say("DualCsvLogger 2.2: STOP, DUMP, NEW, STATUS, RESET. FSYNC on J1/J3. Downloads require ACK_LOG from Windows app. USB export only.");
+  }else if(!strcmp(line,"HELP"))say("DualCsvLogger 2.3: STOP, DUMP, NEW, STATUS, RESET. FSYNC on J1/J3; CAM1 strobe edges as # STROBE rows. Downloads require ACK_LOG from Windows app. USB export only.");
 }
 static void input(Stream &port,InputLine &line) {
   for(unsigned budget=0;budget<64 && port.available();++budget){
@@ -383,13 +463,18 @@ void setup() {
   Serial.begin(115200);Serial1.begin(115200);
   for(uint8_t pin:{10,9,38,37}){digitalWrite(pin,HIGH);pinMode(pin,OUTPUT);}
   for(uint8_t pin:{6,7,21,32})pinMode(pin,INPUT);
+  // Strobe inputs are driven by the hub's buffers (push-pull), so plain INPUT.
+  // Edges are counted only while `running`, so attaching here is safe.
+  static void (*const strobeIsr[3])()={strobe1,strobe2,strobe3};
+  for(unsigned c=0;c<3;++c){pinMode(STROBE_PIN[c],INPUT);
+    if(STROBE_ENABLED[c])attachInterrupt(digitalPinToInterrupt(STROBE_PIN[c]),strobeIsr[c],CHANGE);}
   SPI.setSCK(13);SPI.setMOSI(11);SPI.setMISO(12);SPI.begin();
   SPI1.setSCK(27);SPI1.setMOSI(26);SPI1.setMISO(39);SPI1.begin();
   // Do not erase the only copy of a recording before a USB terminal connects.
   while(!Serial)delay(10);
   delay(500);
   UsbSink usb;
-  if(!usb.text("DualCsvLogger 2.2 -- J1 + J3 at 16000 samples/s EACH with FSYNC; host ACK required before ALL SD contents erased\r\n"))return;
+  if(!usb.text("DualCsvLogger 2.3 -- J1 + J3 at 16000 samples/s EACH with FSYNC + CAM1 strobe edges; host ACK required before ALL SD contents erased\r\n"))return;
   if(!sd.begin(SdioConfig(FIFO_SDIO))){
     fault="SD_MOUNT_FAILED";say("FAIL SD code=0x%02X data=0x%02X; no erase attempted",sd.sdErrorCode(),sd.sdErrorData());return;
   }
@@ -400,6 +485,7 @@ void loop() {
   if(running && fault){finish();return;}
   if(running){
     if(!saveSyncEvents()){fault="FSYNC_SAVE_FAILED";finish();return;}
+    if(!saveStrobeEdges()){fault="STROBE_SAVE_FAILED";finish();return;}
     csvlog::Record r;
     for(unsigned budget=0;budget<128 && records.pop(r);++budget)if(!saveRecord(r))break;
     if(fault){finish();return;}

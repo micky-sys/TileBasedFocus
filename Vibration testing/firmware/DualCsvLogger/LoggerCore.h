@@ -35,6 +35,9 @@ struct Record {
 };
 static_assert(sizeof(Record)==48, "RAM queue budget changed");
 struct SyncEvent {uint64_t beforeUs;uint32_t id;uint16_t bracketUs;uint8_t sensorId;};
+// One camera strobe (exposure-active) edge, stamped in the GPIO ISR with the raw
+// 32-bit micros(); the main loop extends it to the common 64-bit MCU clock.
+struct StrobeEdge {uint32_t rawUs;uint32_t edge;uint8_t cam;uint8_t level;};
 inline bool ackMatches(const char *line,uint64_t size,uint32_t crc) {
   char expected[80];
   snprintf(expected,sizeof(expected),"ACK_LOG %llu %08lX",(unsigned long long)size,(unsigned long)crc);
