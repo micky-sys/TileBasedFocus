@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "reason": "Packaged GUI and simulated serial protocol passed",
+  "steps": [
+    "connect",
+    "idle",
+    "armed",
+    "stopped",
+    "recording",
+    "stopped_again",
+    "health",
+    "disconnected"
+  ]
+}

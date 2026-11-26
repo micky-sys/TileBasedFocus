@@ -1,0 +1,24 @@
+# Local development toolchains, build outputs and releases
+/firmware/.toolchain/
+/firmware/arduino-cli.yaml
+/firmware/build*/
+/firmware/release/
+/firmware/reference/
+/VibrationMonitor/build/
+/VibrationMonitor/release/
+/FlightBridge/build/
+/FlightBridge/release/
+/tools/TeensyLoader/
+**/__pycache__/
+*.py[cod]
+desktop.ini
+
+# Original recordings, large CAD assets and third-party hardware material stay on Drive.
+/data/
+/CAD model/
+/hardware/
+/tmp/
+*.pdf
+
+# Machine-specific transfer inventories and generated validation artifacts.
+/migration/
